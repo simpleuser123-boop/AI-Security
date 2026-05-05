@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      optional_group:
+        description: "Optional test group to run after the default quality gate"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - none
+          - slow
+          - e2e
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  FLASK_ENV: testing
+  ALERT_STREAM_CONSUMER_AUTOSTART: "false"
+  AUDIT_INTEGRITY_PATROL: "false"
+  GUARDIAN_REDIS_DISABLE_CONNECT: "true"
+  REDIS_HOST: 127.0.0.1
+  REDIS_PORT: "63999"
+  DATABASE_URL: "sqlite:///:memory:"
+  SECRET_KEY: ci-only-dummy-secret-key-which-is-at-least-32b
+  ADMIN_USERNAME: admin
+  ADMIN_PASSWORD: ci-only-admin-password
+
+jobs:
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Dependency sanity check
+        run: python -m pip check
+
+      - name: Unit and offline tests
+        run: |
+          python -m pytest -q --tb=short --maxfail=1 -m "not integration and not e2e and not slow"
+
+      - name: Critical security hardening tests
+        run: |
+          python -m pytest tests/test_production_hardening.py -q --tb=short --maxfail=1
+
+      - name: Schema and manifest tests
+        run: |
+          python -m pytest tests/test_schema_manifest.py tests/test_model_registry.py -q --tb=short --maxfail=1
+
+      - name: v1 acceptance scenarios
+        run: python scripts/verify_v1.py
+
+  optional-tests:
+    name: Optional ${{ github.event.inputs.optional_group }} Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: quality-gate
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.optional_group != 'none' }}
+
+    env:
+      OPTIONAL_GROUP: ${{ github.event.inputs.optional_group }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Run selected optional group
+        run: |
+          if [ "$OPTIONAL_GROUP" = "slow" ]; then
+            python -m pytest -q --tb=short --maxfail=1 -m slow
+          elif [ "$OPTIONAL_GROUP" = "e2e" ]; then
+            python -m pytest -q --tb=short --maxfail=1 -m e2e
+          else
+            echo "Unknown optional_group: $OPTIONAL_GROUP" >&2
+            exit 2
+          fi

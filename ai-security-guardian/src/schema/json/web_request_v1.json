@@ -1,0 +1,18 @@
+{
+  "schema_name": "web_request_v1",
+  "schema_version": "1",
+  "description": "HTTP 日志 / Web 特征契约；告警链路需保留 src_ip。",
+  "required_fields": {
+    "src_ip": {"type": "string", "policy": "forbid_silent_fill"},
+    "url": {"type": "string", "policy": "forbid_silent_fill"},
+    "method": {"type": "string", "policy": "forbid_silent_fill"},
+    "status_code": {"type": "number", "policy": "forbid_silent_fill"}
+  },
+  "optional_fields": {
+    "response_size": {"type": "number", "policy": "optional"},
+    "user_agent": {"type": "string", "policy": "optional"},
+    "timestamp": {"type": "string", "policy": "optional"},
+    "decoded_url": {"type": "string", "policy": "optional"},
+    "url_decoded": {"type": "string", "policy": "optional"}
+  }
+}

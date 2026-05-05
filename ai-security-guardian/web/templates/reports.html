@@ -1,0 +1,228 @@
+{% extends "base.html" %}
+
+{#-
+  审计报告（Reports）— DESIGN.md §4.9 + §8.6
+
+  约束：
+    - 浅色模式：通过 <html data-theme="report"> 切换，避免 FOUC
+    - 报告模块：概览 → 威胁统计 → 响应记录 → 模型性能 → 建议
+    - 导出：PDF（浏览器打印）/ HTML（保存页面）/ JSON（原始数据）
+    - 打印友好：@page A4、隐藏侧栏/顶栏/工具栏
+-#}
+
+{% block html_attrs %}data-theme="report"{% endblock %}
+{% block color_scheme %}light{% endblock %}
+
+{% block title %}安全审计报告 · AI Security Guardian{% endblock %}
+{% block topbar_title %}审计报告{% endblock %}
+
+{% block extra_styles %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/reports.css') }}" />
+{% endblock %}
+
+{% block topbar_actions %}
+  <span class="text-tertiary" style="font-size: var(--fs-caption)">报告以浅色模式呈现，便于打印与归档</span>
+{% endblock %}
+
+{% block content %}
+  <div class="report-root" id="report-root">
+    <section class="report-toolbar" aria-label="报告操作">
+      <div class="filter-bar__group" style="padding: 0; margin: 0">
+        <span class="filter-bar__label">周期</span>
+        <div class="btn-group" role="group" aria-label="报告周期">
+          <button class="btn is-active" type="button" data-period="day">日报</button>
+          <button class="btn" type="button" data-period="week">周报</button>
+          <button class="btn" type="button" data-period="month">月报</button>
+        </div>
+      </div>
+      <div class="report-toolbar__actions">
+        <button class="btn btn--ghost btn--sm" id="btn-refresh" type="button">重新生成</button>
+        <button class="btn btn--ghost btn--sm" id="btn-export-json" type="button">导出 JSON</button>
+        <button class="btn btn--ghost btn--sm" id="btn-export-html" type="button">导出 HTML</button>
+        <button class="btn btn--primary btn--sm" id="btn-export-pdf" type="button">导出 PDF</button>
+      </div>
+    </section>
+
+    {#- ===== 封面 / 元信息 ===== -#}
+    <header class="report-cover">
+      <div>
+        <h1 class="report-cover__title" id="cover-title">AI 安全守卫 · 安全审计日报</h1>
+        <p class="report-cover__subtitle" id="cover-subtitle">
+          生成于 <span id="cover-generated">—</span> · 数据窗口
+          <span id="cover-window" class="mono">—</span>
+        </p>
+      </div>
+      <div class="report-cover__meta">
+        <div>Model: <span id="cover-model">—</span></div>
+        <div>Security Score: <span id="cover-score">—</span> / 100</div>
+        <div>Report Version: Phase 7 R1</div>
+      </div>
+    </header>
+
+    {#- ===== 1. 概览 ===== -#}
+    <section class="report-section" id="section-overview">
+      <h2 class="report-section__title">1. 概览</h2>
+      <p class="report-section__subtitle">本周期内的关键安全指标快照。</p>
+      <div class="report-section__body">
+        <div class="report-overview" id="overview-grid">
+          <div class="report-metric">
+            <span class="report-metric__label">告警总数</span>
+            <span class="report-metric__value" data-metric="total_alerts">—</span>
+            <span class="report-metric__hint">本周期新产生</span>
+          </div>
+          <div class="report-metric report-metric--danger">
+            <span class="report-metric__label">严重 / 高危</span>
+            <span class="report-metric__value" data-metric="critical_high">—</span>
+            <span class="report-metric__hint">严重 + 高危之和</span>
+          </div>
+          <div class="report-metric report-metric--warning">
+            <span class="report-metric__label">未处置</span>
+            <span class="report-metric__value" data-metric="open_alerts">—</span>
+            <span class="report-metric__hint">状态 = open</span>
+          </div>
+          <div class="report-metric report-metric--success">
+            <span class="report-metric__label">已处置</span>
+            <span class="report-metric__value" data-metric="resolved_alerts">—</span>
+            <span class="report-metric__hint">状态 = resolved</span>
+          </div>
+          <div class="report-metric report-metric--info">
+            <span class="report-metric__label">封禁 IP</span>
+            <span class="report-metric__value" data-metric="banned_ips">—</span>
+          </div>
+          <div class="report-metric">
+            <span class="report-metric__label">IOC 条目</span>
+            <span class="report-metric__value" data-metric="iocs_total">—</span>
+          </div>
+          <div class="report-metric">
+            <span class="report-metric__label">启用规则 / 总规则</span>
+            <span class="report-metric__value" data-metric="rules_ratio">—</span>
+          </div>
+          <div class="report-metric report-metric--success">
+            <span class="report-metric__label">安全评分</span>
+            <span class="report-metric__value" data-metric="security_score">—</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {#- ===== 2. 威胁统计 ===== -#}
+    <section class="report-section" id="section-threats">
+      <h2 class="report-section__title">2. 威胁统计</h2>
+      <p class="report-section__subtitle">按等级、类型、来源分布，以及时间走势。</p>
+      <div class="report-section__body">
+        <div class="report-threats">
+          <div class="report-chart">
+            <h3 class="report-chart__title">按威胁等级</h3>
+            <div class="report-chart__body" id="chart-level"></div>
+          </div>
+          <div class="report-chart">
+            <h3 class="report-chart__title">按攻击类型（Top 10）</h3>
+            <div class="report-chart__body" id="chart-type"></div>
+          </div>
+        </div>
+        <div class="report-chart" style="margin-bottom: var(--space-md)">
+          <h3 class="report-chart__title">告警时间分布</h3>
+          <div class="report-chart__body" id="chart-timeline"></div>
+        </div>
+
+        <h3 class="report-chart__title" style="margin-top: var(--space-md)">Top 10 攻击来源</h3>
+        <table class="report-table" id="table-top-sources" aria-label="Top 攻击来源">
+          <thead>
+            <tr>
+              <th style="width: 48px">#</th>
+              <th>来源 IP</th>
+              <th style="width: 120px">命中次数</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="3" class="text-tertiary" style="text-align: center">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    {#- ===== 3. 响应记录 ===== -#}
+    <section class="report-section" id="section-responses">
+      <h2 class="report-section__title">3. 响应记录</h2>
+      <p class="report-section__subtitle">近 50 条处置动作（封禁 IP / 确认 / 已处理 / 忽略）。</p>
+      <div class="report-section__body">
+        <table class="report-table" id="table-responses" aria-label="响应记录">
+          <thead>
+            <tr>
+              <th style="width: 180px">时间</th>
+              <th style="width: 120px">动作</th>
+              <th>目标</th>
+              <th>说明</th>
+              <th style="width: 100px">操作人</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="5" class="text-tertiary" style="text-align: center">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    {#- ===== 4. 模型性能 ===== -#}
+    <section class="report-section" id="section-model">
+      <h2 class="report-section__title">4. 模型性能</h2>
+      <p class="report-section__subtitle">基于本周期告警的即席统计；Phase 8 接入在线评估后将替换为真实指标。</p>
+      <div class="report-section__body">
+        <div class="report-overview">
+          <div class="report-metric">
+            <span class="report-metric__label">模型版本</span>
+            <span class="report-metric__value" data-model="version">—</span>
+          </div>
+          <div class="report-metric">
+            <span class="report-metric__label">评估样本</span>
+            <span class="report-metric__value" data-model="total_checked">—</span>
+          </div>
+          <div class="report-metric report-metric--info">
+            <span class="report-metric__label">平均置信度</span>
+            <span class="report-metric__value" data-model="avg_confidence">—</span>
+          </div>
+          <div class="report-metric report-metric--success">
+            <span class="report-metric__label">高置信度占比</span>
+            <span class="report-metric__value" data-model="high_confidence_ratio">—</span>
+          </div>
+          <div class="report-metric report-metric--success">
+            <span class="report-metric__label">检出率（非忽略）</span>
+            <span class="report-metric__value" data-model="detection_rate">—</span>
+          </div>
+          <div class="report-metric">
+            <span class="report-metric__label">平均处置耗时</span>
+            <span class="report-metric__value" data-model="mean_resolution">—</span>
+          </div>
+        </div>
+
+        <div class="report-chart" style="margin-top: var(--space-md)">
+          <h3 class="report-chart__title">置信度分布</h3>
+          <div class="report-chart__body" id="chart-confidence"></div>
+        </div>
+      </div>
+    </section>
+
+    {#- ===== 5. 安全建议 ===== -#}
+    <section class="report-section" id="section-recommendations">
+      <h2 class="report-section__title">5. 安全建议</h2>
+      <p class="report-section__subtitle">根据本周期数据自动生成，按严重度排序。</p>
+      <div class="report-section__body">
+        <ul class="report-recommendations" id="recommendations-list">
+          <li class="report-recommendations__item report-recommendations__item--info">
+            <div class="report-recommendations__title">正在生成建议…</div>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <footer class="report-footer">
+      AI Security Guardian · 报告由系统根据当前内存中的告警 / 规则 / IOC 自动生成。
+      如需长期归档请使用「导出 JSON」保存原始数据。
+    </footer>
+  </div>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+  <script src="{{ url_for('static', filename='js/reports.js') }}"></script>
+{% endblock %}

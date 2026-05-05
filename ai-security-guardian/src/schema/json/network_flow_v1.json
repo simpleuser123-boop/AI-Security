@@ -1,0 +1,33 @@
+{
+  "schema_name": "network_flow_v1",
+  "schema_version": "1",
+  "description": "在线流 / 窗口聚合特征契约；与 NSL-KDD 41 维无直接一一对应。",
+  "required_fields": {
+    "src_ip": {"type": "string", "policy": "forbid_silent_fill"},
+    "protocol": {"type": "string", "policy": "forbid_silent_fill"},
+    "flow_pkt_count": {"type": "number", "policy": "forbid_silent_fill"},
+    "flow_byte_count": {"type": "number", "policy": "forbid_silent_fill"}
+  },
+  "optional_fields": {
+    "dst_ip": {"type": "string", "policy": "optional"},
+    "src_port": {"type": "number", "policy": "optional"},
+    "dst_port": {"type": "number", "policy": "optional"},
+    "packet_count": {"type": "number", "policy": "optional"},
+    "byte_count": {"type": "number", "policy": "optional"},
+    "flow_duration": {"type": "number", "policy": "optional"},
+    "flow_pkt_rate": {"type": "number", "policy": "optional"},
+    "flow_byte_rate": {"type": "number", "policy": "optional"},
+    "window_unique_dst_ip": {"type": "number", "policy": "optional"},
+    "window_unique_dst_port": {"type": "number", "policy": "optional"},
+    "window_protocol_dist": {"type": "object", "policy": "optional"},
+    "pkt_len_mean": {"type": "number", "policy": "optional"},
+    "pkt_len_std": {"type": "number", "policy": "optional"},
+    "pkt_len_max": {"type": "number", "policy": "optional"},
+    "pkt_len_min": {"type": "number", "policy": "optional"},
+    "syn_count": {"type": "number", "policy": "optional"},
+    "ack_count": {"type": "number", "policy": "optional"},
+    "fin_count": {"type": "number", "policy": "optional"},
+    "rst_count": {"type": "number", "policy": "optional"},
+    "flow_low_confidence": {"type": "boolean", "policy": "optional"}
+  }
+}

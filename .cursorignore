@@ -1,0 +1,8 @@
+ai-security-guardian/.venv/
+ai-security-guardian/.tmp/
+ai-security-guardian/__pycache__/
+ai-security-guardian/.pytest_cache/
+ai-security-guardian/models/
+ai-security-guardian/logs/
+ai-security-guardian/data/
+ai-security-guardian/**/*.pyc

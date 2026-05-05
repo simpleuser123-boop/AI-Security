@@ -1,0 +1,136 @@
+{#-
+  login.html — Phase 7 独立登录页
+
+  设计规范：
+    - 不 extends base.html，单独布局（DESIGN.md 无侧边栏）
+    - 深色 SOC 主题 + 翠绿强调
+    - 通过 `/api/auth/login` 获取 JWT，存 localStorage 后跳 `/dashboard`
+-#}
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>登录 · AI Security Guardian</title>
+    <link
+      rel="preconnect"
+      href="https://fonts.googleapis.com"
+      crossorigin
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/theme.css') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}" />
+  </head>
+  <body data-page="login">
+    <div class="login-shell">
+      <div class="login-card" role="form" aria-labelledby="login-title">
+        <div class="login-card__brand">
+          <span class="sidebar__brand-dot" aria-hidden="true"></span>
+          <span id="login-title">AI Security Guardian</span>
+        </div>
+        <p class="login-card__subtitle">
+          登录以访问安全态势感知控制台。
+        </p>
+
+        <form id="login-form" novalidate>
+          <div class="form-group">
+            <label class="form-label" for="login-username">用户名</label>
+            <input
+              class="form-input"
+              id="login-username"
+              name="username"
+              autocomplete="username"
+              required
+              maxlength="64"
+            />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="login-password">密码</label>
+            <input
+              class="form-input"
+              id="login-password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              maxlength="128"
+            />
+          </div>
+          <button class="btn btn--primary btn--block" type="submit" id="login-submit">
+            登录
+          </button>
+          <div class="form-error" id="login-error" role="alert"></div>
+        </form>
+
+        <p class="caption" style="margin-top: var(--space-md); text-align: center">
+          首次登录请参考
+          <code class="mono">.env.example</code> 中的
+          <code class="mono">ADMIN_USERNAME</code> /
+          <code class="mono">ADMIN_PASSWORD</code>
+        </p>
+      </div>
+    </div>
+
+    <div id="ag-toast-container" class="toast-container" aria-live="polite"></div>
+
+    <script src="{{ url_for('static', filename='js/utils.js') }}"></script>
+    <script>
+      (function () {
+        "use strict";
+
+        const form = document.getElementById("login-form");
+        const errorNode = document.getElementById("login-error");
+        const submitBtn = document.getElementById("login-submit");
+        const userInput = document.getElementById("login-username");
+        const passInput = document.getElementById("login-password");
+
+        // 如果已经有有效 token，直接跳仪表盘
+        if (window.AGApi.getToken()) {
+          location.href = "/dashboard";
+        }
+
+        // 消费从其他页面带过来的跳转提示
+        const msg = sessionStorage.getItem("ag_login_message");
+        if (msg) {
+          errorNode.textContent = msg;
+          sessionStorage.removeItem("ag_login_message");
+        }
+
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          errorNode.textContent = "";
+
+          const username = userInput.value.trim();
+          const password = passInput.value;
+
+          if (!username || !password) {
+            errorNode.textContent = "请填写用户名与密码";
+            return;
+          }
+
+          submitBtn.disabled = true;
+          submitBtn.textContent = "登录中…";
+
+          try {
+            const data = await window.AGApi.fetchApi("/api/auth/login", {
+              method: "POST",
+              body: { username, password },
+              skipAuth: true,
+            });
+            window.AGApi.setTokens(data);
+            location.href = "/dashboard";
+          } catch (err) {
+            errorNode.textContent = err.message || "登录失败";
+          } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = "登录";
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

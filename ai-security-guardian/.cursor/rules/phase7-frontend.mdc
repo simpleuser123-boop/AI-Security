@@ -1,0 +1,96 @@
+---
+description: Phase 7 可视化与交互层开发规则（AI-Security-Guardian）
+globs: web/**/*,ai-security-guardian/web/**/*
+alwaysApply: false
+---
+
+# Phase 7 前端开发规则
+
+本项目 Phase 7 以《AI-Security-Guardian-DESIGN.md》与《AI-Security-Guardian-Cursor-Phase7-Frontend-Prompt.md》为准。
+《AI-Security-Guardian-Cursor开发实操指南-修复版.md》中 Phase 7 的 UI 示例视为过时草稿，仅保留其安全与通信基线。
+
+## 文档优先级（冲突时从高到低）
+
+1. `AI-Security-Guardian-DESIGN.md` — 视觉/交互/组件/响应式
+2. `AI-Security-Guardian-Cursor-Phase7-Frontend-Prompt.md` — 文件结构与实施约束
+3. `AI安全守卫技术架构文档.md` §8/§9/§10/§11 — 接口职责与通信机制
+4. 开发实操指南修复版 Phase 7 — **仅保留**安全与通信基线
+
+## 必须保留的安全基线（来自实操指南 Phase 7）
+
+- `SECRET_KEY` 强制从环境变量读取（复用 `config.get_config()`）
+- JWT：`flask-jwt-extended`，所有 `/api/*` 默认加 `@jwt_required()`；
+  仅 `/api/auth/login`、`/api/health` 可匿名
+- CORS：仅允许 `config.ALLOWED_ORIGINS` 白名单，禁止 `*`
+- Flask-Limiter：全局 `config.API_RATE_LIMIT`，`/api/auth/login` 再加 `5 per minute`
+- Flask-SocketIO：`cors_allowed_origins=config.ALLOWED_ORIGINS`
+- IP 输入复用 `src.response.responder.validate_ip`，非法一律拒绝
+- 401 / 403 / 429 必须返回 JSON 错误体，前端统一拦截处理
+
+## 视觉硬约束（来自 DESIGN.md）
+
+- 深色 SOC 主题：`--bg-void #0A0A0B`、`--surface-dark #141416`、`--accent-emerald #10B981`
+- 威胁等级色：low `#3B82F6` / medium `#F59E0B` / high `#EF4444` / critical `#EC4899`
+- **严禁**使用旧示例中的蓝紫赛博配色（`#0a0e27`、`#00d4ff`、`#1a1f4e` 等）
+- 指标卡数字使用 `font-variant-numeric: tabular-nums`
+- IP / 命令 / 日志使用 JetBrains Mono 等宽字体
+- 严重等级徽章必须带 `pulse-glow` 2s 脉冲动画
+- 报告页保持浅色模式（`#FFFFFF` 背景 / `#111827` 正文）
+- 响应式断点：<768 汉堡菜单 / 768–1023 侧栏收起 / ≥1024 完整布局
+
+## 文件结构
+
+```
+web/
+├── app.py                  # Flask 入口（JWT + CORS + Limiter + SocketIO）
+├── templates/
+│   ├── base.html           # 侧边栏 + 内容区骨架，各页 extends
+│   ├── login.html          # 独立页面（不 extends base）
+│   ├── dashboard.html      # 四指标卡 + 图表 + 实时告警 + 时间线
+│   ├── alerts.html         # 筛选 + 列表 + 详情抽屉
+│   ├── threat_intel.html
+│   ├── rules.html
+│   ├── reports.html        # 浅色模式
+│   ├── command.html        # 终端式 + 内联确认
+│   └── settings.html       # 真实配置页
+└── static/
+    ├── css/theme.css       # 设计令牌 + 字体 + 基础排版
+    ├── css/components.css  # 卡片/按钮/徽章/表格/侧栏/动画
+    ├── css/reports.css     # 仅报告页的浅色覆盖
+    └── js/app.js, utils.js, dashboard.js, alerts.js, command.js
+```
+
+## 不得违反
+
+- 不要继续把样式内联在 HTML 里，全部走 `static/css/`
+- 不要把登录框塞进 dashboard 页面，login 必须是独立路由/模板
+- 不要为美化 UI 绕过 JWT / 限流 / IP 校验
+- WebSocket 事件名统一为：
+  - `alert` —— 新增告警（仪表盘 + 告警中心订阅；高危/严重级别自动弹 toast）
+  - `alert_updated` —— 告警状态变更（如 open → acknowledged）
+  - `metrics_update` —— 指标卡刷新
+  - `pong_client` —— 心跳回执
+  旧 `new_alert` / `threat_detected` 已在 Phase 7 P2 下线，任何新代码不得再使用
+
+## 即用设计令牌
+
+```css
+:root {
+  --bg-void: #0A0A0B;
+  --surface-dark: #141416;
+  --surface-mid: #1C1C1F;
+  --surface-raised: #252528;
+  --border-subtle: #2A2A2E;
+  --border-default: #3A3A3F;
+  --text-primary: #E8E8EC;
+  --text-secondary: #8B8B96;
+  --text-tertiary: #5C5C66;
+  --accent-emerald: #10B981;
+  --accent-emerald-hover: #34D399;
+  --accent-emerald-glow: rgba(16, 185, 129, 0.15);
+  --threat-low: #3B82F6;
+  --threat-medium: #F59E0B;
+  --threat-high: #EF4444;
+  --threat-critical: #EC4899;
+}
+```

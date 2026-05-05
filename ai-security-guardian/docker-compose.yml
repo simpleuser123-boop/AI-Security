@@ -1,0 +1,177 @@
+# AI-Security-Guardian docker-compose（Phase 8：集成与部署）
+# 对应架构文档 §11 + Phase 8 提示词 C 节
+#
+# 本编排提供：
+#   1. app 服务（Phase 7 Flask/API 层；默认启动）
+#   2. redis 服务（缓存 / 轻量消息队列，含密码 + healthcheck）
+#   3. guardian 服务（完整检测链路，需抓包权限；可选 profile: full-chain）
+#   4. 环境变量全部经由 .env 注入（禁止硬编码敏感凭据）
+#   5. 模型目录只读挂载、日志目录可写挂载
+#   6. depends_on + condition: service_healthy：Redis 先起再起 app
+#   7. restart: unless-stopped
+#   8. CPU / 内存资源限制
+#
+# 使用：
+#   1) 首次：cp .env.example .env 并修改 SECRET_KEY / ADMIN_PASSWORD_HASH / REDIS_PASSWORD
+#   2) 仅 Web/API 层（日常调试 / 前端联调，默认）：
+#        docker compose up --build
+#   3) Web + 完整检测链路（需要 CAP_NET_RAW，宿主机需支持）：
+#        docker compose --profile full-chain up --build
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 国内网络构建时可在 .env 中设置 PIP_INDEX_URL / APT_MIRROR 加速
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        APT_MIRROR: ${APT_MIRROR:-}
+    image: ai-security-guardian:latest
+    container_name: ai-security-guardian-app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      # 关键变量：compose 允许上层 shell 覆盖，未设置时退回 .env
+      FLASK_ENV: ${FLASK_ENV:-production}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/security.db}
+      AUTO_CREATE_DB_TABLES: ${AUTO_CREATE_DB_TABLES:-false}
+      DRY_RUN: ${DRY_RUN:-true}
+      # Web/API 层默认不启用抓包 / 日志采集
+      ENABLE_PACKET_CAPTURE: "false"
+      ENABLE_WEB_LOG: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5000}
+    volumes:
+      - ./models/saved:/app/models/saved:ro
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    mem_limit: 2g
+    mem_reservation: 512m
+    cpus: 2.0
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          python -c "import urllib.request;
+          assert urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=5).status == 200"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # -------------------------------------------------------------------
+  # 完整检测链路（Phase 8 主入口 main.py）
+  # 默认不启动；执行 `docker compose --profile full-chain up` 才会拉起。
+  # 它会：
+  #   - 运行真实抓包（需要 CAP_NET_RAW / CAP_NET_ADMIN；network_mode: host）
+  #   - 监听 /var/log/nginx/access.log（如需采集 Web 日志，按需挂载进来）
+  #   - 把告警通过 push_alert 广播到 app 的 Phase 7 WebSocket
+  # -------------------------------------------------------------------
+  guardian:
+    image: ai-security-guardian:latest
+    container_name: ai-security-guardian-main
+    restart: unless-stopped
+    profiles:
+      - full-chain
+    env_file:
+      - .env
+    environment:
+      FLASK_ENV: ${FLASK_ENV:-production}
+      REDIS_HOST: ${REDIS_HOST_FOR_GUARDIAN:-127.0.0.1}
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      DRY_RUN: ${DRY_RUN:-true}
+      ENABLE_PACKET_CAPTURE: "true"
+      ENABLE_WEB_LOG: ${ENABLE_WEB_LOG:-false}
+      ENABLE_FLASK: "false"  # 告警通过 Redis 队列共享给 app，不在此进程起 Flask
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PACKET_INTERFACE: ${PACKET_INTERFACE:-}
+    # 抓包必须能看到宿主机的真实网卡：host 网络是最简单可靠的做法。
+    # 若不想用 host 网络，需要显式 cap_add + network: bridge，但 bridge 内只能
+    # 看到容器间流量，对真实网卡的 DDoS 检测意义有限。
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: ["python", "main.py"]
+    volumes:
+      - ./models/saved:/app/models/saved:ro
+      - ./logs:/app/logs
+      # 如需采集宿主机 Web 日志，取消下一行的注释并按实际路径调整：
+      # - /var/log/nginx:/var/log/nginx:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    mem_limit: 2g
+    cpus: 2.0
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # guardian 没有 HTTP，使用进程存活 + Redis 可达作为健康信号
+      test:
+        - CMD-SHELL
+        - pgrep -f "python main.py" >/dev/null 2>&1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-security-guardian-redis
+    restart: unless-stopped
+    # 仅绑定 127.0.0.1，不向公网 0.0.0.0 暴露；供本机 Guardian（host 网络）访问。
+    # 纯 bridge 内访问可删除 ports 段并改用 profile「dev-publish-redis」（见 docs/deployment.md）。
+    ports:
+      - "127.0.0.1:6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # 有 REDIS_PASSWORD 时才启用 --requirepass；空密码时不在命令行写入弱口令
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ -n "$${REDIS_PASSWORD}" ]; then
+          exec redis-server --requirepass "$${REDIS_PASSWORD}" --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+        else
+          exec redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+        fi
+    volumes:
+      - redis_data:/data
+    mem_limit: 512m
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          if [ -n "$${REDIS_PASSWORD}" ]; then
+            redis-cli -a "$${REDIS_PASSWORD}" ping | grep -q PONG;
+          else
+            redis-cli ping | grep -q PONG;
+          fi
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  redis_data:
+    driver: local

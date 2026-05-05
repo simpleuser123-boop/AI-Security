@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+
+{% block title %}命令面板 · AI Security Guardian{% endblock %}
+{% block topbar_title %}命令面板{% endblock %}
+
+{% block content %}
+  <div class="card card--padded">
+    <h3 class="card__title">终端</h3>
+    <p class="text-secondary" style="margin-top: var(--space-sm); margin-bottom: var(--space-md)">
+      支持命令：<code class="mono">block &lt;ip&gt;</code>、
+      <code class="mono">unblock &lt;ip&gt;</code>、
+      <code class="mono">isolate &lt;ip&gt;</code>、
+      <code class="mono">rate-limit &lt;ip&gt;</code>、
+      <code class="mono">status</code>。
+      危险命令（<code class="mono">isolate</code>）会内联确认后再执行。
+    </p>
+    <div class="terminal" id="terminal">
+      <div class="terminal__line">AI Security Guardian · interactive command shell</div>
+      <div class="terminal__line terminal__line--ok">Type `status` to view system state.</div>
+      <div class="terminal__prompt">
+        <input id="terminal-input" class="terminal__input" autocomplete="off"
+               spellcheck="false" autocapitalize="off"
+               placeholder="输入命令，按 Enter 执行" />
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block page_scripts %}
+  <script>
+    (function () {
+      "use strict";
+      if (!window.AGApi) return;
+      const { fetchApi } = window.AGApi;
+      const { escapeHtml, toast } = window.AGUI;
+      const term = document.getElementById("terminal");
+      const input = document.getElementById("terminal-input");
+      const prompt = term.querySelector(".terminal__prompt");
+      const history = [];
+      let historyIdx = -1;
+
+      const DANGEROUS = /^isolate\b/i;
+
+      function printLine(text, kind) {
+        const el = document.createElement("div");
+        el.className =
+          "terminal__line" + (kind ? " terminal__line--" + kind : "");
+        el.textContent = text;
+        term.insertBefore(el, prompt);
+        term.scrollTop = term.scrollHeight;
+      }
+
+      async function runCommand(cmd) {
+        printLine(cmd, "cmd");
+        try {
+          const result = await fetchApi("/api/command", {
+            method: "POST",
+            body: { command: cmd },
+          });
+          printLine(result.output || "(无输出)", result.ok ? "ok" : "err");
+        } catch (err) {
+          printLine("执行失败：" + (err.message || err), "err");
+        }
+      }
+
+      function confirmInline(cmd, onConfirm) {
+        const wrap = document.createElement("div");
+        wrap.className = "terminal__line terminal__line--err";
+        wrap.innerHTML =
+          "⚠ 危险命令 " +
+          escapeHtml(cmd) +
+          ' ，请确认：<button class="btn btn--danger btn--sm" type="button">执行</button> ' +
+          '<button class="btn btn--ghost btn--sm" type="button">取消</button>';
+        const [yes, no] = wrap.querySelectorAll("button");
+        yes.addEventListener("click", () => {
+          wrap.remove();
+          onConfirm();
+        });
+        no.addEventListener("click", () => wrap.remove());
+        term.insertBefore(wrap, prompt);
+        term.scrollTop = term.scrollHeight;
+      }
+
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          const cmd = input.value.trim();
+          if (!cmd) return;
+          history.push(cmd);
+          historyIdx = history.length;
+          input.value = "";
+          if (DANGEROUS.test(cmd)) {
+            confirmInline(cmd, () => runCommand(cmd));
+          } else {
+            runCommand(cmd);
+          }
+        } else if (e.key === "ArrowUp") {
+          if (historyIdx > 0) {
+            historyIdx -= 1;
+            input.value = history[historyIdx] || "";
+          }
+          e.preventDefault();
+        } else if (e.key === "ArrowDown") {
+          if (historyIdx < history.length - 1) {
+            historyIdx += 1;
+            input.value = history[historyIdx] || "";
+          } else {
+            historyIdx = history.length;
+            input.value = "";
+          }
+          e.preventDefault();
+        }
+      });
+
+      input.focus();
+    })();
+  </script>
+{% endblock %}

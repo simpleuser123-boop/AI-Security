@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+
+{#-
+  告警中心（Alerts） — DESIGN.md §8.2
+
+  布局契约：
+    - 筛选栏：威胁等级（4 色按钮组）、时间范围、攻击类型、状态、搜索
+    - 列表：左侧 3px 等级色条 + 告警标题 + 来源 IP（等宽蓝）+ 时间（等宽）+ 等级徽章 + 操作
+    - 严重等级徽章脉冲辉光；新告警入场滑入动画
+    - 详情抽屉：元信息 + AI 推理 + 原始数据 + 操作（封禁/确认/处理/忽略）
+
+  数据契约（/api/alerts 与 /api/alerts/<id> 字段一致，详情返回完整 history/raw/features）：
+    id, timestamp, level, status, threat_type, title, summary,
+    source_ip, source_port, dest_ip, dest_port, protocol,
+    confidence, model_version, recommended_action,
+    features (dict), explanation (str), raw (str), indicators (list), history (list)
+-#}
+
+{% block title %}告警中心 · AI Security Guardian{% endblock %}
+{% block topbar_title %}告警中心{% endblock %}
+
+{% block topbar_actions %}
+  <button class="btn btn--ghost btn--sm" id="btn-seed" type="button" hidden>生成演示数据</button>
+  <button class="btn btn--ghost btn--sm" id="btn-refresh" type="button" title="手动刷新 (R)">刷新</button>
+  <label class="btn btn--ghost btn--sm" style="gap: 6px">
+    <input type="checkbox" id="toggle-autorefresh" style="margin: 0" />
+    <span>自动 15s</span>
+  </label>
+{% endblock %}
+
+{% block content %}
+  <section class="page-header" aria-label="告警统计">
+    <div class="page-header__meta" role="status" aria-live="polite">
+      <span>当前筛选 <strong id="count-filtered">0</strong></span>
+      <span>全部告警 <strong id="count-total">0</strong></span>
+      <span>未处理 <strong id="count-open">0</strong></span>
+    </div>
+    <div id="active-chips" class="page-header__meta" aria-label="活动筛选条件"></div>
+  </section>
+
+  <section class="filter-bar" aria-label="告警筛选">
+    <div class="filter-bar__group">
+      <span class="filter-bar__label">威胁等级</span>
+      <div class="btn-group" role="group" aria-label="按等级筛选">
+        <button class="btn is-active" type="button" data-level="">全部</button>
+        <button class="btn btn--level-low" type="button" data-level="low">低危</button>
+        <button class="btn btn--level-medium" type="button" data-level="medium">中危</button>
+        <button class="btn btn--level-high" type="button" data-level="high">高危</button>
+        <button class="btn btn--level-critical" type="button" data-level="critical">严重</button>
+      </div>
+    </div>
+
+    <div class="filter-bar__group">
+      <label class="filter-bar__label" for="filter-status">状态</label>
+      <select id="filter-status" class="form-select">
+        <option value="">全部</option>
+        <option value="open">未处理</option>
+        <option value="acknowledged">已确认</option>
+        <option value="resolved">已处理</option>
+        <option value="ignored">已忽略</option>
+      </select>
+    </div>
+
+    <div class="filter-bar__group">
+      <label class="filter-bar__label" for="filter-range">时间范围</label>
+      <select id="filter-range" class="form-select">
+        <option value="1h">近 1 小时</option>
+        <option value="24h" selected>近 24 小时</option>
+        <option value="7d">近 7 天</option>
+        <option value="30d">近 30 天</option>
+        <option value="all">全部</option>
+      </select>
+    </div>
+
+    <div class="filter-bar__group">
+      <label class="filter-bar__label" for="filter-type">攻击类型</label>
+      <select id="filter-type" class="form-select">
+        <option value="">全部类型</option>
+      </select>
+    </div>
+
+    <div class="filter-bar__group filter-bar__search">
+      <label class="filter-bar__label" for="filter-query">搜索</label>
+      <input
+        id="filter-query"
+        class="form-input form-input--mono"
+        type="search"
+        placeholder="标题 / IP / 类型…"
+        autocomplete="off"
+      />
+    </div>
+  </section>
+
+  <section class="card" aria-label="告警列表">
+    <div class="card__header">
+      <h3 class="card__title">告警列表</h3>
+      <div class="topbar__actions" style="gap: var(--space-xs)">
+        <button class="btn btn--ghost btn--sm" id="btn-load-more" type="button" hidden>加载更多</button>
+        <span id="list-status" class="text-tertiary" style="font-size: var(--fs-caption)"></span>
+      </div>
+    </div>
+    <div class="card__body">
+      <ul id="alert-list" class="alert-list" role="list">
+        <li class="alert-list__empty">
+          <span class="loader" aria-hidden="true"></span>
+          <span style="margin-left: 8px">加载中…</span>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  {#- 详情抽屉（默认隐藏；由 alerts.js 切换 .is-open） -#}
+  <div id="drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <aside
+    id="alert-drawer"
+    class="drawer"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="drawer-title"
+    aria-hidden="true"
+  >
+    <header class="drawer__header">
+      <h2 class="drawer__title" id="drawer-title">
+        <span id="drawer-title-text" class="drawer__title-text">告警详情</span>
+        <span id="drawer-level-badge"></span>
+      </h2>
+      <button class="drawer__close" id="drawer-close" type="button" aria-label="关闭">×</button>
+    </header>
+
+    <div class="drawer__body">
+      <section class="drawer__section">
+        <h3 class="drawer__section-title">基本信息</h3>
+        <dl class="kv-grid">
+          <dt>告警 ID</dt>
+          <dd id="d-id" class="mono">—</dd>
+          <dt>时间</dt>
+          <dd id="d-time" class="mono">—</dd>
+          <dt>类型</dt>
+          <dd id="d-type">—</dd>
+          <dt>状态</dt>
+          <dd id="d-status">—</dd>
+          <dt>来源</dt>
+          <dd id="d-source" class="mono">—</dd>
+          <dt>目的</dt>
+          <dd id="d-dest" class="mono">—</dd>
+          <dt>协议</dt>
+          <dd id="d-proto" class="mono">—</dd>
+          <dt>建议动作</dt>
+          <dd id="d-action">—</dd>
+        </dl>
+      </section>
+
+      <section class="drawer__section">
+        <h3 class="drawer__section-title">AI 检测推理</h3>
+        <dl class="kv-grid" style="margin-bottom: var(--space-sm)">
+          <dt>模型版本</dt>
+          <dd id="d-model" class="mono">—</dd>
+          <dt>置信度</dt>
+          <dd>
+            <span id="d-confidence" class="mono">—</span>
+            <div class="confidence-bar" aria-hidden="true">
+              <div class="confidence-bar__fill" id="d-confidence-bar" style="width: 0%"></div>
+            </div>
+          </dd>
+        </dl>
+        <p id="d-explanation" class="text-secondary" style="margin: var(--space-sm) 0">—</p>
+
+        <table class="feature-table" id="d-features" aria-label="特征权重">
+          <thead>
+            <tr><th>特征</th><th>值</th></tr>
+          </thead>
+          <tbody><!-- 由 JS 填充 --></tbody>
+        </table>
+      </section>
+
+      <section class="drawer__section">
+        <h3 class="drawer__section-title">原始数据 / 请求日志</h3>
+        <pre class="code-block" id="d-raw">—</pre>
+      </section>
+
+      <section class="drawer__section" id="d-indicators-section" hidden>
+        <h3 class="drawer__section-title">关联 IOC</h3>
+        <ul id="d-indicators" class="text-secondary" style="font-family: var(--font-mono); font-size: var(--fs-mono); padding-left: var(--space-lg)"></ul>
+      </section>
+
+      <section class="drawer__section" id="d-history-section" hidden>
+        <h3 class="drawer__section-title">处置历史</h3>
+        <ol id="d-history" class="timeline"></ol>
+      </section>
+    </div>
+
+    <footer class="drawer__footer">
+      <button class="btn btn--ghost btn--sm" id="btn-ignore" type="button">忽略</button>
+      <button class="btn btn--ghost btn--sm" id="btn-ack" type="button">标记已确认</button>
+      <button class="btn btn--danger btn--sm" id="btn-ban" type="button">封禁来源 IP</button>
+      <button class="btn btn--primary btn--sm" id="btn-resolve" type="button">标记已处理</button>
+    </footer>
+  </aside>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="{{ url_for('static', filename='js/alerts.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}安全态势感知 · AI Security Guardian{% endblock %}
+{% block topbar_title %}安全态势感知{% endblock %}
+
+{% block topbar_actions %}
+  <button class="btn btn--ghost btn--sm" id="btn-refresh" type="button">刷新</button>
+{% endblock %}
+
+{% block content %}
+  {#- 顶部 4 指标卡（DESIGN.md §8.1） -#}
+  <section class="metrics-grid" aria-label="关键指标">
+    <article class="metric-card">
+      <span class="metric-card__label">实时流量（包/秒）</span>
+      <span class="metric-card__value" data-metric="total_packets">--</span>
+      <span class="metric-card__trend" data-trend="total_packets"></span>
+    </article>
+    <article class="metric-card">
+      <span class="metric-card__label">威胁总数</span>
+      <span class="metric-card__value metric-card__value--danger" data-metric="total_threats">--</span>
+      <span class="metric-card__trend" data-trend="total_threats"></span>
+    </article>
+    <article class="metric-card">
+      <span class="metric-card__label">安全评分</span>
+      <span class="metric-card__value metric-card__value--emerald" data-metric="security_score">--</span>
+      <span class="metric-card__trend" data-trend="security_score"></span>
+    </article>
+    <article class="metric-card">
+      <span class="metric-card__label">封禁 IP 数</span>
+      <span class="metric-card__value metric-card__value--warning" data-metric="banned_ips">--</span>
+      <span class="metric-card__trend" data-trend="banned_ips"></span>
+    </article>
+  </section>
+
+  {#- 中部：流量趋势 + 攻击类型分布 -#}
+  <section class="grid-2" aria-label="流量与攻击分布" style="margin-bottom: var(--space-lg)">
+    <div class="card">
+      <div class="card__header">
+        <h3 class="card__title">流量趋势</h3>
+        <div class="topbar__actions" style="gap: var(--space-xs)">
+          <button class="btn btn--ghost btn--sm is-active" data-range="24h" type="button">24H</button>
+          <button class="btn btn--ghost btn--sm" data-range="7d" type="button">7D</button>
+        </div>
+      </div>
+      <div class="card__body">
+        <div id="chart-traffic" class="chart"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card__header">
+        <h3 class="card__title">攻击类型分布</h3>
+      </div>
+      <div class="card__body">
+        <div id="chart-attack-types" class="chart"></div>
+      </div>
+    </div>
+  </section>
+
+  {#- 下部：Top10 攻击来源 + 实时告警 -#}
+  <section class="grid-2" aria-label="攻击来源与告警" style="margin-bottom: var(--space-lg)">
+    <div class="card">
+      <div class="card__header">
+        <h3 class="card__title">攻击来源 Top10</h3>
+      </div>
+      <div class="card__body">
+        <div id="chart-top-attackers" class="chart"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card__header">
+        <h3 class="card__title">实时告警</h3>
+        <a class="btn btn--ghost btn--sm" href="/alerts">查看全部</a>
+      </div>
+      <div class="card__body">
+        <ul class="alert-list" id="alert-list">
+          <li class="alert-list__empty">等待告警数据…</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  {#- 底部：安全事件时间线 -#}
+  <section aria-label="安全事件时间线">
+    <div class="card">
+      <div class="card__header">
+        <h3 class="card__title">安全事件时间线</h3>
+      </div>
+      <div class="card__body">
+        <ol class="timeline" id="event-timeline">
+          <li class="alert-list__empty">暂无事件</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+{% endblock %}

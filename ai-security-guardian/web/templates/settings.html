@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+
+{#-
+  系统设置（Settings）— Phase 7 Prompt §5
+
+  约束：
+    - 可写区：检测灵敏度 / 告警阈值 / 告警邮箱 / 告警 Webhook / 模型版本 / 模型热更新
+    - 只读区：JWT 过期时间 / API 限流 / CORS 白名单 / 日志完整性（均需改 .env 重启）
+    - 真实 GET/PUT 绑定到 /api/settings；schema 由后端下发驱动字段渲染
+    - 修改后「保存」→ 后端写入 _ServerState.settings，GET 立即能看到
+-#}
+
+{% block title %}系统设置 · AI Security Guardian{% endblock %}
+{% block topbar_title %}系统设置{% endblock %}
+
+{% block topbar_actions %}
+  <span class="text-tertiary" style="font-size: var(--fs-caption)">
+    可写字段保存后立即对运行时生效；只读字段需修改 .env 并重启
+  </span>
+{% endblock %}
+
+{% block content %}
+  <div class="settings-shell" id="settings-shell" aria-busy="true">
+    {#- ===== 检测参数 ===== -#}
+    <section class="settings-section" data-group="detection">
+      <header class="settings-section__header">
+        <h3 class="settings-section__title">检测参数</h3>
+        <span class="settings-section__caption">影响 AI 模型对流量的判定敏感度</span>
+      </header>
+      <div class="settings-section__body">
+        <div class="settings-field" data-field="detection_sensitivity">
+          <div class="settings-field__head">
+            <span class="settings-field__label">检测灵敏度</span>
+            <span class="settings-field__hint"></span>
+          </div>
+          <div class="settings-field__control">
+            <div class="slider-row">
+              <input type="range" data-bind="detection_sensitivity" />
+              <span class="slider-value" data-bind-display="detection_sensitivity">—</span>
+            </div>
+            <p class="settings-field__error" data-error="detection_sensitivity"></p>
+          </div>
+        </div>
+
+        <div class="settings-field" data-field="alert_threshold">
+          <div class="settings-field__head">
+            <span class="settings-field__label">告警触发阈值</span>
+            <span class="settings-field__hint"></span>
+          </div>
+          <div class="settings-field__control">
+            <div class="slider-row">
+              <input type="range" data-bind="alert_threshold" />
+              <span class="slider-value" data-bind-display="alert_threshold">—</span>
+            </div>
+            <p class="settings-field__error" data-error="alert_threshold"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {#- ===== 通知配置 ===== -#}
+    <section class="settings-section" data-group="notifications">
+      <header class="settings-section__header">
+        <h3 class="settings-section__title">通知配置</h3>
+        <span class="settings-section__caption">严重告警触发时将推送到此处</span>
+      </header>
+      <div class="settings-section__body">
+        <div class="settings-field" data-field="alert_email">
+          <div class="settings-field__head">
+            <span class="settings-field__label">告警邮箱</span>
+            <span class="settings-field__hint"></span>
+          </div>
+          <div class="settings-field__control settings-field__control--wide">
+            <div class="settings-inline">
+              <input type="email" class="form-input" data-bind="alert_email" />
+              <button class="btn btn--ghost btn--sm" type="button" data-test="email">发送测试</button>
+            </div>
+            <small class="settings-test-result" data-test-result="email"></small>
+            <p class="settings-field__error" data-error="alert_email"></p>
+          </div>
+        </div>
+
+        <div class="settings-field" data-field="alert_webhook">
+          <div class="settings-field__head">
+            <span class="settings-field__label">告警 Webhook</span>
+            <span class="settings-field__hint"></span>
+          </div>
+          <div class="settings-field__control settings-field__control--wide">
+            <div class="settings-inline">
+              <input type="url" class="form-input form-input--mono" data-bind="alert_webhook" />
+              <button class="btn btn--ghost btn--sm" type="button" data-test="webhook">试投</button>
+            </div>
+            <small class="settings-test-result" data-test-result="webhook"></small>
+            <p class="settings-field__error" data-error="alert_webhook"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {#- ===== 模型 ===== -#}
+    <section class="settings-section" data-group="model">
+      <header class="settings-section__header">
+        <h3 class="settings-section__title">模型配置</h3>
+        <span class="settings-section__caption">影响 /api/reports 中的 model_performance.version</span>
+      </header>
+      <div class="settings-section__body">
+        <div class="settings-field" data-field="model_version">
+          <div class="settings-field__head">
+            <span class="settings-field__label">当前模型版本</span>
+            <span class="settings-field__hint"></span>
+          </div>
+          <div class="settings-field__control">
+            <input type="text" class="form-input form-input--mono" data-bind="model_version" placeholder="v1" />
+            <p class="settings-field__error" data-error="model_version"></p>
+          </div>
+        </div>
+
+        <div class="settings-field" data-field="model_hot_reload">
+          <div class="settings-field__head">
+            <span class="settings-field__label">开启模型热更新</span>
+            <span class="settings-field__hint"></span>
+          </div>
+          <div class="settings-field__control">
+            <label class="switch" style="align-self: flex-start">
+              <input type="checkbox" data-bind="model_hot_reload" />
+              <span class="switch__track"></span>
+              <span class="switch__thumb"></span>
+            </label>
+            <p class="settings-field__error" data-error="model_hot_reload"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {#- ===== 运行时（只读） ===== -#}
+    <section class="settings-section" data-group="runtime">
+      <header class="settings-section__header">
+        <h3 class="settings-section__title">运行时参数（只读）</h3>
+        <span class="settings-section__caption">
+          这些值由 .env 与环境变量决定；修改后需重启应用生效
+        </span>
+      </header>
+      <div class="settings-section__body" id="runtime-body">
+        <div class="settings-field">
+          <div class="settings-field__head">
+            <span class="settings-field__label">Access Token 过期时间</span>
+            <span class="settings-field__hint">环境变量 <code class="mono">JWT_TOKEN_EXPIRES</code>，单位秒</span>
+          </div>
+          <div class="settings-field__control">
+            <span class="settings-field__readonly" data-runtime="jwt_access_expires_seconds">—</span>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field__head">
+            <span class="settings-field__label">Refresh Token 过期时间</span>
+            <span class="settings-field__hint">环境变量 <code class="mono">JWT_REFRESH_TOKEN_EXPIRES</code>，单位秒</span>
+          </div>
+          <div class="settings-field__control">
+            <span class="settings-field__readonly" data-runtime="jwt_refresh_expires_seconds">—</span>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field__head">
+            <span class="settings-field__label">API 限流策略</span>
+            <span class="settings-field__hint">环境变量 <code class="mono">API_RATE_LIMIT</code>，Flask-Limiter 语法</span>
+          </div>
+          <div class="settings-field__control">
+            <span class="settings-field__readonly" data-runtime="api_rate_limit">—</span>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field__head">
+            <span class="settings-field__label">日志完整性保护</span>
+            <span class="settings-field__hint">启用后日志写入会带 SHA-256 链式校验</span>
+          </div>
+          <div class="settings-field__control">
+            <span class="settings-field__readonly" data-runtime="log_integrity_enabled">—</span>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field__head">
+            <span class="settings-field__label">CORS 允许源</span>
+            <span class="settings-field__hint">环境变量 <code class="mono">ALLOWED_ORIGINS</code>（逗号分隔）</span>
+          </div>
+          <div class="settings-field__control settings-field__control--wide">
+            <ul class="settings-field__readonly" style="flex-direction: column; align-items: stretch; gap: 4px; padding: var(--space-sm) var(--space-md)" data-runtime="allowed_origins">
+              <li class="text-tertiary">—</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="settings-actions">
+      <div class="settings-actions__status" id="settings-status" role="status" aria-live="polite">
+        <span id="settings-status-dot" class="status-light" aria-hidden="true"></span>
+        <span id="settings-status-text">加载中…</span>
+      </div>
+      <button class="btn btn--ghost btn--sm" id="btn-reset" type="button" disabled>重置为已保存</button>
+      <button class="btn btn--primary btn--sm" id="btn-save" type="button" disabled>保存修改</button>
+    </div>
+  </div>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+{% endblock %}

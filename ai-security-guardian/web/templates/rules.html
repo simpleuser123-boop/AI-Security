@@ -1,0 +1,232 @@
+{% extends "base.html" %}
+
+{#-
+  规则管理（Rules） — DESIGN.md §8.4
+
+  布局契约：
+    - 规则列表表格：规则名称、类型、状态开关、操作（编辑 / 测试 / 删除）
+    - 新建/编辑规则：侧边抽屉面板
+    - 规则测试：抽屉内嵌终端面板，输入测试数据 → 显示匹配结果
+
+  规则 schema（前后端一致）：
+    id, name, type (signature|anomaly|threshold), pattern, action (alert|block|monitor),
+    level (low|medium|high|critical), priority (1~999), enabled (bool),
+    description, created_at, updated_at, hits
+-#}
+
+{% block title %}规则管理 · AI Security Guardian{% endblock %}
+{% block topbar_title %}规则管理{% endblock %}
+
+{% block topbar_actions %}
+  <button class="btn btn--ghost btn--sm" id="btn-seed" type="button" hidden>生成演示规则</button>
+  <button class="btn btn--ghost btn--sm" id="btn-refresh" type="button" title="手动刷新">刷新</button>
+  <button class="btn btn--primary btn--sm" id="btn-new-rule" type="button">新建规则</button>
+{% endblock %}
+
+{% block content %}
+  <section class="page-header" aria-label="规则统计">
+    <div class="page-header__meta" role="status" aria-live="polite">
+      <span>当前筛选 <strong id="count-filtered">0</strong></span>
+      <span>规则总数 <strong id="count-total">0</strong></span>
+      <span>已启用 <strong id="count-enabled">0</strong></span>
+    </div>
+    <div id="active-chips" class="page-header__meta" aria-label="活动筛选条件"></div>
+  </section>
+
+  <section class="filter-bar" aria-label="规则筛选">
+    <div class="filter-bar__group">
+      <span class="filter-bar__label">类型</span>
+      <div class="btn-group" role="group" aria-label="按类型筛选">
+        <button class="btn is-active" type="button" data-type="">全部</button>
+        <button class="btn" type="button" data-type="signature">特征</button>
+        <button class="btn" type="button" data-type="threshold">阈值</button>
+        <button class="btn" type="button" data-type="anomaly">异常</button>
+      </div>
+    </div>
+
+    <div class="filter-bar__group">
+      <label class="filter-bar__label" for="filter-enabled">启用状态</label>
+      <select id="filter-enabled" class="form-select">
+        <option value="">全部</option>
+        <option value="true">仅启用</option>
+        <option value="false">仅禁用</option>
+      </select>
+    </div>
+
+    <div class="filter-bar__group filter-bar__search">
+      <label class="filter-bar__label" for="filter-query">搜索</label>
+      <input
+        id="filter-query"
+        class="form-input form-input--mono"
+        type="search"
+        placeholder="名称 / 特征 / 描述…"
+        autocomplete="off"
+      />
+    </div>
+  </section>
+
+  <section class="card" aria-label="规则列表">
+    <div class="card__header">
+      <h3 class="card__title">检测规则</h3>
+      <span id="list-status" class="text-tertiary" style="font-size: var(--fs-caption)"></span>
+    </div>
+    <div class="card__body">
+      <div style="overflow-x: auto">
+        <table class="table" id="rules-table">
+          <thead>
+            <tr>
+              <th style="width: 48px" class="center">启用</th>
+              <th>规则名称</th>
+              <th style="width: 84px">类型</th>
+              <th>特征 / 表达式</th>
+              <th style="width: 90px">动作</th>
+              <th style="width: 80px">等级</th>
+              <th style="width: 72px" class="num">优先级</th>
+              <th style="width: 72px" class="num">命中</th>
+              <th style="width: 180px">更新时间</th>
+              <th style="width: 200px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="rules-tbody">
+            <tr>
+              <td colspan="10" class="alert-list__empty">
+                <span class="loader" aria-hidden="true"></span>
+                <span style="margin-left: 8px">加载中…</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  {#- 新建/编辑抽屉（含内嵌测试终端） -#}
+  <div id="drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <aside
+    id="rule-drawer"
+    class="drawer drawer--wide"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="drawer-title"
+    aria-hidden="true"
+  >
+    <header class="drawer__header">
+      <h2 class="drawer__title" id="drawer-title">
+        <span id="drawer-title-text" class="drawer__title-text">新建规则</span>
+      </h2>
+      <button class="drawer__close" id="drawer-close" type="button" aria-label="关闭">×</button>
+    </header>
+
+    <div class="drawer__body">
+      <form id="rule-form" autocomplete="off" onsubmit="return false">
+        <section class="drawer__section">
+          <h3 class="drawer__section-title">基本信息</h3>
+
+          <div class="form-group">
+            <label class="form-label" for="f-name">规则名称</label>
+            <input id="f-name" name="name" class="form-input" type="text" maxlength="80" required />
+            <div class="form-error" id="e-name" hidden></div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="f-description">描述</label>
+            <textarea id="f-description" name="description" class="form-textarea" rows="2" maxlength="400"></textarea>
+          </div>
+
+          <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md)">
+            <div>
+              <label class="form-label" for="f-type">类型</label>
+              <select id="f-type" name="type" class="form-select" required>
+                <option value="signature">signature（特征匹配）</option>
+                <option value="threshold">threshold（阈值）</option>
+                <option value="anomaly">anomaly（异常检测）</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label" for="f-action">动作</label>
+              <select id="f-action" name="action" class="form-select" required>
+                <option value="alert">alert（告警）</option>
+                <option value="block">block（阻断）</option>
+                <option value="monitor">monitor（仅记录）</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md)">
+            <div>
+              <label class="form-label" for="f-level">等级</label>
+              <select id="f-level" name="level" class="form-select" required>
+                <option value="low">低危</option>
+                <option value="medium">中危</option>
+                <option value="high" selected>高危</option>
+                <option value="critical">严重</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label" for="f-priority">优先级（1~999）</label>
+              <input id="f-priority" name="priority" type="number" min="1" max="999" value="100" class="form-input form-input--mono" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="f-pattern">特征 / 表达式</label>
+            <textarea id="f-pattern" name="pattern" class="form-textarea form-input--mono" rows="3" placeholder="" required></textarea>
+            <small id="f-pattern-hint" class="text-tertiary" style="font-size: var(--fs-caption)"></small>
+            <div class="form-error" id="e-pattern" hidden></div>
+          </div>
+
+          <label class="form-label" style="display: inline-flex; align-items: center; gap: var(--space-sm); margin-bottom: 0">
+            <span class="switch">
+              <input id="f-enabled" name="enabled" type="checkbox" checked />
+              <span class="switch__track"></span>
+              <span class="switch__thumb"></span>
+            </span>
+            <span style="text-transform: none; letter-spacing: 0">启用该规则</span>
+          </label>
+        </section>
+
+        <section class="drawer__section" id="section-test">
+          <h3 class="drawer__section-title">规则测试 · 内嵌终端</h3>
+          <p class="text-tertiary" style="font-size: var(--fs-caption); margin: 0 0 var(--space-sm)">
+            <span>在下方填测试样本，点击「运行测试」用当前抽屉内的规则评估。</span>
+          </p>
+
+          <div class="form-group">
+            <label class="form-label" for="t-payload">payload（用于 signature）</label>
+            <textarea id="t-payload" class="form-textarea form-input--mono" rows="2" placeholder="GET /admin?q=' OR 1=1 -- HTTP/1.1"></textarea>
+          </div>
+
+          <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md)">
+            <div>
+              <label class="form-label" for="t-src-ip">src_ip</label>
+              <input id="t-src-ip" class="form-input form-input--mono" type="text" placeholder="203.0.113.10" />
+            </div>
+            <div>
+              <label class="form-label" for="t-features">features（JSON，用于 threshold / anomaly）</label>
+              <input id="t-features" class="form-input form-input--mono" type="text"
+                placeholder='{"packets_per_sec":2000,"failed_ratio":0.9}' />
+            </div>
+          </div>
+
+          <div class="terminal" id="t-terminal" role="log" aria-live="polite">
+            <div class="terminal__line text-tertiary" style="font-style: italic">终端就绪：输入样本后运行测试。</div>
+            <div class="terminal__prompt">
+              <input id="t-input" class="terminal__input" type="text" placeholder="直接输入字符串作为 payload 并回车，或使用上方字段" />
+              <button class="btn btn--terminal btn--sm" id="t-run" type="button">运行测试</button>
+            </div>
+          </div>
+        </section>
+      </form>
+    </div>
+
+    <footer class="drawer__footer">
+      <button class="btn btn--ghost btn--sm" id="btn-drawer-cancel" type="button">取消</button>
+      <button class="btn btn--danger btn--sm" id="btn-drawer-delete" type="button" hidden>删除</button>
+      <button class="btn btn--primary btn--sm" id="btn-drawer-save" type="button">保存</button>
+    </footer>
+  </aside>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="{{ url_for('static', filename='js/rules.js') }}"></script>
+{% endblock %}

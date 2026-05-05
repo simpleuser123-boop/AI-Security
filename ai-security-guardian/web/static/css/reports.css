@@ -1,0 +1,439 @@
+/* =============================================================
+ * reports.css — 审计报告浅色模式（DESIGN.md §2.5 / §4.9 / §8.6）
+ *
+ * 设计约束：
+ *   - :root[data-theme="report"] 上重绑核心令牌 → 骨架自动变浅
+ *   - 不修改其它页面（只匹配 data-theme="report"）
+ *   - 打印友好：无斑马纹、黑白化图表线、隐藏侧栏/顶栏/交互按钮
+ * ============================================================= */
+
+:root[data-theme="report"] {
+  /* -- 报告专用令牌（DESIGN §2.5）-- */
+  --report-white: #FFFFFF;
+  --report-surface: #F9FAFB;
+  --report-surface-alt: #F3F4F6;
+  --report-border: #E5E7EB;
+  --report-border-strong: #111827;
+  --report-text: #111827;
+  --report-text-secondary: #4B5563;
+  --report-text-tertiary: #6B7280;
+
+  /* -- 覆写基础令牌（骨架与通用组件随之变浅）-- */
+  --bg-void: var(--report-white);
+  --surface-dark: var(--report-surface);
+  --surface-mid: var(--report-surface);
+  --surface-raised: var(--report-surface-alt);
+  --border-subtle: var(--report-border);
+  --border-default: var(--report-border);
+  --text-primary: var(--report-text);
+  --text-secondary: var(--report-text-secondary);
+  --text-tertiary: var(--report-text-tertiary);
+  --accent-emerald-glow: rgba(16, 185, 129, 0.08);
+
+  color-scheme: light;
+}
+
+/* 让全局选区、滚动条也符合浅色语义 */
+:root[data-theme="report"] body {
+  background: var(--report-white);
+  color: var(--report-text);
+}
+
+:root[data-theme="report"] ::-webkit-scrollbar-track {
+  background: var(--report-surface);
+}
+:root[data-theme="report"] ::-webkit-scrollbar-thumb {
+  background: #D1D5DB;
+}
+
+/* 主图表容器在浅色模式下使用白底 */
+:root[data-theme="report"] .chart {
+  background: var(--report-white);
+}
+
+/* 徽章（威胁/IOC/等级）在浅色模式下保留原语义色，但降低底色透明度以便打印 */
+:root[data-theme="report"] .badge--low {
+  color: #1D4ED8;
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.3);
+}
+:root[data-theme="report"] .badge--medium {
+  color: #B45309;
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+:root[data-theme="report"] .badge--high {
+  color: #B91C1C;
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+:root[data-theme="report"] .badge--critical {
+  color: #BE185D;
+  background: rgba(236, 72, 153, 0.1);
+  border-color: rgba(236, 72, 153, 0.3);
+  animation: none; /* 打印不要脉冲 */
+}
+
+/* 侧栏在报告模式下变浅 */
+:root[data-theme="report"] .sidebar {
+  background: var(--report-surface-alt);
+  border-right: 1px solid var(--report-border);
+}
+
+:root[data-theme="report"] .sidebar__item {
+  color: var(--report-text-secondary);
+}
+
+:root[data-theme="report"] .sidebar__item.is-active {
+  background: var(--accent-emerald-glow);
+  color: #065F46;
+}
+
+:root[data-theme="report"] .topbar {
+  background: var(--report-white);
+  border-bottom: 1px solid var(--report-border);
+}
+
+:root[data-theme="report"] .topbar__title {
+  color: var(--report-text);
+}
+
+/* 卡片：DESIGN §4.9 — 白底、1px 浅灰边框、12px 圆角 */
+:root[data-theme="report"] .card {
+  background: var(--report-white);
+  border: 1px solid var(--report-border);
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+/* 报告段落主体 */
+.report-root {
+  max-width: 960px;
+  margin: 0 auto;
+  font-family: var(--font-sans);
+  color: var(--report-text);
+  line-height: 1.7;
+}
+
+.report-cover {
+  padding: var(--space-xl) 0 var(--space-lg);
+  border-bottom: 2px solid var(--report-border-strong);
+  margin-bottom: var(--space-xl);
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  flex-wrap: wrap;
+}
+
+.report-cover__title {
+  font-size: var(--fs-display);
+  font-weight: 700;
+  margin: 0 0 var(--space-xs);
+  color: var(--report-text);
+  letter-spacing: -0.01em;
+}
+
+.report-cover__subtitle {
+  color: var(--report-text-secondary);
+  font-size: var(--fs-body);
+  margin: 0;
+}
+
+.report-cover__meta {
+  font-family: var(--font-mono);
+  color: var(--report-text-tertiary);
+  font-size: var(--fs-caption);
+  text-align: right;
+}
+
+.report-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin: 0 auto var(--space-lg);
+  max-width: 960px;
+  flex-wrap: wrap;
+}
+
+.report-toolbar__actions {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+/* 报告段落 */
+.report-section {
+  margin-bottom: var(--space-2xl);
+}
+
+.report-section__title {
+  font-size: var(--fs-h1);
+  font-weight: 600;
+  color: var(--report-text);
+  margin: 0 0 var(--space-md);
+  padding-bottom: var(--space-xs);
+  border-bottom: 2px solid var(--report-border-strong);
+}
+
+.report-section__subtitle {
+  color: var(--report-text-tertiary);
+  font-size: var(--fs-caption);
+  margin: -6px 0 var(--space-md);
+}
+
+.report-section__body {
+  background: var(--report-surface);
+  border: 1px solid var(--report-border);
+  border-radius: 12px;
+  padding: var(--space-lg);
+}
+
+/* 概览指标卡网格 */
+.report-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-md);
+}
+
+.report-metric {
+  background: var(--report-white);
+  border: 1px solid var(--report-border);
+  border-radius: 8px;
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.report-metric__label {
+  font-size: var(--fs-caption);
+  color: var(--report-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.report-metric__value {
+  font-size: var(--fs-h1);
+  font-weight: 600;
+  color: var(--report-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.report-metric__hint {
+  font-size: var(--fs-caption);
+  color: var(--report-text-tertiary);
+}
+
+.report-metric--danger .report-metric__value {
+  color: #B91C1C;
+}
+.report-metric--warning .report-metric__value {
+  color: #B45309;
+}
+.report-metric--success .report-metric__value {
+  color: #047857;
+}
+.report-metric--info .report-metric__value {
+  color: #1D4ED8;
+}
+
+/* 威胁统计：左饼 + 右条 / 下方时间线 */
+.report-threats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-lg);
+  margin-bottom: var(--space-lg);
+}
+
+@media (max-width: 767px) {
+  .report-threats {
+    grid-template-columns: 1fr;
+  }
+}
+
+.report-chart {
+  background: var(--report-white);
+  border: 1px solid var(--report-border);
+  border-radius: 8px;
+  padding: var(--space-md);
+}
+
+.report-chart__title {
+  font-size: var(--fs-caption);
+  color: var(--report-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 var(--space-sm);
+}
+
+.report-chart__body {
+  width: 100%;
+  height: 260px;
+}
+
+/* 报告表格：无斑马纹、细边框 */
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-body);
+  background: var(--report-white);
+}
+
+.report-table th,
+.report-table td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--report-border);
+}
+
+.report-table th {
+  background: var(--report-surface-alt);
+  color: var(--report-text-secondary);
+  font-weight: 500;
+  font-size: var(--fs-caption);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.report-table tbody tr:hover {
+  background: var(--report-surface);
+}
+
+.report-table .mono {
+  font-family: var(--font-mono);
+  color: #1D4ED8;
+}
+
+/* 建议条目 */
+.report-recommendations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.report-recommendations__item {
+  background: var(--report-white);
+  border: 1px solid var(--report-border);
+  border-left-width: 3px;
+  border-radius: 8px;
+  padding: var(--space-md) var(--space-lg);
+}
+
+.report-recommendations__item--critical {
+  border-left-color: #BE185D;
+}
+.report-recommendations__item--high {
+  border-left-color: #B91C1C;
+}
+.report-recommendations__item--medium {
+  border-left-color: #B45309;
+}
+.report-recommendations__item--low {
+  border-left-color: #1D4ED8;
+}
+.report-recommendations__item--info {
+  border-left-color: #047857;
+}
+
+.report-recommendations__title {
+  font-weight: 600;
+  font-size: var(--fs-body);
+  margin: 0 0 4px;
+  color: var(--report-text);
+}
+
+.report-recommendations__body {
+  margin: 0;
+  color: var(--report-text-secondary);
+  font-size: var(--fs-body);
+  line-height: 1.7;
+}
+
+.report-footer {
+  text-align: center;
+  padding: var(--space-lg) 0;
+  color: var(--report-text-tertiary);
+  font-size: var(--fs-caption);
+  border-top: 1px solid var(--report-border);
+  margin-top: var(--space-2xl);
+}
+
+/* =============================================================
+ * 打印样式：A4 + 隐藏 sidebar/topbar/交互按钮
+ * ============================================================= */
+@media print {
+  @page {
+    size: A4;
+    margin: 18mm 14mm 20mm;
+  }
+
+  :root[data-theme="report"] body,
+  :root[data-theme="report"] .app-shell,
+  :root[data-theme="report"] .app-main,
+  :root[data-theme="report"] .page-body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  :root[data-theme="report"] .sidebar,
+  :root[data-theme="report"] .topbar,
+  :root[data-theme="report"] .menu-toggle,
+  :root[data-theme="report"] .report-toolbar,
+  :root[data-theme="report"] .drawer,
+  :root[data-theme="report"] .drawer-overlay,
+  :root[data-theme="report"] #ag-toast-container {
+    display: none !important;
+  }
+
+  /* 打印时让主内容占满宽度 */
+  :root[data-theme="report"] .page-body {
+    padding: 0 !important;
+  }
+
+  :root[data-theme="report"] .report-root {
+    max-width: none;
+    margin: 0;
+  }
+
+  /* 卡片与段落避免跨页拆断 */
+  :root[data-theme="report"] .report-section,
+  :root[data-theme="report"] .report-chart,
+  :root[data-theme="report"] .report-metric,
+  :root[data-theme="report"] .report-recommendations__item {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  :root[data-theme="report"] .report-cover {
+    break-after: auto;
+  }
+
+  /* 打印不要背景色（部分打印机会丢墨）*/
+  :root[data-theme="report"] .report-section__body,
+  :root[data-theme="report"] .report-metric,
+  :root[data-theme="report"] .report-chart,
+  :root[data-theme="report"] .report-table th,
+  :root[data-theme="report"] .report-recommendations__item {
+    background: #fff !important;
+  }
+
+  /* 关闭跨页表格的边距抖动 */
+  :root[data-theme="report"] .report-table {
+    page-break-inside: auto;
+  }
+  :root[data-theme="report"] .report-table tr {
+    page-break-inside: avoid;
+    page-break-after: auto;
+  }
+  :root[data-theme="report"] .report-table thead {
+    display: table-header-group;
+  }
+  :root[data-theme="report"] .report-table tfoot {
+    display: table-footer-group;
+  }
+}

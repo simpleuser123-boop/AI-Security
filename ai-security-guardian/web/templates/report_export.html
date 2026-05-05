@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<!-- guardian-report-export -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>AI 安全守卫 — 审计报告</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #111; }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.1rem; margin-top: 1.5rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
+    table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; font-size: 0.9rem; }
+    th, td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
+    .muted { color: #666; font-size: 0.85rem; }
+    @media print { body { margin: 1rem; } }
+  </style>
+</head>
+<body>
+  <h1>AI 安全守卫 · 审计报告</h1>
+  <p class="muted">
+    周期：{{ summary.period }} · 窗口 {{ summary.window.start }} — {{ summary.window.end }} ·
+    生成时间 {{ summary.generated_at }}
+  </p>
+
+  <h2>周期概览</h2>
+  <table>
+    {% for k, v in summary.overview.items() %}
+    <tr><th>{{ k }}</th><td>{{ v }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>告警等级分布</h2>
+  <table>
+    <tr><th>等级</th><th>数量</th></tr>
+    {% for row in summary.threats.by_level %}
+    <tr><td>{{ row.level }}</td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>告警类型（Top）</h2>
+  <table>
+    <tr><th>类型</th><th>数量</th></tr>
+    {% for row in summary.threats.by_type %}
+    <tr><td>{{ row.type }}</td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>攻击来源 Top10</h2>
+  <table>
+    <tr><th>IP</th><th>次数</th></tr>
+    {% for row in summary.threats.top_sources %}
+    <tr><td>{{ row.ip }}</td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>响应与封禁</h2>
+  <table>
+    <tr><th>时间</th><th>动作</th><th>目标</th><th>操作人</th><th>说明</th></tr>
+    {% for r in summary.responses %}
+    <tr>
+      <td>{{ r.timestamp }}</td>
+      <td>{{ r.action }}</td>
+      <td>{{ r.target }}</td>
+      <td>{{ r.operator or '—' }}</td>
+      <td>{{ r.reason or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>模型版本与检测质量</h2>
+  <table>
+    {% for k, v in summary.model_performance.items() %}
+    {% if k != 'confidence_distribution' %}
+    <tr><th>{{ k }}</th><td>{{ v }}</td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  <table>
+    <tr><th>置信度区间</th><th>计数</th></tr>
+    {% for row in summary.model_performance.confidence_distribution %}
+    <tr><td>{{ row.range }}</td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>加固建议</h2>
+  <ul>
+    {% for rec in summary.recommendations %}
+    <li><strong>[{{ rec.severity }}]</strong> {{ rec.title }} — {{ rec.body }}</li>
+    {% endfor %}
+  </ul>
+
+  <p class="muted">PDF 导出：请使用浏览器打印本页并选择「另存为 PDF」（后续可接入无头浏览器或专用渲染服务）。</p>
+</body>
+</html>

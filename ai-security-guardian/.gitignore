@@ -1,0 +1,9 @@
+﻿.env
+*.db
+models/saved/*.pkl
+models/saved/*.h5
+logs/
+__pycache__/
+*.pyc
+data/raw/
+data/processed/

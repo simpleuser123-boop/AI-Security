@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+
+{#-
+  威胁情报（Threat Intel）— Phase 7 Prompt §2.3 + 架构文档 §3.2
+
+  布局契约：
+    - 查询面板：类型段控（IP / Domain）+ 值输入 + provider 复选 + 查询按钮
+                 → 裁决条（malicious / clean）+ 三 provider 结果卡
+    - IOC 列表：表格（类型/值/来源/评分/命中次数/原因/加入时间/操作）+ 筛选 + 新增抽屉
+
+  Provider 约定：
+    - local：本地黑名单（同步到 ThreatIntelCollector，供检测前置过滤）
+    - abuseipdb：有 API Key 则真实调用；DEBUG/THREAT_INTEL_MOCK 下走 mock
+    - virustotal：同上
+-#}
+
+{% block title %}威胁情报 · AI Security Guardian{% endblock %}
+{% block topbar_title %}威胁情报{% endblock %}
+
+{% block topbar_actions %}
+  <button class="btn btn--ghost btn--sm" id="btn-seed" type="button" hidden>生成演示 IOC</button>
+  <button class="btn btn--ghost btn--sm" id="btn-refresh" type="button">刷新</button>
+  <button class="btn btn--primary btn--sm" id="btn-new-ioc" type="button">新增 IOC</button>
+{% endblock %}
+
+{% block content %}
+  <section class="page-header" aria-label="情报统计">
+    <div class="page-header__meta" role="status" aria-live="polite">
+      <span>IOC 总数 <strong id="count-total">0</strong></span>
+      <span>IP <strong id="count-ip">0</strong></span>
+      <span>域名 <strong id="count-domain">0</strong></span>
+    </div>
+    <div id="provider-status" class="page-header__meta" aria-label="Provider 状态"></div>
+  </section>
+
+  {#- ===== 查询面板 ===== -#}
+  <section class="card" style="margin-bottom: var(--space-md)" aria-label="IOC 查询">
+    <div class="card__header">
+      <h3 class="card__title">IOC 查询面板</h3>
+      <span class="text-tertiary" style="font-size: var(--fs-caption)">
+        同时查询本地黑名单 / AbuseIPDB / VirusTotal
+      </span>
+    </div>
+    <div class="card__body">
+      <div class="query-panel">
+        <div class="query-panel__inputs">
+          <div class="filter-bar__group" style="padding: 0">
+            <span class="filter-bar__label">类型</span>
+            <div class="btn-group" role="group" aria-label="IOC 类型">
+              <button class="btn is-active" type="button" data-query-type="ip">IP</button>
+              <button class="btn" type="button" data-query-type="domain">域名</button>
+            </div>
+          </div>
+
+          <div class="filter-bar__group" style="padding: 0">
+            <label class="filter-bar__label" for="q-value">IOC 值</label>
+            <input
+              id="q-value"
+              class="form-input form-input--mono"
+              type="text"
+              placeholder="1.2.3.4 或 evil-example.com"
+              autocomplete="off"
+            />
+          </div>
+
+          <div style="display: flex; gap: var(--space-sm); align-items: flex-end; min-height: 38px">
+            <button class="btn btn--primary btn--sm" id="btn-query" type="button">查询</button>
+            <button class="btn btn--ghost btn--sm" id="btn-query-clear" type="button">清空</button>
+          </div>
+        </div>
+
+        {#- 裁决横幅：查询前隐藏 -#}
+        <div id="query-verdict" class="query-verdict" hidden>
+          <div>
+            <div class="query-verdict__status" id="verdict-status">—</div>
+            <div class="query-verdict__detail" id="verdict-detail">—</div>
+          </div>
+          <div style="margin-left: auto" class="text-tertiary" style="font-size: var(--fs-caption)">
+            <span class="query-verdict__value" id="verdict-value"></span>
+          </div>
+        </div>
+
+        <div id="provider-grid" class="provider-grid">
+          {# 三个 provider 卡片由 JS 填充 #}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {#- ===== IOC 列表 ===== -#}
+  <section class="filter-bar" aria-label="IOC 筛选">
+    <div class="filter-bar__group">
+      <span class="filter-bar__label">类型</span>
+      <div class="btn-group" role="group" aria-label="按类型筛选">
+        <button class="btn is-active" type="button" data-list-type="">全部</button>
+        <button class="btn" type="button" data-list-type="ip">IP</button>
+        <button class="btn" type="button" data-list-type="domain">域名</button>
+      </div>
+    </div>
+    <div class="filter-bar__group">
+      <label class="filter-bar__label" for="filter-source">来源</label>
+      <select id="filter-source" class="form-select">
+        <option value="">全部来源</option>
+      </select>
+    </div>
+    <div class="filter-bar__group filter-bar__search">
+      <label class="filter-bar__label" for="filter-q">搜索</label>
+      <input
+        id="filter-q"
+        class="form-input form-input--mono"
+        type="search"
+        placeholder="值 / 原因 / 备注…"
+        autocomplete="off"
+      />
+    </div>
+  </section>
+
+  <section class="card" aria-label="IOC 列表">
+    <div class="card__header">
+      <h3 class="card__title">IOC 列表</h3>
+      <span id="list-status" class="text-tertiary" style="font-size: var(--fs-caption)"></span>
+    </div>
+    <div class="card__body">
+      <div style="overflow-x: auto">
+        <table class="table" id="iocs-table">
+          <thead>
+            <tr>
+              <th style="width: 72px">类型</th>
+              <th>值</th>
+              <th style="width: 220px">来源</th>
+              <th style="width: 90px" class="num">评分</th>
+              <th style="width: 80px" class="num">命中</th>
+              <th>原因 / 备注</th>
+              <th style="width: 160px">加入时间</th>
+              <th style="width: 160px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="iocs-tbody">
+            <tr>
+              <td colspan="8" class="alert-list__empty">
+                <span class="loader" aria-hidden="true"></span>
+                <span style="margin-left: 8px">加载中…</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  {#- ===== 新增 IOC 抽屉 ===== -#}
+  <div id="drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <aside
+    id="ioc-drawer"
+    class="drawer"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="drawer-title"
+    aria-hidden="true"
+  >
+    <header class="drawer__header">
+      <h2 class="drawer__title" id="drawer-title">
+        <span class="drawer__title-text">新增 IOC</span>
+      </h2>
+      <button class="drawer__close" id="drawer-close" type="button" aria-label="关闭">×</button>
+    </header>
+
+    <div class="drawer__body">
+      <form id="ioc-form" autocomplete="off" onsubmit="return false">
+        <div class="form-group">
+          <label class="form-label" for="f-type">类型</label>
+          <select id="f-type" class="form-select">
+            <option value="ip" selected>IP</option>
+            <option value="domain">域名</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="f-value">值</label>
+          <input id="f-value" class="form-input form-input--mono" type="text" required />
+          <div class="form-error" id="e-value" hidden></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="f-source">来源</label>
+          <input id="f-source" class="form-input" type="text" value="manual" maxlength="40" />
+          <small class="text-tertiary" style="font-size: var(--fs-caption)">
+            来源标签（如 manual / abuseipdb / virustotal / phishtank / internal-report）
+          </small>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="f-score">评分（0~100，可空）</label>
+          <input id="f-score" class="form-input form-input--mono" type="number" min="0" max="100" placeholder="留空表示未评分" />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="f-reason">原因</label>
+          <input id="f-reason" class="form-input" type="text" maxlength="200" placeholder="为什么要加入黑名单" />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="f-note">备注</label>
+          <textarea id="f-note" class="form-textarea" rows="2" maxlength="400"></textarea>
+        </div>
+      </form>
+    </div>
+
+    <footer class="drawer__footer">
+      <button class="btn btn--ghost btn--sm" id="btn-drawer-cancel" type="button">取消</button>
+      <button class="btn btn--primary btn--sm" id="btn-drawer-save" type="button">添加到黑名单</button>
+    </footer>
+  </aside>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="{{ url_for('static', filename='js/threat_intel.js') }}"></script>
+{% endblock %}

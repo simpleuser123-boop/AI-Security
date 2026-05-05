@@ -1,0 +1,17 @@
+{
+  "schema_name": "system_behavior_v1",
+  "schema_version": "1",
+  "description": "系统 / 用户行为异常检测输入契约（预留，与登录、进程、权限日志对齐）。",
+  "required_fields": {
+    "host_id": {"type": "string", "policy": "forbid_silent_fill"},
+    "event_time": {"type": "string", "policy": "forbid_silent_fill"},
+    "event_type": {"type": "string", "policy": "forbid_silent_fill"}
+  },
+  "optional_fields": {
+    "user": {"type": "string", "policy": "optional"},
+    "process_name": {"type": "string", "policy": "optional"},
+    "pid": {"type": "number", "policy": "optional"},
+    "severity_hint": {"type": "string", "policy": "optional"},
+    "raw_message": {"type": "string", "policy": "optional"}
+  }
+}
