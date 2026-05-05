@@ -97,6 +97,23 @@ class SecurityLogger:
         # 避免同一条日志被 Flask root logger 再次打印
         self.logger.propagate = False
 
+    def close(self) -> None:
+        """释放该审计 logger 持有的所有 handler。
+
+        Windows 会对打开的 FileHandler 保持独占文件句柄；测试或短生命周期
+        进程删除临时日志目录前必须显式关闭，否则 TemporaryDirectory 清理会失败。
+        """
+        for handler in list(self.logger.handlers):
+            self.logger.removeHandler(handler)
+            try:
+                handler.flush()
+            except Exception:  # noqa: BLE001 - close must be best-effort
+                pass
+            try:
+                handler.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _restore_last_hash(self) -> None:
         """从既有 security.log 末行恢复链尾 hash，保证跨重启链连续。"""
         if not self.enable_integrity:

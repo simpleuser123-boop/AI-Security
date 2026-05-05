@@ -168,6 +168,7 @@ class SecurityGuardian:
     def __init__(self, cfg: Optional[RuntimeConfig] = None) -> None:
         self.cfg: RuntimeConfig = cfg or RuntimeConfig.from_env()
         self._running: bool = False
+        self._shutdown_complete: bool = False
         self._shutdown_lock = threading.Lock()
 
         # ---- 审计日志（首先启动，保证后续故障都能留痕）------------------
@@ -700,12 +701,16 @@ class SecurityGuardian:
     def shutdown(self) -> None:
         """幂等的关闭流程，所有子模块的停止都被 try 包裹。"""
         with self._shutdown_lock:
-            if not self._running:
+            if self._shutdown_complete:
                 return
             self._running = False
+            self._shutdown_complete = True
 
         logger.info("[Guardian] 开始优雅关闭...")
-        self.security_logger.log_system("AI-Security-Guardian 关闭中", level="info")
+        try:
+            self.security_logger.log_system("AI-Security-Guardian 关闭中", level="info")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Guardian] 关闭审计日志写入失败: %s", exc)
 
         if self.packet_collector is not None:
             try:
@@ -720,6 +725,11 @@ class SecurityGuardian:
                 logger.info("[Guardian] 审计缓冲回写成功 %d 条", drained)
         except Exception:  # noqa: BLE001
             pass
+
+        try:
+            self.security_logger.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Guardian] 审计日志 handler 释放失败: %s", exc)
 
         logger.info("[Guardian] 系统已停止")
 

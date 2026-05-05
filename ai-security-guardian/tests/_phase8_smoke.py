@@ -30,10 +30,19 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def _close_security_logger_handlers() -> None:
     """Release FileHandler locks before deleting temporary smoke directories."""
-    sec_logger = logging.getLogger("security")
-    for handler in list(sec_logger.handlers):
-        sec_logger.removeHandler(handler)
-        handler.close()
+    loggers = [logging.getLogger("security")]
+    loggers.extend(
+        logger
+        for name, logger in logging.Logger.manager.loggerDict.items()
+        if name.startswith("security.") and isinstance(logger, logging.Logger)
+    )
+    for sec_logger in loggers:
+        for handler in list(sec_logger.handlers):
+            sec_logger.removeHandler(handler)
+            try:
+                handler.flush()
+            finally:
+                handler.close()
 
 
 def _setup_env() -> None:
