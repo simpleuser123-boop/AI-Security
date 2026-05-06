@@ -20,7 +20,8 @@
 #   - 系统依赖: libpcap-dev（供 Scapy 在需要抓包时使用；Web/API 容器不会真正抓包，
 #               但安装它以便同一镜像可兼做完整检测链路入口）
 #   - 非 root 用户: guardian（降低容器逃逸风险）
-#   - 默认启动: `python -m web.app`（Web/API 层，无需管理员权限）
+#   - 默认启动: Gunicorn gthread worker（Web/API 层，无需管理员权限）
+#   - 开发启动: `python -m web.app` 保留给本地调试
 #
 # 注意：故意不使用 `# syntax=docker/dockerfile:1.6`，避免 buildx 在首次构建时
 # 额外拉取 `docker/dockerfile:1.6` 前端镜像（这是部分网络下构建失败的主因）。
@@ -36,7 +37,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    PORT=5000 \
+    WEB_CONCURRENCY=1 \
+    GUNICORN_THREADS=100 \
+    GUNICORN_TIMEOUT=120 \
+    GUNICORN_GRACEFUL_TIMEOUT=30 \
+    GUNICORN_KEEPALIVE=5
 
 WORKDIR /app
 
@@ -88,4 +95,4 @@ sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=1)
 # ---- 入口 ----------------------------------------------------------
 # 使用 tini 作为 PID 1，正确处理 SIGTERM / SIGINT，保证容器优雅停止
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "-m", "web.app"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-5000} --worker-class gthread --workers ${WEB_CONCURRENCY:-1} --threads ${GUNICORN_THREADS:-100} --timeout ${GUNICORN_TIMEOUT:-120} --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT:-30} --keep-alive ${GUNICORN_KEEPALIVE:-5} --access-logfile - --error-logfile - --log-level ${GUNICORN_LOG_LEVEL:-info} web.wsgi:app"]

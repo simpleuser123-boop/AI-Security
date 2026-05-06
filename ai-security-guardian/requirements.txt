@@ -20,6 +20,7 @@ gast==0.7.0
 google-pasta==0.2.0
 greenlet==3.4.0
 grpcio==1.80.0
+gunicorn==23.0.0; platform_system != "Windows"
 h11==0.16.0
 h5py==3.14.0
 idna==3.13
@@ -69,6 +70,7 @@ threadpoolctl==3.6.0
 typing_extensions==4.15.0
 tzdata==2026.2
 urllib3==2.6.3
+waitress==3.0.2; platform_system == "Windows"
 Werkzeug==3.1.8
 wheel==0.47.0
 wrapt==2.1.2

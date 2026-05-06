@@ -48,6 +48,15 @@ services:
       ENABLE_WEB_LOG: "false"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5000}
+      PORT: "5000"
+      # Flask-SocketIO + Gunicorn 不建议在单个 Gunicorn master 下开多 worker；
+      # 如需横向扩容，运行多个单 worker app 实例并在反向代理层启用粘性会话。
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-100}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+      GUNICORN_GRACEFUL_TIMEOUT: ${GUNICORN_GRACEFUL_TIMEOUT:-30}
+      GUNICORN_KEEPALIVE: ${GUNICORN_KEEPALIVE:-5}
+      GUNICORN_LOG_LEVEL: ${GUNICORN_LOG_LEVEL:-info}
     volumes:
       - ./models/saved:/app/models/saved:ro
       - ./logs:/app/logs

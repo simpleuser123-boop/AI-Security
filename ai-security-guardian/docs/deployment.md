@@ -375,7 +375,55 @@ curl -fsS http://127.0.0.1:5000/healthz
 curl -fsS http://127.0.0.1:5000/readyz
 ```
 
-### 6.3 启用完整检测链路
+### 6.3 Web/API 生产启动方式
+
+`python -m web.app` 只作为本地开发入口保留。它通过 `socketio.run()` 启动，便于调试、热重载和 Windows 本机联调；生产容器不再依赖 Werkzeug development server。
+
+生产镜像默认启动命令为：
+
+```bash
+gunicorn \
+  --bind 0.0.0.0:${PORT:-5000} \
+  --worker-class gthread \
+  --workers ${WEB_CONCURRENCY:-1} \
+  --threads ${GUNICORN_THREADS:-100} \
+  --timeout ${GUNICORN_TIMEOUT:-120} \
+  --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT:-30} \
+  --keep-alive ${GUNICORN_KEEPALIVE:-5} \
+  --access-logfile - \
+  --error-logfile - \
+  --log-level ${GUNICORN_LOG_LEVEL:-info} \
+  web.wsgi:app
+```
+
+选型说明：
+
+- Linux 容器优先使用 `gunicorn` + `gthread`。项目当前 `Flask-SocketIO` 明确配置为 `async_mode="threading"`，且已依赖 `simple-websocket`，因此该组合可以承载 Socket.IO WebSocket，不需要引入 eventlet/gevent monkey patch 风险。
+- `WEB_CONCURRENCY` 默认保持 `1`。Flask-SocketIO 在单个 Gunicorn master 下不建议直接开启多个 worker；Gunicorn 的连接分发不保证 Socket.IO 会话稳定落到同一 worker。需要扩容时，运行多个 `WEB_CONCURRENCY=1` 的 app 实例，由 Nginx/LB 做粘性会话，并为 Socket.IO 配置共享消息队列后再放开多实例广播。
+- `GUNICORN_THREADS` 默认 `100`，适合 Web/API + Socket.IO 长连接的轻中等并发。CPU 密集型模型推理不应放在 Web 请求线程里长时间执行；应由检测链路或后台任务处理。
+- `GUNICORN_TIMEOUT` 默认 `120` 秒，避免慢启动、模型/数据库首次连接和少量慢请求被过早杀死。反向代理 `proxy_read_timeout` 对 `/socket.io/` 应大于 `ping_interval + ping_timeout`，本文 Nginx 示例使用 `300s`。
+- 日志统一写到 stdout/stderr：`--access-logfile -`、`--error-logfile -`，由 Docker logging driver、journald 或集中式日志系统采集。应用审计日志继续写入挂载的 `./logs:/app/logs`。
+
+eventlet/gevent 评估：
+
+- `gunicorn -k eventlet` 或 `gunicorn -k gevent` 适合高并发长连接，但需要安装对应依赖、尽早 monkey patch，并把 Socket.IO async mode 切换到对应模式。本项目当前没有这类补丁入口；为避免影响数据库、Redis、Scapy、TensorFlow/scikit-learn 等依赖，本版本不默认引入。
+- ASGI 不是当前推荐路径。应用是 Flask + Flask-SocketIO 的 WSGI 架构，切到 ASGI 需要额外适配或框架迁移，不符合本次“不重构应用工厂”的约束。
+
+Windows 本机替代：
+
+```powershell
+# 完整本地联调，保留现有开发入口
+$env:FLASK_ENV="development"
+$env:DISABLE_RELOADER="true"
+python -m web.app
+
+# 仅 HTTP/API 的 WSGI 生产替代；Waitress 不承载 Socket.IO WebSocket 升级
+waitress-serve --listen=0.0.0.0:5000 web.wsgi:app
+```
+
+Waitress 可作为 Windows 本机 HTTP/API 部署替代，但它不是完整 WebSocket 服务器。若生产必须使用 Dashboard 的 Socket.IO 实时能力，推荐使用 Linux 容器方案，或在 Windows 仅作为开发/演示运行。
+
+### 6.4 启用完整检测链路
 
 仅在需要真实抓包和主机授权后启用：
 
