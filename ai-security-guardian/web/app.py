@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
-from flask import Flask, jsonify, redirect, render_template, request, url_for, has_request_context
+from flask import Flask, current_app, jsonify, redirect, render_template, request, url_for, has_request_context
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager,
@@ -1013,7 +1013,7 @@ def _record_audit_event(
     resource_id: Optional[str] = None,
     payload: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Best-effort 操作审计入库；失败只记录日志，不阻断业务接口。"""
+    """Best-effort 操作审计入库，并同步写入哈希链日志用于合规举证。"""
     try:
         ip_address = get_remote_address() if has_request_context() else None
         db.session.add(
@@ -1030,6 +1030,37 @@ def _record_audit_event(
     except Exception:  # noqa: BLE001
         db.session.rollback()
         logger.warning("[AuditEvent] 写入失败: %s", event_type, exc_info=True)
+        ip_address = None
+
+    try:
+        app = current_app._get_current_object()
+        audit_logger = app.extensions.get("guardian_security_audit_logger")
+        if audit_logger is None:
+            from src.audit.security_logger import SecurityLogger
+
+            audit_logger = SecurityLogger(
+                log_dir=app.config.get("GUARDIAN_LOG_DIR", "logs"),
+                enable_integrity=bool(app.config.get("LOG_INTEGRITY_ENABLED", True)),
+            )
+            app.extensions["guardian_security_audit_logger"] = audit_logger
+        audit_logger.log_event(
+            event_type="operation_audit",
+            level="info",
+            details={
+                "event_type": event_type[:64],
+                "actor": (actor or "anonymous")[:128],
+                "resource_type": (resource_type or "")[:64] or None,
+                "resource_id": (resource_id or "")[:255] or None,
+                "payload": payload or {},
+                "ip_address": ip_address,
+            },
+            source_ip=ip_address or "",
+            confidence=1.0,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[AuditEvent] 哈希链日志写入失败: %s", event_type, exc_info=True
+        )
 
 
 def _hydrate_settings_from_db(state: _ServerState) -> None:

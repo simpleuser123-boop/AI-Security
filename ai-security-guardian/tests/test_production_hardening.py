@@ -52,7 +52,7 @@ def test_production_get_config_rejects_default_secret():
         "os.environ['SECRET_KEY']='dev-only-insecure-key-never-use-in-production'\n"
         "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
         "os.environ['REDIS_PASSWORD']='x'\n"
-        "os.environ['ALLOWED_ORIGINS']='https://example.com'\n"
+        "os.environ['ALLOWED_ORIGINS']='https://console.beta.acme-security.cn'\n"
         "import importlib\n"
         "import config.config as cc\n"
         "importlib.reload(cc)\n"
@@ -77,7 +77,7 @@ def test_production_get_config_requires_admin_password_hash():
         "os.environ['SECRET_KEY']='a' * 40\n"
         "os.environ.pop('ADMIN_PASSWORD_HASH', None)\n"
         "os.environ['REDIS_PASSWORD']='redis-secret'\n"
-        "os.environ['ALLOWED_ORIGINS']='https://app.example.com'\n"
+        "os.environ['ALLOWED_ORIGINS']='https://console.beta.acme-security.cn'\n"
         "import importlib\n"
         "import config.config as cc\n"
         "importlib.reload(cc)\n"
@@ -101,7 +101,7 @@ def test_production_get_config_requires_redis_password():
         "os.environ['SECRET_KEY']='a' * 40\n"
         "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
         "os.environ.pop('REDIS_PASSWORD', None)\n"
-        "os.environ['ALLOWED_ORIGINS']='https://app.example.com'\n"
+        "os.environ['ALLOWED_ORIGINS']='https://console.beta.acme-security.cn'\n"
         "import importlib\n"
         "import config.config as cc\n"
         "importlib.reload(cc)\n"
@@ -173,7 +173,7 @@ def test_production_get_config_rejects_sqlite_database_url():
         "os.environ['SECRET_KEY']='a' * 40\n"
         "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
         "os.environ['REDIS_PASSWORD']='redis-secret'\n"
-        "os.environ['ALLOWED_ORIGINS']='https://app.example.com'\n"
+        "os.environ['ALLOWED_ORIGINS']='https://console.beta.acme-security.cn'\n"
         "import importlib\n"
         "import config.config as cc\n"
         "importlib.reload(cc)\n"
@@ -210,21 +210,46 @@ def test_readiness_check_rejects_localhost_origin(monkeypatch):
     assert local_result.ok is False
     assert "https" in local_result.reason or "forbidden" in local_result.reason
 
-    monkeypatch.setenv("ALLOWED_ORIGINS", "https://console.example.com")
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://console.beta.acme-security.cn")
     prod_result = check_allowed_origins()
     assert prod_result.ok is True
 
 
-def test_readiness_runtime_guard_false_is_warning(monkeypatch):
+def test_readiness_check_rejects_placeholder_origin(monkeypatch):
+    from scripts.check_production_readiness import check_allowed_origins
+
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://console.example.com")
+
+    result = check_allowed_origins()
+
+    assert result.ok is False
+    assert "placeholder" in result.reason or "example" in result.reason
+
+
+def test_readiness_runtime_guard_false_is_failure(monkeypatch):
     from scripts.check_production_readiness import check_required_runtime_guards
 
+    monkeypatch.setenv("RUNTIME_GUARDS_ENABLED", "true")
     monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
     monkeypatch.setenv("REQUIRE_MODELS_READY", "true")
 
     result = check_required_runtime_guards()
-    assert result.ok is True
-    assert result.status == "WARN"
+    assert result.ok is False
+    assert result.status == "FAIL"
     assert "REQUIRE_REDIS_AVAILABLE" in result.reason
+
+
+def test_readiness_runtime_guards_require_explicit_umbrella(monkeypatch):
+    from scripts.check_production_readiness import check_required_runtime_guards
+
+    monkeypatch.delenv("RUNTIME_GUARDS_ENABLED", raising=False)
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "true")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "true")
+
+    result = check_required_runtime_guards()
+
+    assert result.ok is False
+    assert "RUNTIME_GUARDS_ENABLED" in result.reason
 
 
 def test_private_beta_readiness_allows_dry_run(monkeypatch):
@@ -346,6 +371,21 @@ def test_readiness_connectivity_checks_are_successful_when_services_respond(monk
     assert readiness.check_database_connectivity().ok is True
 
 
+def test_readiness_database_connectivity_fails_when_database_unreachable(monkeypatch):
+    import scripts.check_production_readiness as readiness
+
+    def fake_create_engine(*args, **kwargs):
+        raise TimeoutError("connection timed out")
+
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_DB_URL)
+    monkeypatch.setattr(readiness, "create_engine", fake_create_engine)
+
+    result = readiness.check_database_connectivity()
+
+    assert result.ok is False
+    assert "SELECT 1 failed" in result.reason
+
+
 def test_readiness_main_reports_warn_fail_and_never_prints_secrets(monkeypatch, tmp_path, capsys):
     import redis
     import scripts.check_production_readiness as readiness
@@ -395,9 +435,10 @@ def test_readiness_main_reports_warn_fail_and_never_prints_secrets(monkeypatch, 
         "REDIS_PORT": "6379",
         "REDIS_DB": "0",
         "REDIS_PASSWORD": redis_password,
-        "ALLOWED_ORIGINS": "https://console.example.com",
+        "ALLOWED_ORIGINS": "https://console.beta.acme-security.cn",
         "DRY_RUN": "false",
-        "REQUIRE_REDIS_AVAILABLE": "false",
+        "RUNTIME_GUARDS_ENABLED": "true",
+        "REQUIRE_REDIS_AVAILABLE": "true",
         "REQUIRE_MODELS_READY": "true",
         "MODEL_DIR": str(model_dir),
         "LOG_INTEGRITY_ENABLED": "true",
@@ -414,7 +455,7 @@ def test_readiness_main_reports_warn_fail_and_never_prints_secrets(monkeypatch, 
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "[WARN] RUNTIME_GUARDS" in out
+    assert "[PASS] RUNTIME_GUARDS" in out
     assert secret_key not in out
     assert redis_password not in out
     assert admin_password not in out

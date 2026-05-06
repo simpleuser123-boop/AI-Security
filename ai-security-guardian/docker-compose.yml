@@ -40,14 +40,17 @@ services:
       REDIS_PORT: "6379"
       REDIS_DB: ${REDIS_DB:-0}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/security.db}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must point to a reachable PostgreSQL database for Beta/production}
       AUTO_CREATE_DB_TABLES: ${AUTO_CREATE_DB_TABLES:-false}
       DRY_RUN: ${DRY_RUN:-true}
       # Web/API 层默认不启用抓包 / 日志采集
       ENABLE_PACKET_CAPTURE: "false"
       ENABLE_WEB_LOG: "false"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5000}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must be the HTTPS private Beta/production origin}
+      RUNTIME_GUARDS_ENABLED: ${RUNTIME_GUARDS_ENABLED:-true}
+      REQUIRE_REDIS_AVAILABLE: ${REQUIRE_REDIS_AVAILABLE:-true}
+      REQUIRE_MODELS_READY: ${REQUIRE_MODELS_READY:-true}
       PORT: "5000"
       # Flask-SocketIO + Gunicorn 不建议在单个 Gunicorn master 下开多 worker；
       # 如需横向扩容，运行多个单 worker app 实例并在反向代理层启用粘性会话。
@@ -104,6 +107,9 @@ services:
       REDIS_DB: ${REDIS_DB:-0}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       DRY_RUN: ${DRY_RUN:-true}
+      RUNTIME_GUARDS_ENABLED: ${RUNTIME_GUARDS_ENABLED:-true}
+      REQUIRE_REDIS_AVAILABLE: ${REQUIRE_REDIS_AVAILABLE:-true}
+      REQUIRE_MODELS_READY: ${REQUIRE_MODELS_READY:-true}
       ENABLE_PACKET_CAPTURE: "true"
       ENABLE_WEB_LOG: ${ENABLE_WEB_LOG:-false}
       ENABLE_FLASK: "false"  # 告警通过 Redis 队列共享给 app，不在此进程起 Flask

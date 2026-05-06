@@ -84,10 +84,12 @@ CI/CD 与测试分组见 **[docs/ci-test-groups.md](docs/ci-test-groups.md)**。
 - `SECRET_KEY`：JWT 与 Flask 密钥，必须修改。
 - `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH`：管理员认证，推荐只用哈希。
 - `ADMIN_ROLE`：基础 RBAC 角色，支持 `viewer` / `analyst` / `admin`；默认 `admin`。
-- `DATABASE_URL`：数据库连接。生产必须使用 PostgreSQL；SQLite 仅用于开发/测试。
+- `DATABASE_URL`：数据库连接。Private Beta / production 必须使用可连接 PostgreSQL；SQLite、localhost、示例或占位连接串仅用于开发/测试。
+- `ALLOWED_ORIGINS`：Private Beta / production 必须是客户正式 HTTPS Origin，禁止 `*`、`http://`、localhost、127.0.0.1 和占位域名。
 - `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`：缓存与队列。
-- `REQUIRE_REDIS_AVAILABLE`：设为 `true` 时，Redis 不可达将启动失败（生产建议开启）。
-- `REQUIRE_MODELS_READY`：设为 `true` 时，关键模型缺失将启动失败（生产建议开启）。
+- `RUNTIME_GUARDS_ENABLED`：Private Beta / production 显式设置为 `true`。
+- `REQUIRE_REDIS_AVAILABLE`：设为 `true` 时，Redis 不可达将启动失败（Private Beta / production 必须开启）。
+- `REQUIRE_MODELS_READY`：设为 `true` 时，关键模型缺失将启动失败（Private Beta / production 必须开启）。
 - `LOG_INTEGRITY_ENABLED`：审计日志哈希链开关。
 - `AUDIT_ENV` / `AUDIT_LOG_DIR`：审计日志环境与目录；默认按 `logs/test|dev|staging|production` 隔离。
 - `MODEL_DIR`：模型目录，默认 `models/saved`。

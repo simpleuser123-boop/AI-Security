@@ -92,14 +92,15 @@ Beta 交付人员需确认：
 | `ADMIN_USERNAME` | 必填 | 默认可为 `admin` |
 | `ADMIN_PASSWORD_HASH` | 生产必填 | 使用 `python scripts/generate_admin_password_hash.py` |
 | `ADMIN_ROLE` | 必填 | `admin` / `analyst` / `viewer` |
-| `DATABASE_URL` | 生产必须 PostgreSQL | `postgresql+psycopg2://...` |
+| `DATABASE_URL` | 生产必须是可连接 PostgreSQL | `postgresql+psycopg2://...`；缺少真实连接信息时保留占位并让校验失败，禁止伪造通过 |
 | `AUTO_CREATE_DB_TABLES` | 必须为 `false` | 生产通过迁移建表 |
 | `REDIS_PASSWORD` | 必填，非弱密码 | 与 Redis `requirepass` 一致 |
 | `REDIS_DB` | 必填 | 通常为 `0` |
-| `ALLOWED_ORIGINS` | 必填，禁止 `*` | `https://console.example.com` |
+| `ALLOWED_ORIGINS` | 必填，必须是正式 HTTPS Origin | 禁止 `*`、`http://`、localhost、127.0.0.1、占位域名；示例：`https://guardian-console.company.tld` |
 | `LOG_INTEGRITY_ENABLED` | 建议 `true` | 审计日志哈希链 |
-| `REQUIRE_REDIS_AVAILABLE` | Beta 生产建议 `true` | Redis 不可用则启动失败 |
-| `REQUIRE_MODELS_READY` | Beta 生产建议 `true` | 关键模型缺失则启动失败 |
+| `RUNTIME_GUARDS_ENABLED` | Beta 生产必须显式 `true` | runtime guards 总开关 |
+| `REQUIRE_REDIS_AVAILABLE` | Beta 生产必须显式 `true` | Redis 不可用则启动失败 |
+| `REQUIRE_MODELS_READY` | Beta 生产必须显式 `true` | 关键模型缺失则启动失败 |
 | `MODEL_DIR` | Compose 内为 `/app/models/saved` | 宿主机为 `./models/saved` |
 | `MODEL_DELIVERY_MODE` | `artifact` 或 `repository` | Beta 推荐 `artifact` |
 | `DRY_RUN` | Beta 建议 `true`，且 `private-beta` readiness 允许 `true` | 真实封禁前另走 `real-enforcement` readiness |
@@ -123,8 +124,9 @@ Beta 交付人员需确认：
 
 - 生产 `.env` 中保留示例 `SECRET_KEY`。
 - 生产使用明文 `ADMIN_PASSWORD` 作为认证路径。
-- 生产 `DATABASE_URL` 使用 SQLite。
-- 生产 `ALLOWED_ORIGINS=*`、localhost 或非 HTTPS Origin。
+- 生产 `DATABASE_URL` 使用 SQLite、localhost、示例或占位连接串，或无法执行 `SELECT 1`。
+- 生产 `ALLOWED_ORIGINS=*`、`http://`、localhost、127.0.0.1、占位域名或非 HTTPS Origin。
+- Beta 默认关闭任何 dangerous bypass / disable-connect 类开关；`GUARDIAN_REDIS_DISABLE_CONNECT=true` 只能用于本地测试，不能用于 Beta 校验。
 - 将 `.env`、数据库 dump、模型私有制品地址、管理员哈希提交到版本控制。
 
 ## 4. 数据库 / Redis / 模型 / 日志目录要求

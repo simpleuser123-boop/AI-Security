@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from typing import Callable, Iterable, Literal
+from urllib.parse import urlparse
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -94,6 +95,23 @@ FORBIDDEN_ALLOWED_ORIGINS = {
     "http://127.0.0.1:5000",
     "http://0.0.0.0",
     "http://0.0.0.0:5000",
+}
+
+FORBIDDEN_ORIGIN_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+}
+
+FORBIDDEN_ORIGIN_TOKENS = {
+    "example",
+    "replace",
+    "replace_with",
+    "change_me",
+    "changeme",
+    "placeholder",
+    "localhost",
 }
 
 TRUTHY = {"1", "true", "yes", "on"}
@@ -343,18 +361,31 @@ def check_allowed_origins() -> CheckResult:
             False,
             f"production origins must use https://, got: {invalid[0]}",
         )
-    forbidden = [
-        origin
-        for origin in origins
-        if origin.lower().rstrip("/") in FORBIDDEN_ALLOWED_ORIGINS
-        or "localhost" in origin.lower()
-    ]
-    if forbidden:
-        return CheckResult(
-            "ALLOWED_ORIGINS",
-            False,
-            f"local/default origin is forbidden in production: {forbidden[0]}",
-        )
+    for origin in origins:
+        parsed = urlparse(origin)
+        host = (parsed.hostname or "").strip().lower()
+        normalized = origin.lower().rstrip("/")
+        if not parsed.scheme or not host:
+            return CheckResult("ALLOWED_ORIGINS", False, f"invalid origin URL: {origin}")
+        if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+            return CheckResult("ALLOWED_ORIGINS", False, f"origin must not include path/query/fragment: {origin}")
+        if normalized in FORBIDDEN_ALLOWED_ORIGINS or host in FORBIDDEN_ORIGIN_HOSTS:
+            return CheckResult(
+                "ALLOWED_ORIGINS",
+                False,
+                f"local/default origin is forbidden in production: {origin}",
+            )
+        if "*" in host:
+            return CheckResult("ALLOWED_ORIGINS", False, f"wildcard host is forbidden: {origin}")
+        if "." not in host:
+            return CheckResult("ALLOWED_ORIGINS", False, f"production origin must use a formal domain: {origin}")
+        host_tokens = {token for token in re.split(r"[^a-z0-9_]+", host) if token}
+        if host_tokens & FORBIDDEN_ORIGIN_TOKENS:
+            return CheckResult(
+                "ALLOWED_ORIGINS",
+                False,
+                f"origin looks like an example or placeholder, not a real Beta/production domain: {origin}",
+            )
     return CheckResult("ALLOWED_ORIGINS", True, f"{len(origins)} origin(s) configured")
 
 
@@ -443,16 +474,23 @@ def check_real_enforcement_review_required() -> CheckResult:
 def check_required_runtime_guards() -> CheckResult:
     problems: list[str] = []
     warnings: list[str] = []
+    umbrella = _env("RUNTIME_GUARDS_ENABLED")
+    if not umbrella:
+        problems.append("RUNTIME_GUARDS_ENABLED must be explicitly true")
+    elif not _is_bool(umbrella):
+        problems.append("RUNTIME_GUARDS_ENABLED must be true or false")
+    elif not _bool_value(umbrella):
+        problems.append("RUNTIME_GUARDS_ENABLED must be true for private Beta/production")
     for key in ("REQUIRE_REDIS_AVAILABLE", "REQUIRE_MODELS_READY"):
         value = _env(key)
         if not value:
-            warnings.append(f"{key} is not explicit true")
+            problems.append(f"{key} must be explicitly true")
             continue
         if not _is_bool(value):
             problems.append(f"{key} must be true or false")
             continue
         if not _bool_value(value):
-            warnings.append(f"{key} should be true in production")
+            problems.append(f"{key} must be true for private Beta/production")
     if problems:
         return CheckResult("RUNTIME_GUARDS", False, "; ".join(problems))
     if warnings:
@@ -460,7 +498,7 @@ def check_required_runtime_guards() -> CheckResult:
     return CheckResult(
         "RUNTIME_GUARDS",
         True,
-        "REQUIRE_REDIS_AVAILABLE and REQUIRE_MODELS_READY are true",
+        "RUNTIME_GUARDS_ENABLED, REQUIRE_REDIS_AVAILABLE, and REQUIRE_MODELS_READY are true",
     )
 
 

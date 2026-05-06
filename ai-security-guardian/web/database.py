@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from flask import Flask
+from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text
 
@@ -16,6 +17,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 db = SQLAlchemy()
+migrate = Migrate(compare_type=True, render_as_batch=True)
+
+
+def init_migration_extension(app: Flask) -> None:
+    """Register Flask-Migrate/Alembic commands for a configured app."""
+    migrate.init_app(app, db)
 
 
 def ensure_sqlite_parent_dir(app: Flask) -> None:
@@ -75,14 +82,15 @@ def init_db_tables(app: Flask, *, force: bool = False) -> None:
     """创建 ORM 定义的全部表。
 
     - development / testing：启动时自动调用（一键开发）。
-    - production：默认不在启动时建表，请使用 ``python -m web.init_db``；
+    - production：默认不在启动时建表，请使用 ``flask db upgrade``；
       若设置环境变量 ``AUTO_CREATE_DB_TABLES=true`` 则也会在启动时建表（应急/演示）。
     """
     env = os.environ.get("FLASK_ENV", "development")
     auto_prod = os.environ.get("AUTO_CREATE_DB_TABLES", "").lower() == "true"
     if env == "production" and not force and not auto_prod:
         logger.info(
-            "[DB] 生产环境跳过自动建表；首次请执行: python -m web.init_db "
+            "[DB] 生产环境跳过自动建表；请执行: "
+            "flask --app web.migration_app:create_migration_app db upgrade "
             "（或设置 AUTO_CREATE_DB_TABLES=true 仅限应急）"
         )
         return

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 def _build_test_app(monkeypatch, tmp_path, *, role: str = "admin"):
@@ -12,6 +14,10 @@ def _build_test_app(monkeypatch, tmp_path, *, role: str = "admin"):
     monkeypatch.setenv("ADMIN_USERNAME", "admin")
     monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
     monkeypatch.setenv("ADMIN_ROLE", role)
+    monkeypatch.setenv(
+        "AUDIT_LOG_DIR",
+        str(tmp_path / f"audit_{role}_{uuid.uuid4().hex}"),
+    )
 
     from web.app import create_app
 
@@ -83,6 +89,42 @@ def test_alert_status_update_writes_queryable_audit_event(monkeypatch, tmp_path)
     assert audit.status_code == 200
     items = audit.get_json()["items"]
     assert any(item["event_type"] == "alert.status_updated" for item in items)
+
+
+def test_operation_audit_is_written_to_hash_chained_security_log(monkeypatch, tmp_path):
+    app = _build_test_app(monkeypatch, tmp_path, role="admin")
+    client = app.test_client()
+    headers, _ = _auth_headers(client)
+
+    resp = client.put(
+        "/api/settings",
+        headers=headers,
+        json={"alert_threshold": 0.4},
+    )
+    assert resp.status_code == 200
+
+    log_path = Path(app.config["GUARDIAN_LOG_DIR"]) / "security.log"
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    operation_events = [
+        event
+        for event in events
+        if event.get("event_type") == "operation_audit"
+    ]
+    assert any(
+        event["details"]["event_type"] == "settings.updated"
+        for event in operation_events
+    )
+
+    from src.audit.security_logger import SecurityLogger
+
+    integrity = SecurityLogger(
+        log_dir=app.config["GUARDIAN_LOG_DIR"], enable_integrity=True
+    ).verify_integrity()
+    assert integrity["valid"] is True
 
 
 def test_analyst_can_triage_but_cannot_admin_mutate(monkeypatch, tmp_path):

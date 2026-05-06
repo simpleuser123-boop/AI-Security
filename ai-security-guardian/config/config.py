@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Type
+from urllib.parse import urlparse
 
 from sqlalchemy.engine import make_url
 
@@ -30,6 +32,38 @@ _FORBIDDEN_PRODUCTION_SECRET_KEYS: frozenset[str] = frozenset(
         "your-secret-key",
         "please-change-me",
     }
+)
+
+_FORBIDDEN_PRODUCTION_PASSWORD_VALUES: frozenset[str] = frozenset(
+    {
+        "admin",
+        "guardian",
+        "changeme",
+        "password",
+        "password123",
+        "secret",
+        "123456",
+        "admin123",
+    }
+)
+
+_FORBIDDEN_PRODUCTION_ORIGINS: frozenset[str] = frozenset(
+    {
+        "http://localhost",
+        "http://localhost:5000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:5000",
+        "http://0.0.0.0",
+        "http://0.0.0.0:5000",
+    }
+)
+
+_FORBIDDEN_PRODUCTION_ORIGIN_HOSTS: frozenset[str] = frozenset(
+    {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+)
+
+_FORBIDDEN_PRODUCTION_ORIGIN_TOKENS: frozenset[str] = frozenset(
+    {"example", "replace", "replace_with", "change_me", "changeme", "placeholder"}
 )
 
 
@@ -82,11 +116,30 @@ def _validate_production_hardening(cfg: Type["Config"]) -> None:
             "生产环境必须设置 ADMIN_PASSWORD_HASH（禁止仅依赖明文 ADMIN_PASSWORD）。"
             " 使用: python scripts/generate_admin_password_hash.py"
         )
+    if admin_hash.lower() in _FORBIDDEN_PRODUCTION_PASSWORD_VALUES:
+        raise RuntimeError("生产环境 ADMIN_PASSWORD_HASH 不能是默认明文密码。")
+    if not (
+        admin_hash.startswith("pbkdf2:") or admin_hash.startswith("scrypt:")
+    ) or "$" not in admin_hash:
+        raise RuntimeError(
+            "生产环境 ADMIN_PASSWORD_HASH 必须是 Werkzeug 密码哈希，"
+            "请使用 scripts/generate_admin_password_hash.py 生成。"
+        )
+
+    if (os.environ.get("ADMIN_PASSWORD") or "").strip():
+        raise RuntimeError("生产环境禁止设置明文 ADMIN_PASSWORD。")
 
     redis_pwd = (os.environ.get("REDIS_PASSWORD") or "").strip()
     if not redis_pwd:
         raise RuntimeError(
             "生产环境必须设置 REDIS_PASSWORD，避免 Redis 无鉴权暴露。"
+        )
+    if (
+        redis_pwd.lower() in _FORBIDDEN_PRODUCTION_PASSWORD_VALUES
+        or len(redis_pwd) < 12
+    ):
+        raise RuntimeError(
+            "生产环境 REDIS_PASSWORD 不能使用默认/弱密码，且长度至少 12 字符。"
         )
 
     raw_origins = os.environ.get("ALLOWED_ORIGINS", "") or ""
@@ -100,11 +153,27 @@ def _validate_production_hardening(cfg: Type["Config"]) -> None:
             "生产环境 ALLOWED_ORIGINS 不能为空；请配置逗号分隔的 https 站点 Origin。"
         )
     for o in origins:
-        if o.strip() == "*":
+        origin = o.strip()
+        if origin == "*":
             raise RuntimeError("生产环境 CORS 禁止使用通配符 *。")
-        lo = o.lower()
-        if not (lo.startswith("http://") or lo.startswith("https://")):
-            raise RuntimeError(f"生产环境 CORS Origin 必须以 http:// 或 https:// 开头: {o!r}")
+        lo = origin.lower().rstrip("/")
+        parsed = urlparse(origin)
+        host = (parsed.hostname or "").strip().lower()
+        if not parsed.scheme or not host:
+            raise RuntimeError(f"生产环境 CORS Origin 格式无效: {origin!r}")
+        if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+            raise RuntimeError(f"生产环境 CORS Origin 不能包含 path/query/fragment: {origin!r}")
+        if lo in _FORBIDDEN_PRODUCTION_ORIGINS or host in _FORBIDDEN_PRODUCTION_ORIGIN_HOSTS:
+            raise RuntimeError(f"生产环境 CORS Origin 禁止使用本地/示例地址: {origin!r}")
+        if not lo.startswith("https://"):
+            raise RuntimeError(f"生产环境 CORS Origin 必须使用 https://: {origin!r}")
+        if "*" in host:
+            raise RuntimeError(f"生产环境 CORS Origin 禁止使用通配符域名: {origin!r}")
+        if "." not in host:
+            raise RuntimeError(f"生产环境 CORS Origin 必须使用正式域名: {origin!r}")
+        host_tokens = {token for token in re.split(r"[^a-z0-9_]+", host) if token}
+        if host_tokens & _FORBIDDEN_PRODUCTION_ORIGIN_TOKENS:
+            raise RuntimeError(f"生产环境 CORS Origin 不能使用示例或占位域名: {origin!r}")
 
 
 def _validate_production_database_url(database_url: str) -> None:

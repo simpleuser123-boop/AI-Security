@@ -79,19 +79,20 @@ find models/saved -maxdepth 1 -type f | sort
 | `FLASK_ENV` | 必须为 `production` |
 | `SECRET_KEY` | 至少 32 字符，禁止使用示例值或开发默认值 |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 必须使用哈希；禁止生产使用明文 `ADMIN_PASSWORD` |
-| `DATABASE_URL` | 生产必须指向 PostgreSQL；SQLite 仅允许开发/测试 |
+| `DATABASE_URL` | 生产必须指向可连接 PostgreSQL；SQLite、localhost、示例/占位连接串仅允许开发/测试 |
 | `AUTO_CREATE_DB_TABLES` | 生产保持 `false`，首次上线和后续升级使用 Flask-Migrate/Alembic |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` | `REDIS_PASSWORD` 必填，必须与 Redis `requirepass` 一致 |
 | `REDIS_CONNECT_TIMEOUT_SEC` / `REDIS_SOCKET_TIMEOUT_SEC` | Redis 客户端连接/读写超时，默认 `0.5` / `2.0` 秒，避免健康检查长时间阻塞 |
-| `ALLOWED_ORIGINS` | 填真实 Origin，例如 `https://console.example.com`，禁止 `*` |
+| `ALLOWED_ORIGINS` | 填正式 HTTPS Origin，例如 `https://guardian-console.company.tld`；禁止 `*`、`http://`、localhost、127.0.0.1、占位域名 |
 | `DRY_RUN` | 私有化 Beta 建议 `true`；真实封禁 readiness 才要求 `false` |
 | `REAL_ENFORCEMENT_APPROVAL_REQUIRED` | 仅真实封禁 gate 使用；必须确认审批门禁已启用 |
 | `REAL_ENFORCEMENT_AUDIT_VERIFIED` | 仅真实封禁 gate 使用；必须确认审计和哈希链证据已验证 |
 | `REAL_ENFORCEMENT_ROLLBACK_READY` | 仅真实封禁 gate 使用；必须确认回滚/止血路径已演练 |
 | `REAL_ENFORCEMENT_UNBLOCK_READY` | 仅真实封禁 gate 使用；必须确认手工解封或等效恢复已演练 |
 | `REAL_ENFORCEMENT_REVIEW_REQUIRED` | 仅真实封禁 gate 使用；必须确认响应后复盘要求 |
-| `REQUIRE_REDIS_AVAILABLE` | 生产建议 `true`，Redis 不可用时启动失败 |
-| `REQUIRE_MODELS_READY` | 生产建议 `true`，关键模型缺失时启动失败 |
+| `RUNTIME_GUARDS_ENABLED` | Private Beta / production 必须显式为 `true`，作为运行期保护已开启的总开关 |
+| `REQUIRE_REDIS_AVAILABLE` | Private Beta / production 必须显式为 `true`，Redis 不可用时启动失败 |
+| `REQUIRE_MODELS_READY` | Private Beta / production 必须显式为 `true`，关键模型缺失时启动失败 |
 | `LOG_INTEGRITY_ENABLED` | 生产建议 `true` |
 | `MODEL_DIR` | Compose 内为 `/app/models/saved`，宿主机挂载为 `./models/saved` |
 | `REDIS_HOST_FOR_GUARDIAN` | 启用 `full-chain` 时通常为 `127.0.0.1` |
@@ -129,9 +130,9 @@ python scripts/check_production_readiness.py --env-file /etc/guardian/production
 - `ADMIN_PASSWORD_HASH` 存在性、Werkzeug 哈希格式、是否匹配默认密码检查；生产禁止明文 `ADMIN_PASSWORD`。
 - `DATABASE_URL` 必须是非示例、非本地的 PostgreSQL，并执行 `SELECT 1` 连通性检查。
 - `REDIS_PASSWORD` 必填且非弱密码，并执行带密码 `PING` 连通性检查。
-- `ALLOWED_ORIGINS` 禁止 `*`、localhost 和非 HTTPS Origin。
+- `ALLOWED_ORIGINS` 禁止 `*`、localhost、127.0.0.1、`http://`、占位域名和非正式域名；Private Beta 也必须使用客户正式 HTTPS 域名。
 - `DRY_RUN=true` 通过；若为 `false`，输出 `[WARN]`，提示必须另走真实封禁 gate。
-- `REQUIRE_REDIS_AVAILABLE` / `REQUIRE_MODELS_READY` 建议为 `true`；不符合时输出 `[WARN]`。
+- `RUNTIME_GUARDS_ENABLED` / `REQUIRE_REDIS_AVAILABLE` / `REQUIRE_MODELS_READY` 必须显式为 `true`；不符合时输出 `[FAIL]`。
 - `MODEL_DIR` 与关键模型/manifest 文件存在且可读。
 - `LOG_INTEGRITY_ENABLED=true`，审计日志目录存在且可写。
 

@@ -1,0 +1,5 @@
+Single-database migration repository for AI-Security-Guardian.
+
+Run migrations through the lightweight Flask app:
+
+    flask --app web.migration_app:create_migration_app db upgrade
