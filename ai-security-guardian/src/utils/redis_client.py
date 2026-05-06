@@ -76,8 +76,8 @@ class RedisClient:
     判断当前运行模式，其余调用方法对两种模式完全透明。
     """
 
-    _CONNECT_TIMEOUT: float = float(os.environ.get("REDIS_CONNECT_TIMEOUT_SEC", "0.5"))
-    _SOCKET_TIMEOUT: float = float(os.environ.get("REDIS_SOCKET_TIMEOUT_SEC", "2.0"))
+    _CONNECT_TIMEOUT: float = float(os.environ.get("REDIS_CONNECT_TIMEOUT_SEC", "0.2"))
+    _SOCKET_TIMEOUT: float = float(os.environ.get("REDIS_SOCKET_TIMEOUT_SEC", "0.3"))
 
     def __init__(
         self,
@@ -123,6 +123,7 @@ class RedisClient:
                 socket_timeout=self._SOCKET_TIMEOUT,
                 decode_responses=True,
                 health_check_interval=30,
+                retry_on_timeout=False,
             )
             client.ping()
             self._client = client

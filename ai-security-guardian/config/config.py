@@ -137,6 +137,11 @@ class Config:
     REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
     REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
     REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
+    REDIS_CONNECT_TIMEOUT_SEC = float(os.environ.get("REDIS_CONNECT_TIMEOUT_SEC", "0.2"))
+    REDIS_SOCKET_TIMEOUT_SEC = float(os.environ.get("REDIS_SOCKET_TIMEOUT_SEC", "0.3"))
+    HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC = float(
+        os.environ.get("HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC", "0.3")
+    )
     # 生产落地保护：关键依赖是否必须可用（不可用时启动失败）
     REQUIRE_REDIS_AVAILABLE = (
         os.environ.get("REQUIRE_REDIS_AVAILABLE", "false").lower() == "true"

@@ -79,10 +79,10 @@ USER guardian
 EXPOSE 5000
 
 # ---- 健康检查 ------------------------------------------------------
-# 容器启动后 30s 开始探活，失败超 3 次视为不健康；/api/health 匿名豁免限流
+# 容器启动后 30s 开始探活，失败超 3 次视为不健康；/healthz 只检查进程存活
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import sys, urllib.request; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=5).status == 200 else 1)" \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=1).status == 200 else 1)" \
     || exit 1
 
 # ---- 入口 ----------------------------------------------------------

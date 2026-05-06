@@ -112,25 +112,14 @@ def _redis_client_for_app(app: Flask, cfg: Any):
 
 
 def _runtime_dependency_checks(app: Flask, cfg: Any) -> Dict[str, Any]:
-    checks: Dict[str, Any] = {}
     require_redis = bool(getattr(cfg, "REQUIRE_REDIS_AVAILABLE", False))
     require_models = bool(getattr(cfg, "REQUIRE_MODELS_READY", False))
 
-    redis_client = _redis_client_for_app(app, cfg)
-    redis_ok = bool(redis_client.ping())
-    checks["redis"] = {
-        "ok": redis_ok,
-        "mode": redis_client.mode,
-        "required": require_redis,
-    }
+    from web.observability_routes import collect_health_checks
 
-    missing = _missing_model_artifacts(app)
-    checks["models"] = {
-        "ok": len(missing) == 0,
-        "required": require_models,
-        "missing": missing,
-        "model_dir": _resolve_model_dir(app),
-    }
+    checks, _fatal, _degraded = collect_health_checks(app, include_config=False)
+    checks.setdefault("redis", {})["required"] = require_redis
+    checks.setdefault("models", {})["required"] = require_models
     return checks
 
 
@@ -176,6 +165,9 @@ def create_app() -> tuple[Flask, SocketIO]:
     # 生产环境关闭 debug（由 config 控制）
     app.config["DEBUG"] = getattr(cfg, "DEBUG", False)
     app.config["MODEL_DIR"] = getattr(cfg, "MODEL_DIR", "models/saved")
+    app.config["HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC"] = getattr(
+        cfg, "HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC", 0.3
+    )
     app.config["GUARDIAN_LOG_DIR"] = getattr(cfg, "LOG_DIR", "logs")
     app.config["LOG_INTEGRITY_ENABLED"] = getattr(
         cfg, "LOG_INTEGRITY_ENABLED", True
@@ -1290,14 +1282,14 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
     @app.route("/api/health")
     @limiter.exempt
     def health_check():  # type: ignore[unused-function]
-        cfg = app.extensions.get("guardian_os_config")
-        checks = _runtime_dependency_checks(app, cfg) if cfg is not None else {}
+        from web.observability_routes import build_api_health_payload
+
+        payload = build_api_health_payload(app)
         return (
             jsonify(
                 {
-                    "status": "healthy",
-                    "timestamp": _now_iso(),
-                    "checks": checks,
+                    **payload,
+                    "frontend_safe": True,
                 }
             ),
             200,

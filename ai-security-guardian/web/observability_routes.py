@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from flask import Flask, Response, jsonify
 from sqlalchemy import text
@@ -13,6 +14,9 @@ from src.observability.guardian_metrics import read_guardian_redis_snapshot
 from src.utils.redis_client import RedisClient
 from web.audit_integrity_patrol import get_last_audit_integrity_valid
 from web.database import db
+
+_DEFAULT_READY_TIMEOUT_SEC = 0.3
+_DEFAULT_API_HEALTH_TIMEOUT_SEC = 0.2
 
 
 def _redis_for_app(app: Flask) -> RedisClient:
@@ -31,6 +35,52 @@ def _redis_for_app(app: Flask) -> RedisClient:
         db=int(getattr(cfg, "REDIS_DB", 0)),
         password=str(getattr(cfg, "REDIS_PASSWORD", "") or ""),
     )
+    app.extensions["guardian_redis_client"] = client
+    return client
+
+
+def _dependency_timeout(app: Flask, default: float) -> float:
+    raw = (
+        app.config.get("HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC")
+        or os.environ.get("HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC")
+        or default
+    )
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(0.05, min(timeout, 2.0))
+
+
+def _run_check(
+    name: str,
+    fn: Callable[[], Tuple[bool, str]],
+    *,
+    timeout_sec: float,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"health-{name}")
+    future = executor.submit(fn)
+    try:
+        ok, detail = future.result(timeout=timeout_sec)
+        timed_out = False
+    except TimeoutError:
+        ok = False
+        detail = f"{name}_timeout_after_{timeout_sec:.3f}s"
+        timed_out = True
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        detail = f"{name}_error: {type(exc).__name__}"
+        timed_out = False
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return {
+        "ok": bool(ok),
+        "detail": detail,
+        "timed_out": timed_out,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
 
 
 def _default_secret_key() -> str:
@@ -48,6 +98,8 @@ def _checks_database() -> Tuple[bool, str]:
 
 def _checks_redis(client: RedisClient) -> Tuple[bool, str]:
     try:
+        if client.mode != "redis" or not client.is_available:
+            return False, f"redis_unavailable_{client.mode}"
         if client.ping():
             return True, "ok"
         return False, "redis_ping_failed"
@@ -92,6 +144,78 @@ def _checks_models(app: Flask, rds: RedisClient) -> Tuple[bool, str]:
     return False, "no_guardian_metrics_and_empty_model_dir"
 
 
+def collect_health_checks(
+    app: Flask,
+    *,
+    timeout_sec: Optional[float] = None,
+    include_config: bool = True,
+) -> Tuple[Dict[str, Any], List[str], List[str]]:
+    timeout = timeout_sec or _dependency_timeout(app, _DEFAULT_READY_TIMEOUT_SEC)
+    checks: Dict[str, Any] = {}
+    fatal: List[str] = []
+    degraded: List[str] = []
+    testing = app.config.get("TESTING") or os.environ.get("FLASK_ENV") == "testing"
+
+    def _db_probe() -> Tuple[bool, str]:
+        with app.app_context():
+            return _checks_database()
+
+    checks["database"] = _run_check("database", _db_probe, timeout_sec=timeout)
+    if not checks["database"]["ok"]:
+        fatal.append("database")
+
+    rds: Optional[RedisClient] = None
+
+    def _redis_probe() -> Tuple[bool, str]:
+        nonlocal rds
+        rds = _redis_for_app(app)
+        return _checks_redis(rds)
+
+    redis_check = _run_check("redis", _redis_probe, timeout_sec=timeout)
+    redis_check["mode"] = rds.mode if rds is not None else "unknown"
+    checks["redis"] = redis_check
+    if not redis_check["ok"]:
+        if testing:
+            degraded.append("redis")
+        else:
+            fatal.append("redis")
+
+    if include_config:
+        checks["config"] = _run_check(
+            "config",
+            lambda: _checks_config(app),
+            timeout_sec=timeout,
+        )
+        if not checks["config"]["ok"]:
+            fatal.append("config")
+
+    def _models_probe() -> Tuple[bool, str]:
+        model_rds = rds if rds is not None else _redis_for_app(app)
+        return _checks_models(app, model_rds)
+
+    checks["models"] = _run_check("models", _models_probe, timeout_sec=timeout)
+    if not checks["models"]["ok"]:
+        fatal.append("models")
+
+    return checks, fatal, degraded
+
+
+def build_api_health_payload(app: Flask) -> Dict[str, Any]:
+    timeout = _dependency_timeout(app, _DEFAULT_API_HEALTH_TIMEOUT_SEC)
+    checks, fatal, degraded = collect_health_checks(
+        app,
+        timeout_sec=timeout,
+        include_config=False,
+    )
+    unhealthy = sorted(set(fatal + degraded))
+    return {
+        "status": "healthy" if not unhealthy else "degraded",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "checks": checks,
+        "degraded": unhealthy,
+    }
+
+
 def register_observability_routes(app: Flask, limiter: Any) -> None:
     """注册 /healthz、/readyz、/metrics（匿名、不限流）。"""
 
@@ -103,35 +227,7 @@ def register_observability_routes(app: Flask, limiter: Any) -> None:
     @app.route("/readyz")
     @limiter.exempt
     def readyz():  # type: ignore[unused-function]
-        checks: Dict[str, Any] = {}
-        fatal: List[str] = []
-
-        ok_db, msg_db = _checks_database()
-        checks["database"] = {"ok": ok_db, "detail": msg_db}
-        if not ok_db:
-            fatal.append("database")
-
-        rds = _redis_for_app(app)
-        ok_redis, msg_redis = _checks_redis(rds)
-        checks["redis"] = {"ok": ok_redis, "detail": msg_redis, "mode": rds.mode}
-
-        testing = app.config.get("TESTING") or os.environ.get("FLASK_ENV") == "testing"
-        if not ok_redis and not testing:
-            fatal.append("redis")
-
-        ok_cfg, msg_cfg = _checks_config(app)
-        checks["config"] = {"ok": ok_cfg, "detail": msg_cfg}
-        if not ok_cfg:
-            fatal.append("config")
-
-        ok_models, msg_models = _checks_models(app, rds)
-        checks["models"] = {"ok": ok_models, "detail": msg_models}
-        if not ok_models:
-            fatal.append("models")
-
-        degraded: List[str] = []
-        if not ok_redis and testing:
-            degraded.append("redis")
+        checks, fatal, degraded = collect_health_checks(app)
 
         if fatal:
             return (

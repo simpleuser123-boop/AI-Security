@@ -155,6 +155,8 @@ python -m tests._phase8_smoke
   - `main.py` 抓包需要管理员权限或容器 `NET_RAW/NET_ADMIN` 能力。
   - 无权限时可加 `--no-packet-capture` 先降级运行。
 - 健康检查失败：
-  - 访问 `/api/health`，确认 Flask 端口和 `ALLOWED_ORIGINS` 设置正确。
+  - `/healthz`：进程存活探针，只确认 Flask 进程能快速响应，不检查 Redis/DB/模型。
+  - `/readyz`：生产就绪探针，带短超时检查 DB、Redis、配置和模型；依赖不可用时返回 503。
+  - `/api/health`：前端/管理端展示接口，始终快速返回 JSON，依赖异常体现在 `checks`/`degraded`。
   - Docker 中可用 `docker compose ps` 与容器日志进一步定位。
 

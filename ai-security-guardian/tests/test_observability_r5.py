@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,110 @@ def test_readyz_unready_on_db_failure(monkeypatch, tmp_path):
     r = client.get("/readyz")
     assert r.status_code == 503
     assert r.get_json().get("status") == "unready"
+
+
+def test_readyz_unready_on_model_missing(monkeypatch, tmp_path):
+    app = _make_app(monkeypatch, tmp_path)
+    client = app.test_client()
+
+    from web import observability_routes
+
+    monkeypatch.setattr(
+        observability_routes,
+        "_checks_models",
+        lambda _app, _rds: (False, "no_guardian_metrics_and_empty_model_dir"),
+    )
+    r = client.get("/readyz")
+    body = r.get_json()
+    assert r.status_code == 503
+    assert body["status"] == "unready"
+    assert "models" in body["fatal"]
+    assert body["checks"]["models"]["ok"] is False
+    assert "empty_model_dir" in body["checks"]["models"]["detail"]
+
+
+def test_readyz_redis_timeout_returns_fast(monkeypatch, tmp_path):
+    monkeypatch.setenv("HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC", "0.05")
+    app = _make_app(monkeypatch, tmp_path)
+    app.config["HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC"] = 0.05
+
+    from src.utils.redis_client import RedisClient
+
+    rds = RedisClient(host="127.0.0.1", port=63999)
+    rds._client = object()  # noqa: SLF001 - simulate a stuck redis-py client
+    rds._mode = "redis"  # noqa: SLF001
+
+    def _slow_ping():
+        time.sleep(0.5)
+        return False
+
+    monkeypatch.setattr(rds, "ping", _slow_ping)
+    app.extensions["guardian_redis_client"] = rds
+
+    started = time.perf_counter()
+    r = app.test_client().get("/readyz")
+    elapsed = time.perf_counter() - started
+
+    body = r.get_json()
+    assert elapsed < 0.3
+    assert r.status_code == 200
+    assert body["status"] == "degraded"
+    assert body["checks"]["redis"]["ok"] is False
+    assert body["checks"]["redis"]["timed_out"] is True
+
+
+def test_api_health_redis_timeout_returns_fast(monkeypatch, tmp_path):
+    monkeypatch.setenv("HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC", "0.05")
+    app = _make_app(monkeypatch, tmp_path)
+    app.config["HEALTHCHECK_DEPENDENCY_TIMEOUT_SEC"] = 0.05
+
+    from src.utils.redis_client import RedisClient
+
+    rds = RedisClient(host="127.0.0.1", port=63999)
+    rds._client = object()  # noqa: SLF001 - simulate auth/network stall after startup
+    rds._mode = "redis"  # noqa: SLF001
+
+    def _slow_ping():
+        time.sleep(0.5)
+        return False
+
+    monkeypatch.setattr(rds, "ping", _slow_ping)
+    app.extensions["guardian_redis_client"] = rds
+
+    started = time.perf_counter()
+    r = app.test_client().get("/api/health")
+    elapsed = time.perf_counter() - started
+
+    body = r.get_json()
+    assert elapsed < 0.3
+    assert r.status_code == 200
+    assert body["status"] == "degraded"
+    assert body["frontend_safe"] is True
+    assert body["checks"]["redis"]["timed_out"] is True
+
+
+def test_readyz_redis_auth_failure_content(monkeypatch, tmp_path):
+    app = _make_app(monkeypatch, tmp_path)
+
+    from src.utils.redis_client import RedisClient
+
+    rds = RedisClient(host="127.0.0.1", port=63999)
+    rds._client = object()  # noqa: SLF001
+    rds._mode = "redis"  # noqa: SLF001
+
+    def _auth_failure():
+        raise RuntimeError("invalid password")
+
+    monkeypatch.setattr(rds, "ping", _auth_failure)
+    app.extensions["guardian_redis_client"] = rds
+
+    r = app.test_client().get("/readyz")
+    body = r.get_json()
+    assert r.status_code == 200
+    assert body["status"] == "degraded"
+    assert "redis" in body["degraded"]
+    assert body["checks"]["redis"]["ok"] is False
+    assert "RuntimeError" in body["checks"]["redis"]["detail"]
 
 
 def test_metrics_contains_key_series(monkeypatch, tmp_path):
