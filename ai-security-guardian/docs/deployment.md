@@ -82,6 +82,7 @@ find models/saved -maxdepth 1 -type f | sort
 | `DATABASE_URL` | 生产必须指向 PostgreSQL；SQLite 仅允许开发/测试 |
 | `AUTO_CREATE_DB_TABLES` | 生产保持 `false`，首次上线必须显式执行 `python -m web.init_db` |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` | `REDIS_PASSWORD` 必填，必须与 Redis `requirepass` 一致 |
+| `REDIS_CONNECT_TIMEOUT_SEC` / `REDIS_SOCKET_TIMEOUT_SEC` | Redis 客户端连接/读写超时，默认 `0.5` / `2.0` 秒，避免健康检查长时间阻塞 |
 | `ALLOWED_ORIGINS` | 填真实 Origin，例如 `https://console.example.com`，禁止 `*` |
 | `DRY_RUN` | 上线前演练可为 `true`；生产真实响应前必须完成误封恢复演练 |
 | `REQUIRE_REDIS_AVAILABLE` | 生产建议 `true`，Redis 不可用时启动失败 |
@@ -238,7 +239,16 @@ Stream 堆积观测：
 
 ```bash
 docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" XLEN guardian:alerts'
+docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" XPENDING guardian:alerts guardian:web'
+docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" XINFO GROUPS guardian:alerts'
 docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" XINFO STREAM guardian:alerts'
+```
+
+若本机没有 `redis-cli`，使用项目内 Python fallback（从 `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` 读取配置，不打印密码）：
+
+```bash
+python scripts/redis_stream_status.py
+python scripts/redis_stream_status.py --json
 ```
 
 生产检查项：
@@ -247,6 +257,15 @@ docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" XINFO STREAM gu
 - 非本机无法访问 `6379`。
 - Redis 密码错误时 `redis-cli ping` 失败，带 `-a` 成功。
 - `REQUIRE_REDIS_AVAILABLE=true` 时 Redis 不可用会阻止应用启动。
+- Web、后台 Stream consumer、Guardian 均从 `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` 构造 Redis 客户端；Compose 中 `guardian` 因 `network_mode: host` 可用 `REDIS_HOST_FOR_GUARDIAN` 映射到进程内 `REDIS_HOST`，其余端口、DB、密码保持同一组变量。
+- `/api/health`、`/readyz` 与 `/metrics` 复用 Web 进程内 Redis 客户端；Redis 密码错误或网络异常时按 `REDIS_CONNECT_TIMEOUT_SEC` / `REDIS_SOCKET_TIMEOUT_SEC` 快速失败并降级，不应让接口长时间阻塞。
+
+Redis Stream 生产验收指标：
+
+- `XLEN guardian:alerts` 在正常流量下稳定 bounded，不持续线性增长；当前实现写入时使用 `MAXLEN ~ 10000` 软修剪。
+- `XPENDING guardian:alerts guardian:web` 不持续增长；短时非 0 可以接受，但应随 consumer 恢复后回落。
+- `XINFO GROUPS guardian:alerts` 中 `guardian:web` 的 `pending` 不持续增长，`consumers` 大于 0，`lag` 在稳定流量下可回落或保持在业务阈值内。
+- Web consumer 日志应出现正常启动记录，数据库告警入库后执行 `XACK`，`/metrics` 中 `redis_stream_pending`、`redis_stream_length`、`redis_stream_group_lag` 可被 Prometheus 抓取。
 
 ## 5. 模型目录与交付
 

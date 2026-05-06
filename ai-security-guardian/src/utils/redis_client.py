@@ -32,6 +32,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -75,8 +76,8 @@ class RedisClient:
     判断当前运行模式，其余调用方法对两种模式完全透明。
     """
 
-    _CONNECT_TIMEOUT: float = 2.0
-    _SOCKET_TIMEOUT: float = 2.0
+    _CONNECT_TIMEOUT: float = float(os.environ.get("REDIS_CONNECT_TIMEOUT_SEC", "0.5"))
+    _SOCKET_TIMEOUT: float = float(os.environ.get("REDIS_SOCKET_TIMEOUT_SEC", "2.0"))
 
     def __init__(
         self,
@@ -106,8 +107,6 @@ class RedisClient:
     # ------------------------------------------------------------------
     def _try_connect(self) -> None:
         """尝试初始化 Redis 连接；失败时静默降级到内存模式。"""
-        import os
-
         if os.environ.get("GUARDIAN_REDIS_DISABLE_CONNECT", "").lower() == "true":
             self._client = None
             self._mode = "memory"
@@ -563,6 +562,41 @@ class RedisClient:
             if st is None or group not in st.groups:
                 return 0
             return len(st.groups[group]["pending"])
+
+    def stream_info_groups(self, stream: str) -> List[Dict[str, Any]]:
+        """返回 ``XINFO GROUPS`` 风格的 consumer group 观测信息。"""
+        if self.is_available:
+            try:
+                raw = self._client.xinfo_groups(stream)  # type: ignore[union-attr]
+                out: List[Dict[str, Any]] = []
+                for item in raw or []:
+                    row: Dict[str, Any] = {}
+                    for k, v in dict(item).items():
+                        key = k.decode() if isinstance(k, bytes) else str(k)
+                        if isinstance(v, bytes):
+                            row[key] = v.decode()
+                        else:
+                            row[key] = v
+                    out.append(row)
+                return out
+            except Exception as exc:
+                logger.debug("[RedisClient] xinfo groups 失败: %s", exc)
+                return []
+
+        with self._mem_lock:
+            st = self._mem_streams.get(stream)
+            if st is None:
+                return []
+            return [
+                {
+                    "name": group,
+                    "consumers": len(data.get("consumers", {})),
+                    "pending": len(data.get("pending", {})),
+                    "last-delivered-id": data.get("last_id", "0"),
+                    "lag": max(0, len(st.entries) - len(data.get("pending", {}))),
+                }
+                for group, data in st.groups.items()
+            ]
 
     def stream_len(self, stream: str) -> int:
         """返回流的总消息数。"""

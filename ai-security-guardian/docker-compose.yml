@@ -38,7 +38,7 @@ services:
       FLASK_ENV: ${FLASK_ENV:-production}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      REDIS_DB: "0"
+      REDIS_DB: ${REDIS_DB:-0}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/security.db}
       AUTO_CREATE_DB_TABLES: ${AUTO_CREATE_DB_TABLES:-false}
@@ -92,6 +92,7 @@ services:
       FLASK_ENV: ${FLASK_ENV:-production}
       REDIS_HOST: ${REDIS_HOST_FOR_GUARDIAN:-127.0.0.1}
       REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       DRY_RUN: ${DRY_RUN:-true}
       ENABLE_PACKET_CAPTURE: "true"

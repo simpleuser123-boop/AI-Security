@@ -16,6 +16,10 @@ from web.database import db
 
 
 def _redis_for_app(app: Flask) -> RedisClient:
+    client = app.extensions.get("guardian_redis_client")
+    if isinstance(client, RedisClient):
+        return client
+
     cfg = app.extensions.get("guardian_os_config")
     if cfg is None:
         from config.config import get_config
@@ -164,11 +168,25 @@ def register_observability_routes(app: Flask, limiter: Any) -> None:
 
         stream_key = os.environ.get("GUARDIAN_ALERT_STREAM", "guardian:alerts")
         group = os.environ.get("GUARDIAN_ALERT_STREAM_GROUP", "guardian:web")
+        stream_len = 0
         pending = 0
+        group_count = 0
+        group_lag = 0
         try:
+            stream_len = int(rds.stream_len(stream_key))
             pending = int(rds.stream_pending(stream_key, group))
+            groups = rds.stream_info_groups(stream_key)
+            group_count = len(groups)
+            for item in groups:
+                if str(item.get("name")) == group:
+                    group_lag = int(item.get("lag") or 0)
+                    pending = int(item.get("pending") or pending)
+                    break
         except Exception:  # noqa: BLE001
+            stream_len = 0
             pending = 0
+            group_count = 0
+            group_lag = 0
 
         audit_ok = 1 if get_last_audit_integrity_valid() else 0
 
@@ -198,6 +216,15 @@ def register_observability_routes(app: Flask, limiter: Any) -> None:
         lines.append("# HELP redis_stream_pending Pending entries in Redis alert stream consumer group.")
         lines.append("# TYPE redis_stream_pending gauge")
         lines.append(f"redis_stream_pending {pending}")
+        lines.append("# HELP redis_stream_length Entries currently retained in Redis alert stream.")
+        lines.append("# TYPE redis_stream_length gauge")
+        lines.append(f"redis_stream_length {stream_len}")
+        lines.append("# HELP redis_stream_group_lag Redis-reported lag for the configured alert consumer group.")
+        lines.append("# TYPE redis_stream_group_lag gauge")
+        lines.append(f"redis_stream_group_lag {group_lag}")
+        lines.append("# HELP redis_stream_groups Consumer group count for the alert stream.")
+        lines.append("# TYPE redis_stream_groups gauge")
+        lines.append(f"redis_stream_groups {group_count}")
         lines.append("# HELP audit_integrity_valid 1 if last audit hash-chain patrol succeeded.")
         lines.append("# TYPE audit_integrity_valid gauge")
         lines.append(f"audit_integrity_valid {audit_ok}")

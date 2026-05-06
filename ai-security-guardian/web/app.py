@@ -93,19 +93,30 @@ def _missing_model_artifacts(app: Flask) -> List[str]:
     return [f for f in _REQUIRED_MODEL_FILES if not os.path.exists(os.path.join(md, f))]
 
 
-def _runtime_dependency_checks(app: Flask, cfg: Any) -> Dict[str, Any]:
-    checks: Dict[str, Any] = {}
-    require_redis = bool(getattr(cfg, "REQUIRE_REDIS_AVAILABLE", False))
-    require_models = bool(getattr(cfg, "REQUIRE_MODELS_READY", False))
+def _redis_client_for_app(app: Flask, cfg: Any):
+    """Return the process-wide Redis client so health probes do not reconnect."""
+    client = app.extensions.get("guardian_redis_client")
+    if client is not None:
+        return client
 
     from src.utils.redis_client import RedisClient
 
-    redis_client = RedisClient(
+    client = RedisClient(
         host=cfg.REDIS_HOST,
         port=cfg.REDIS_PORT,
         db=cfg.REDIS_DB,
         password=getattr(cfg, "REDIS_PASSWORD", "") or "",
     )
+    app.extensions["guardian_redis_client"] = client
+    return client
+
+
+def _runtime_dependency_checks(app: Flask, cfg: Any) -> Dict[str, Any]:
+    checks: Dict[str, Any] = {}
+    require_redis = bool(getattr(cfg, "REQUIRE_REDIS_AVAILABLE", False))
+    require_models = bool(getattr(cfg, "REQUIRE_MODELS_READY", False))
+
+    redis_client = _redis_client_for_app(app, cfg)
     redis_ok = bool(redis_client.ping())
     checks["redis"] = {
         "ok": redis_ok,
@@ -247,15 +258,9 @@ def create_app() -> tuple[Flask, SocketIO]:
     app.extensions["guardian_alert_consumer"] = None
     if getattr(cfg, "ALERT_STREAM_CONSUMER_AUTOSTART", True):
         try:
-            from src.utils.redis_client import RedisClient
             from web.alert_stream_consumer import GuardianAlertStreamConsumer
 
-            _redis_client = RedisClient(
-                host=cfg.REDIS_HOST,
-                port=cfg.REDIS_PORT,
-                db=cfg.REDIS_DB,
-                password=getattr(cfg, "REDIS_PASSWORD", "") or "",
-            )
+            _redis_client = _redis_client_for_app(app, cfg)
             _consumer = GuardianAlertStreamConsumer(
                 app=app,
                 redis_client=_redis_client,

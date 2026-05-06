@@ -19,8 +19,10 @@
    默认 ``127.0.0.1:5000`` 需本地已启动 ``python -m web.app``。
 
 3. **Redis Stream 无持续堆积**  
-   脚本不强制依赖在线 Redis；若提供 ``REDIS_URL`` 环境变量或本机 ``redis-cli``，打印 ``XLEN guardian:alerts`` 的方法说明。  
-   持续堆积应对：连续采样 ``XLEN`` / ``XPENDING``，正常负载下长度应稳定 bounded（``MAXLEN`` 软上限）。
+   脚本不强制依赖在线 Redis；若本机无 ``redis-cli``，使用
+   ``python scripts/redis_stream_status.py`` 采集 ``XLEN`` / ``XPENDING`` /
+   ``XINFO GROUPS``。持续堆积应对：连续采样，正常负载下长度应稳定
+   bounded（``MAXLEN`` 软上限），PEL 不持续增长。
 
 无法在单机完成的项（无网卡权限、无 Redis、未启动 Web）请在 ``docs/deployment.md`` 的前置条件中标注，并使用替代验证。
 """
@@ -132,7 +134,9 @@ def main() -> int:
     print("[Redis Stream 堆积观测]")
     print("  redis-cli -a \"$REDIS_PASSWORD\" XLEN guardian:alerts")
     print("  redis-cli -a \"$REDIS_PASSWORD\" XPENDING guardian:alerts guardian:web")
-    print("  正常流量下 XLEN 不应无限增长（流带 MAXLEN 软修剪）；PEL 滞留应被 consumer ack。")
+    print("  redis-cli -a \"$REDIS_PASSWORD\" XINFO GROUPS guardian:alerts")
+    print("  python scripts/redis_stream_status.py --json")
+    print("  正常流量下 XLEN 稳定 bounded；PEL 不持续增长；consumer 持续 ack。")
     return 0
 
 
