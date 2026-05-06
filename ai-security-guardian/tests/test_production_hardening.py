@@ -227,6 +227,52 @@ def test_readiness_runtime_guard_false_is_warning(monkeypatch):
     assert "REQUIRE_REDIS_AVAILABLE" in result.reason
 
 
+def test_private_beta_readiness_allows_dry_run(monkeypatch):
+    from scripts.check_production_readiness import check_dry_run
+
+    monkeypatch.setenv("DRY_RUN", "true")
+
+    result = check_dry_run("private-beta")
+
+    assert result.ok is True
+    assert result.status == "PASS"
+    assert "private Beta" in result.reason
+
+
+def test_real_enforcement_readiness_rejects_dry_run(monkeypatch):
+    from scripts.check_production_readiness import check_dry_run
+
+    monkeypatch.setenv("DRY_RUN", "true")
+
+    result = check_dry_run("real-enforcement")
+
+    assert result.ok is False
+    assert "real-enforcement" in result.reason
+
+
+def test_real_enforcement_readiness_requires_safety_gates(monkeypatch):
+    import scripts.check_production_readiness as readiness
+
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.delenv("RESPONSE_BUSINESS_IP_WHITELIST", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_APPROVAL_REQUIRED", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_AUDIT_VERIFIED", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_ROLLBACK_READY", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_UNBLOCK_READY", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_REVIEW_REQUIRED", raising=False)
+
+    results = [check() for check in readiness._checks("real-enforcement")]
+    failed_names = {result.name for result in results if not result.ok}
+
+    assert "DRY_RUN" not in failed_names
+    assert "RESPONSE_BUSINESS_IP_WHITELIST" in failed_names
+    assert "REAL_ENFORCEMENT_APPROVAL_REQUIRED" in failed_names
+    assert "REAL_ENFORCEMENT_AUDIT_VERIFIED" in failed_names
+    assert "REAL_ENFORCEMENT_ROLLBACK_READY" in failed_names
+    assert "REAL_ENFORCEMENT_UNBLOCK_READY" in failed_names
+    assert "REAL_ENFORCEMENT_REVIEW_REQUIRED" in failed_names
+
+
 def test_readiness_model_files_require_known_artifacts(monkeypatch, tmp_path):
     from scripts.check_production_readiness import REQUIRED_MODEL_FILES, check_model_files
 

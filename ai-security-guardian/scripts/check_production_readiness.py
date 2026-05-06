@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""One-shot production configuration readiness check.
+"""One-shot deployment readiness check.
 
 The script reads environment variables and, by default, also reads a local
 ``.env`` file without modifying it. Existing process environment variables win.
-It exits with status 0 only when every production gate passes.
+It exits with status 0 only when every selected readiness gate passes.
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from functools import partial
+from typing import Callable, Iterable, Literal
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -97,6 +98,7 @@ FORBIDDEN_ALLOWED_ORIGINS = {
 
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
+ReadinessGate = Literal["private-beta", "real-enforcement"]
 
 
 @dataclass(frozen=True)
@@ -356,15 +358,86 @@ def check_allowed_origins() -> CheckResult:
     return CheckResult("ALLOWED_ORIGINS", True, f"{len(origins)} origin(s) configured")
 
 
-def check_dry_run() -> CheckResult:
+def check_dry_run(gate: ReadinessGate = "private-beta") -> CheckResult:
     value = _env("DRY_RUN")
     if not value:
-        return CheckResult("DRY_RUN", False, "missing; production must set DRY_RUN=false explicitly")
+        return CheckResult("DRY_RUN", False, "missing; readiness requires an explicit true/false value")
     if not _is_bool(value):
         return CheckResult("DRY_RUN", False, "must be true or false")
-    if value.lower() in TRUTHY:
-        return CheckResult("DRY_RUN", False, "must be false for production readiness")
-    return CheckResult("DRY_RUN", True, "false")
+    is_dry_run = value.lower() in TRUTHY
+    if gate == "real-enforcement":
+        if is_dry_run:
+            return CheckResult(
+                "DRY_RUN",
+                False,
+                "must be false for real-enforcement readiness",
+            )
+        return CheckResult("DRY_RUN", True, "false; real enforcement explicitly enabled")
+    if is_dry_run:
+        return CheckResult("DRY_RUN", True, "true; private Beta runs in non-enforcing mode")
+    return CheckResult(
+        "DRY_RUN",
+        True,
+        "false; allowed for private Beta only when real enforcement is separately approved",
+        "WARN",
+    )
+
+
+def _check_required_true(key: str, reason: str) -> CheckResult:
+    value = _env(key)
+    if not value:
+        return CheckResult(key, False, f"missing; {reason}")
+    if not _is_bool(value):
+        return CheckResult(key, False, "must be true or false")
+    if not _bool_value(value):
+        return CheckResult(key, False, reason)
+    return CheckResult(key, True, "true")
+
+
+def check_response_business_whitelist() -> CheckResult:
+    whitelist = _env("RESPONSE_BUSINESS_IP_WHITELIST")
+    if not whitelist:
+        return CheckResult(
+            "RESPONSE_BUSINESS_IP_WHITELIST",
+            False,
+            "must be non-empty before real enforcement to protect business/LB/monitoring IPs",
+        )
+    return CheckResult("RESPONSE_BUSINESS_IP_WHITELIST", True, "business whitelist configured")
+
+
+def check_real_enforcement_approval_required() -> CheckResult:
+    return _check_required_true(
+        "REAL_ENFORCEMENT_APPROVAL_REQUIRED",
+        "real enforcement must have an explicit approval gate",
+    )
+
+
+def check_real_enforcement_audit_verified() -> CheckResult:
+    return _check_required_true(
+        "REAL_ENFORCEMENT_AUDIT_VERIFIED",
+        "real enforcement must verify audit logging and hash-chain evidence",
+    )
+
+
+def check_real_enforcement_rollback_ready() -> CheckResult:
+    return _check_required_true(
+        "REAL_ENFORCEMENT_ROLLBACK_READY",
+        "real enforcement must have a tested rollback/stop-the-bleed path",
+    )
+
+
+def check_real_enforcement_unblock_ready() -> CheckResult:
+    return _check_required_true(
+        "REAL_ENFORCEMENT_UNBLOCK_READY",
+        "real enforcement must have tested manual unblock or equivalent recovery",
+    )
+
+
+def check_real_enforcement_review_required() -> CheckResult:
+    return _check_required_true(
+        "REAL_ENFORCEMENT_REVIEW_REQUIRED",
+        "real enforcement must require post-action review/复盘",
+    )
 
 
 def check_required_runtime_guards() -> CheckResult:
@@ -527,8 +600,8 @@ def check_database_connectivity() -> CheckResult:
     return CheckResult("DB_CONNECTIVITY", True, "database SELECT 1 succeeded")
 
 
-def _checks() -> Iterable[Callable[[], CheckResult]]:
-    return (
+def _checks(gate: ReadinessGate) -> Iterable[Callable[[], CheckResult]]:
+    checks: list[Callable[[], CheckResult]] = [
         check_flask_env,
         check_secret_key,
         check_admin_password_hash,
@@ -536,7 +609,7 @@ def _checks() -> Iterable[Callable[[], CheckResult]]:
         check_database_url,
         check_redis_password,
         check_allowed_origins,
-        check_dry_run,
+        partial(check_dry_run, gate),
         check_required_runtime_guards,
         check_model_dir,
         check_model_files,
@@ -544,12 +617,33 @@ def _checks() -> Iterable[Callable[[], CheckResult]]:
         check_audit_log_dir,
         check_redis_connectivity,
         check_database_connectivity,
-    )
+    ]
+    if gate == "real-enforcement":
+        checks.extend(
+            [
+                check_response_business_whitelist,
+                check_real_enforcement_approval_required,
+                check_real_enforcement_audit_verified,
+                check_real_enforcement_rollback_ready,
+                check_real_enforcement_unblock_ready,
+                check_real_enforcement_review_required,
+            ]
+        )
+    return checks
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Validate AI-Security-Guardian production configuration."
+        description="Validate AI-Security-Guardian readiness gates."
+    )
+    parser.add_argument(
+        "--gate",
+        choices=("private-beta", "real-enforcement", "production-enforcement"),
+        default="private-beta",
+        help=(
+            "readiness gate to evaluate: private-beta allows DRY_RUN=true; "
+            "real-enforcement requires DRY_RUN=false plus explicit safety controls"
+        ),
     )
     parser.add_argument(
         "--env-file",
@@ -576,10 +670,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("Env file: skipped")
 
-    print("AI-Security-Guardian production readiness check")
+    gate: ReadinessGate = (
+        "real-enforcement" if args.gate == "production-enforcement" else args.gate
+    )
+
+    print(f"AI-Security-Guardian readiness check: {gate}")
     print("-" * 56)
 
-    results = [check() for check in _checks()]
+    results = [check() for check in _checks(gate)]
     for result in results:
         print(f"[{result.status}] {result.name}: {result.reason}")
 

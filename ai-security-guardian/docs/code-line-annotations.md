@@ -2168,15 +2168,15 @@
 | 206 | 返回结果：把处理后的值交回调用方。 | `    return CheckResult("ALLOWED_ORIGINS", True, f"{len(origins)} origin(s) configured")` |
 | 207 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
 | 208 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
-| 209 | 函数定义：声明 `check_dry_run` 的输入、处理逻辑和返回结果。 | `def check_dry_run() -> CheckResult:` |
+| 209 | 函数定义：声明 `check_dry_run` 的输入、处理逻辑和返回结果。 | `def check_dry_run(gate: ReadinessGate = "private-beta") -> CheckResult:` |
 | 210 | 赋值/配置：保存变量、字段或配置项供后续逻辑使用。 | `    value = _env("DRY_RUN")` |
 | 211 | 条件判断：满足条件时进入对应分支。 | `    if not value:` |
-| 212 | 返回结果：把处理后的值交回调用方。 | `        return CheckResult("DRY_RUN", False, "missing; production must set DRY_RUN=false explicitly")` |
+| 212 | 返回结果：把处理后的值交回调用方。 | `        return CheckResult("DRY_RUN", False, "missing; readiness requires an explicit true/false value")` |
 | 213 | 条件判断：满足条件时进入对应分支。 | `    if not _is_bool(value):` |
 | 214 | 返回结果：把处理后的值交回调用方。 | `        return CheckResult("DRY_RUN", False, "must be true or false")` |
-| 215 | 条件判断：满足条件时进入对应分支。 | `    if value.lower() in TRUTHY:` |
-| 216 | 返回结果：把处理后的值交回调用方。 | `        return CheckResult("DRY_RUN", False, "must be false for production readiness")` |
-| 217 | 返回结果：把处理后的值交回调用方。 | `    return CheckResult("DRY_RUN", True, "false")` |
+| 215 | 条件判断：满足条件时进入对应分支。 | `    if gate == "real-enforcement":` |
+| 216 | 返回结果：把处理后的值交回调用方。 | `        return CheckResult("DRY_RUN", False, "must be false for real-enforcement readiness")` |
+| 217 | 返回结果：把处理后的值交回调用方。 | `    return CheckResult("DRY_RUN", True, "true; private Beta runs in non-enforcing mode")` |
 | 218 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
 | 219 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
 | 220 | 函数定义：声明 `check_model_dir` 的输入、处理逻辑和返回结果。 | `def check_model_dir() -> CheckResult:` |
@@ -29096,4 +29096,3 @@
 | 216 | 模板语句：由 Jinja 在服务端渲染时替换或控制流程。 | `{% block page_scripts %}` |
 | 217 | 脚本引用：加载页面所需 JavaScript。 | `  <script src="{{ url_for('static', filename='js/threat_intel.js') }}"></script>` |
 | 218 | 模板语句：由 Jinja 在服务端渲染时替换或控制流程。 | `{% endblock %}` |
-

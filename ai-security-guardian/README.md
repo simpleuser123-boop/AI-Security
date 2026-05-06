@@ -29,7 +29,7 @@ cp .env.example .env
 
 至少修改：`SECRET_KEY`、`ADMIN_PASSWORD_HASH`、`REDIS_PASSWORD`；生产环境详见 [docs/deployment.md](docs/deployment.md)（明文 `ADMIN_PASSWORD` 仅用于开发回退）。
 
-生产配置上线前可执行一键校验：
+私有化 Beta 配置上线前可执行一键校验：
 
 ```bash
 python scripts/check_production_readiness.py
@@ -38,6 +38,13 @@ python scripts/check_production_readiness.py
 脚本只读取当前环境与 `.env`，不会自动修改 `.env`，也不会打印密钥、密码或管理员哈希。
 输出状态为 `[PASS]`、`[WARN]`、`[FAIL]`；任一 `[FAIL]` 都会返回非 0 退出码。
 该检查会连接 Redis 和 PostgreSQL 执行短超时探针，请在上线目标环境或具备同等网络访问的发布机上运行。
+默认 gate 为 `private-beta`，允许并推荐 `DRY_RUN=true`。真实封禁能力属于更高风险门禁，需单独执行：
+
+```bash
+python scripts/check_production_readiness.py --gate real-enforcement
+```
+
+该 gate 会要求 `DRY_RUN=false`，并显式检查审批、审计、回滚、解封和复盘门禁证据。
 
 3. 启动 Web/API（默认 5000）：
 
@@ -112,6 +119,7 @@ python -c "import os,sys; d=os.getenv('MODEL_DIR','models/saved'); req=['intrusi
 ```bash
 python -m pytest -q
 python scripts/check_production_readiness.py
+python scripts/check_production_readiness.py --gate real-enforcement  # 仅真实封禁上线前执行
 python scripts/verify_v1.py
 python scripts/benchmark_p95.py
 python -m pytest tests/e2e/test_v1_acceptance.py -q
@@ -125,15 +133,36 @@ python -m tests._phase8_smoke
 - **E2E 验收**：`python -m pytest -m e2e -q` 或直接运行 `python -m pytest tests/e2e/test_v1_acceptance.py -q`。
 - **端到端验收**：`scripts/verify_v1.py`（场景 1～9）；场景 10（Web 重启后仍可查库内告警）由 `tests/e2e/test_v1_acceptance.py` 覆盖。  
 - **压测与 P95**：`scripts/benchmark_p95.py`（检测链路与 HTTP 粗测；Redis Stream 观测命令见脚本输出）。  
+- **HTTP/API 生产口径压测**：`scripts/benchmark_http.py` 会自动登录获取 JWT，覆盖核心 API，输出 avg、P50、P95、P99、错误率、状态码分布，并在 `reports/benchmarks/` 生成 JSON 与 Markdown 报告。默认目标：核心 API P95 < 300ms，检测段 P95 < 100ms。
+
+示例：
+
+```bash
+BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' \
+python scripts/benchmark_http.py \
+  --base-url http://127.0.0.1:5000 \
+  --requests 1000 \
+  --workers 32 \
+  --warmup-requests 100
+
+BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' \
+python scripts/benchmark_http.py \
+  --base-url http://127.0.0.1:5000 \
+  --duration 60 \
+  --workers 32 \
+  --warmup-seconds 10
+```
 
 手动检查流程：`/login` -> `/dashboard` -> `/alerts` -> `/settings`。
 
 ## 数据库初始化说明
 
-- 开发/测试：默认使用 SQLite，应用启动会自动创建缺失表，便于本地快速验证。
-- 生产：必须显式配置 PostgreSQL `DATABASE_URL`，应用启动不会自动建表，也不应依赖 `AUTO_CREATE_DB_TABLES=true`。
-- 生产首次上线：在空库、账号和网络 ACL 准备完成后执行 `python -m web.init_db`，再执行 `python -m web.init_db --check` 验证表结构存在。
-- 后续模型变更以外的数据库结构升级：当前项目尚未引入 Alembic/Flask-Migrate；生产变更应先在暂存库验证 SQL/脚本、备份生产库，再在维护窗口执行。详见 [docs/deployment.md](docs/deployment.md)。
+- 开发/测试：默认使用 SQLite，应用启动仍会自动创建缺失表，便于本地快速验证。
+- 迁移框架：项目使用 Flask-Migrate（Alembic）管理正式 schema 版本，迁移 app 为 `web.migration_app:create_migration_app`。
+- 新环境建表：推荐执行 `flask --app web.migration_app:create_migration_app db upgrade`，该命令可在本地和 Docker 容器中运行。
+- 生产：必须显式配置 PostgreSQL `DATABASE_URL`，应用启动不会自动建表，也不应依赖 `AUTO_CREATE_DB_TABLES=true` 或 `create_all()` 做后续升级。
+- `web/init_db.py`：保留给开发/测试首次空库初始化与 `--check` 表存在性检查；生产结构升级以迁移为准。已有 create_all 建出的旧库在确认结构匹配后，应先备份并执行 `flask --app web.migration_app:create_migration_app db stamp head` 纳入版本管理。
+- 生产发布流程、备份、回滚和 Docker 命令见 [docs/deployment.md](docs/deployment.md)。
 
 ## 企业控制面最小闭环
 

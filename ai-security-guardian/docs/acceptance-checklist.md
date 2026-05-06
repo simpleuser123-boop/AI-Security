@@ -52,13 +52,16 @@
 
 ## 上线准入（§7 摘要）
 
+> 私有化 Beta readiness 与真实封禁 readiness 分开判断。默认 `python scripts/check_production_readiness.py` 是 `private-beta` gate，允许 `DRY_RUN=true`；真实封禁上线必须额外通过 `python scripts/check_production_readiness.py --gate real-enforcement`。
+
 - [ ] `.env` 生产配置完成；无默认密钥/默认密码  
 - [ ] 数据库迁移/初始化完成；备份策略可用  
 - [ ] Redis `requirepass`；Compose 绑定策略符合 `deployment.md`  
 - [ ] `/readyz`、健康检查通过  
 - [ ] `python -m pytest -q` 全绿  
 - [ ] `python scripts/verify_v1.py` 通过；场景 10 pytest 通过  
-- [ ] dry-run 与真实响应演练完成  
+- [ ] 私有化 Beta 保持或允许 `DRY_RUN=true`，dry-run 响应记录可审计  
+- [ ] 真实封禁仅在 `--gate real-enforcement` 无 `[FAIL]` 后启用，且审批、审计、回滚、解封、复盘证据齐备  
 - [ ] 审计完整性抽检通过  
 - [ ] Nginx TLS + WSS 验证（若对外 WebSocket）  
 - [ ] 回滚方案演练  

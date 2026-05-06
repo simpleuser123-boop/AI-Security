@@ -80,11 +80,16 @@ find models/saved -maxdepth 1 -type f | sort
 | `SECRET_KEY` | 至少 32 字符，禁止使用示例值或开发默认值 |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 必须使用哈希；禁止生产使用明文 `ADMIN_PASSWORD` |
 | `DATABASE_URL` | 生产必须指向 PostgreSQL；SQLite 仅允许开发/测试 |
-| `AUTO_CREATE_DB_TABLES` | 生产保持 `false`，首次上线必须显式执行 `python -m web.init_db` |
+| `AUTO_CREATE_DB_TABLES` | 生产保持 `false`，首次上线和后续升级使用 Flask-Migrate/Alembic |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` | `REDIS_PASSWORD` 必填，必须与 Redis `requirepass` 一致 |
 | `REDIS_CONNECT_TIMEOUT_SEC` / `REDIS_SOCKET_TIMEOUT_SEC` | Redis 客户端连接/读写超时，默认 `0.5` / `2.0` 秒，避免健康检查长时间阻塞 |
 | `ALLOWED_ORIGINS` | 填真实 Origin，例如 `https://console.example.com`，禁止 `*` |
-| `DRY_RUN` | 上线前演练可为 `true`；生产真实响应前必须完成误封恢复演练 |
+| `DRY_RUN` | 私有化 Beta 建议 `true`；真实封禁 readiness 才要求 `false` |
+| `REAL_ENFORCEMENT_APPROVAL_REQUIRED` | 仅真实封禁 gate 使用；必须确认审批门禁已启用 |
+| `REAL_ENFORCEMENT_AUDIT_VERIFIED` | 仅真实封禁 gate 使用；必须确认审计和哈希链证据已验证 |
+| `REAL_ENFORCEMENT_ROLLBACK_READY` | 仅真实封禁 gate 使用；必须确认回滚/止血路径已演练 |
+| `REAL_ENFORCEMENT_UNBLOCK_READY` | 仅真实封禁 gate 使用；必须确认手工解封或等效恢复已演练 |
+| `REAL_ENFORCEMENT_REVIEW_REQUIRED` | 仅真实封禁 gate 使用；必须确认响应后复盘要求 |
 | `REQUIRE_REDIS_AVAILABLE` | 生产建议 `true`，Redis 不可用时启动失败 |
 | `REQUIRE_MODELS_READY` | 生产建议 `true`，关键模型缺失时启动失败 |
 | `LOG_INTEGRITY_ENABLED` | 生产建议 `true` |
@@ -106,7 +111,7 @@ chmod 600 .env
 vi .env
 ```
 
-上线前配置校验：
+私有化 Beta 配置校验：
 
 ```bash
 python scripts/check_production_readiness.py
@@ -118,47 +123,58 @@ python scripts/check_production_readiness.py
 python scripts/check_production_readiness.py --env-file /etc/guardian/production.env
 ```
 
-脚本会执行生产上线 gate，包括：
+默认脚本执行 `private-beta` gate，允许 `DRY_RUN=true`，用于证明客户侧私有化环境可部署、可审计、可回滚、可验收。它不代表真实封禁能力已经放行。该 gate 包括：
 
 - `SECRET_KEY` 强度、默认值与弱 token 检查。
 - `ADMIN_PASSWORD_HASH` 存在性、Werkzeug 哈希格式、是否匹配默认密码检查；生产禁止明文 `ADMIN_PASSWORD`。
 - `DATABASE_URL` 必须是非示例、非本地的 PostgreSQL，并执行 `SELECT 1` 连通性检查。
 - `REDIS_PASSWORD` 必填且非弱密码，并执行带密码 `PING` 连通性检查。
 - `ALLOWED_ORIGINS` 禁止 `*`、localhost 和非 HTTPS Origin。
+- `DRY_RUN=true` 通过；若为 `false`，输出 `[WARN]`，提示必须另走真实封禁 gate。
 - `REQUIRE_REDIS_AVAILABLE` / `REQUIRE_MODELS_READY` 建议为 `true`；不符合时输出 `[WARN]`。
 - `MODEL_DIR` 与关键模型/manifest 文件存在且可读。
 - `LOG_INTEGRITY_ENABLED=true`，审计日志目录存在且可写。
 
+真实封禁上线前必须单独执行更高风险 gate：
+
+```bash
+python scripts/check_production_readiness.py --gate real-enforcement
+```
+
+该 gate 必须满足 `DRY_RUN=false`，并显式检查业务白名单、审批门禁、审计证据、回滚路径、解封路径和响应后复盘要求。不要把私有化 Beta readiness 通过解读为真实封禁已可上线。
+
 验收证据：
 
-- `scripts/check_production_readiness.py` 输出无 `[FAIL]`，正式发布建议全部为 `[PASS]`。
+- 私有化 Beta：`scripts/check_production_readiness.py` 输出无 `[FAIL]`，允许 `DRY_RUN=true`。
+- 真实封禁：`scripts/check_production_readiness.py --gate real-enforcement` 输出无 `[FAIL]`，且 `DRY_RUN=false` 和安全门禁证据齐备。
 - `.env` 权限为 `600`。
 - `ALLOWED_ORIGINS` 与正式域名一致。
 - `ADMIN_PASSWORD` 在生产环境为空或未设置。
 
-## 3. 数据库初始化
+## 3. 数据库初始化与迁移
 
-生产禁止依赖应用启动自动建表。`AUTO_CREATE_DB_TABLES=false` 必须保持为上线基线；它只保留给开发/应急演示，不作为正式生产发布方案。
+生产禁止依赖应用启动自动建表。`AUTO_CREATE_DB_TABLES=false` 必须保持为上线基线；它只保留给开发/应急演示，不作为正式生产发布方案。正式 schema 版本由 Flask-Migrate（Alembic）管理，迁移命令使用轻量 app：`web.migration_app:create_migration_app`。
 
 ### 3.1 开发/测试 SQLite
 
 SQLite 仅用于开发、测试、演示或临时 POC。`FLASK_ENV=production` 下应用会拒绝 SQLite `DATABASE_URL`，避免把单机文件库误用为正式数据库。
 
-初始化：
+推荐按迁移初始化：
 
 ```bash
 export FLASK_ENV=development
 export DATABASE_URL=sqlite:///data/security.db
-python -m web.init_db
+flask --app web.migration_app:create_migration_app db upgrade
 ```
 
-检查：
+轻量空库初始化入口仍保留给本地快速验证：
 
 ```bash
+python -m web.init_db
 python -m web.init_db --check
 ```
 
-### 3.2 生产 PostgreSQL 首次建表
+### 3.2 生产 PostgreSQL 首次建表与升级
 
 先由 DBA 创建空库、账号和网络访问控制，再执行初始化。生产账号建议只授予应用需要的 DML 权限；首次建表或结构升级可使用受控发布账号执行 DDL。
 
@@ -169,12 +185,12 @@ psql guardian_prod -c "CREATE USER guardian WITH PASSWORD 'REPLACE_WITH_STRONG_P
 psql guardian_prod -c "GRANT CONNECT ON DATABASE guardian_prod TO guardian;"
 ```
 
-初始化应用表：
+初始化或升级应用表：
 
 ```bash
 export FLASK_ENV=production
 export DATABASE_URL=postgresql+psycopg2://guardian:REPLACE_WITH_STRONG_PASSWORD@postgres.example.com:5432/guardian_prod
-docker compose run --rm app python -m web.init_db
+docker compose run --rm app flask --app web.migration_app:create_migration_app db upgrade
 docker compose run --rm app python -m web.init_db --check
 ```
 
@@ -189,16 +205,29 @@ print(sorted(inspect(engine).get_table_names()))
 PY
 ```
 
-当前 `python -m web.init_db` 使用 SQLAlchemy `create_all()` 生成 ORM 已定义但尚不存在的表；它适合空库首次建表，不是通用 schema migration 工具。
+`python -m web.init_db --check` 只验证 ORM 期望表是否存在；`python -m web.init_db` 保留为空库快速初始化或开发/测试用途。生产后续结构变更必须通过迁移 revision 发布，不再用 `create_all()` 作为升级机制。
 
-### 3.3 后续升级与迁移策略
+### 3.3 迁移发布策略
 
-项目当前尚未引入 Alembic/Flask-Migrate。考虑到已有代码直接依赖 Flask 工厂、后台 consumer、审计巡检和生产启动防护，立即接入迁移框架会带来额外初始化路径与发布流程风险；本次先采用最小可落地方案：
+常用命令：
 
-- 首次生产建表：使用 `python -m web.init_db`，该入口只创建轻量 Flask app，不启动完整 Web/API 或后台任务。
-- 发布前检查：使用 `python -m web.init_db --check` 验证 ORM 表是否存在。
-- 后续结构变更：在合并代码前补充独立 SQL/脚本和回滚 SQL，先在暂存 PostgreSQL 上演练，再在维护窗口执行。
-- 中长期建议：当出现第二次以上结构变更或需要自动版本追踪时，引入 Alembic/Flask-Migrate，建立 `migrations/`、`flask db upgrade`、`flask db downgrade` 和 release gate。
+```bash
+# 查看当前数据库版本
+flask --app web.migration_app:create_migration_app db current
+
+# 升级到最新版本；重复执行应保持幂等，不破坏数据
+flask --app web.migration_app:create_migration_app db upgrade
+
+# ORM 变更后生成迁移草稿，提交前必须人工审阅 revision 内容
+flask --app web.migration_app:create_migration_app db migrate -m "describe schema change"
+```
+
+发布规则：
+
+- 每次 ORM schema 变更必须提交对应 `migrations/versions/*.py`。
+- 发布前在暂存 PostgreSQL 上执行 `flask db upgrade`，再跑 `python -m web.init_db --check` 和回归测试。
+- 生产升级前执行 `pg_dump -Fc` 备份，并记录当前 `flask db current` 输出、应用镜像 tag、`.env` SHA256、迁移 revision。
+- 已经用旧版 `python -m web.init_db`/`create_all()` 建出的存量库，先备份并确认表结构与初始迁移一致，再执行 `flask --app web.migration_app:create_migration_app db stamp head` 写入版本标记；后续升级再走 `db upgrade`。
 
 回滚注意：
 
@@ -209,6 +238,7 @@ PY
 验收证据：
 
 - 初始化命令退出码为 `0`。
+- `flask --app web.migration_app:create_migration_app db current` 显示目标 revision。
 - `python -m web.init_db --check` 通过。
 - 表清单截图或日志。
 - DBA 备份策略确认记录。
@@ -371,7 +401,7 @@ YAML
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d redis
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app python -m web.init_db
+docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app flask --app web.migration_app:create_migration_app db upgrade
 docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app python -m web.init_db --check
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d app
 docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
@@ -557,6 +587,8 @@ WSS 验证：
 python scripts/staging_drill.py --cleanup
 python scripts/verify_v1.py
 python scripts/benchmark_p95.py
+BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' \
+  python scripts/benchmark_http.py --base-url http://127.0.0.1:5000 --requests 1000 --workers 32 --warmup-requests 100
 ```
 
 检查审计：
@@ -996,10 +1028,11 @@ python -m pytest -q
 python scripts/check_production_readiness.py
 python scripts/verify_v1.py
 python scripts/benchmark_p95.py
+BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' python scripts/benchmark_http.py --base-url http://127.0.0.1:5000 --requests 1000 --workers 32 --warmup-requests 100
 python scripts/staging_drill.py --cleanup
 docker compose config
 docker compose up -d redis
-docker compose run --rm app python -m web.init_db
+docker compose run --rm app flask --app web.migration_app:create_migration_app db upgrade
 docker compose run --rm app python -m web.init_db --check
 docker compose up -d app
 docker compose ps
@@ -1018,7 +1051,7 @@ curl -fsS http://127.0.0.1:5000/readyz
 - `docker compose config` 输出。
 - `.env` SHA256，不包含明文内容。
 - 模型 manifest 与 SHA256。
-- 数据库初始化输出。
+- 数据库迁移输出和 `flask db current` 版本。
 
 安全：
 
