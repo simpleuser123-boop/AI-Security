@@ -79,7 +79,7 @@ find models/saved -maxdepth 1 -type f | sort
 | `FLASK_ENV` | 必须为 `production` |
 | `SECRET_KEY` | 至少 32 字符，禁止使用示例值或开发默认值 |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 必须使用哈希；禁止生产使用明文 `ADMIN_PASSWORD` |
-| `DATABASE_URL` | 必须指向生产数据库；SQLite 仅适合单机演示或受控小规模部署 |
+| `DATABASE_URL` | 生产必须指向 PostgreSQL；SQLite 仅允许开发/测试 |
 | `AUTO_CREATE_DB_TABLES` | 生产保持 `false`，首次上线必须显式执行 `python -m web.init_db` |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` | `REDIS_PASSWORD` 必填，必须与 Redis `requirepass` 一致 |
 | `ALLOWED_ORIGINS` | 填真实 Origin，例如 `https://console.example.com`，禁止 `*` |
@@ -126,53 +126,44 @@ python scripts/check_production_readiness.py --env-file /etc/guardian/production
 
 ## 3. 数据库初始化
 
-生产禁止依赖应用启动自动建表。`AUTO_CREATE_DB_TABLES=false` 必须保持为上线基线。
+生产禁止依赖应用启动自动建表。`AUTO_CREATE_DB_TABLES=false` 必须保持为上线基线；它只保留给开发/应急演示，不作为正式生产发布方案。
 
-### 3.1 SQLite 单机部署
+### 3.1 开发/测试 SQLite
 
-SQLite 仅建议用于演示、单机 POC 或无并发写入压力的隔离环境。
+SQLite 仅用于开发、测试、演示或临时 POC。`FLASK_ENV=production` 下应用会拒绝 SQLite `DATABASE_URL`，避免把单机文件库误用为正式数据库。
 
 初始化：
 
 ```bash
-export FLASK_ENV=production
-export DATABASE_URL=sqlite:////app/data/security.db
-docker compose run --rm app python -m web.init_db
+export FLASK_ENV=development
+export DATABASE_URL=sqlite:///data/security.db
+python -m web.init_db
 ```
 
 检查：
 
 ```bash
-docker compose run --rm app python - <<'PY'
-from web.app import create_app
-from web.database import db
-app = create_app()
-with app.app_context():
-    print("tables:", sorted(db.metadata.tables.keys()))
-PY
+python -m web.init_db --check
 ```
 
-### 3.2 PostgreSQL / MySQL 外部数据库
+### 3.2 生产 PostgreSQL 首次建表
 
-先由 DBA 创建空库、账号和网络访问控制，再执行初始化。示例：
+先由 DBA 创建空库、账号和网络访问控制，再执行初始化。生产账号建议只授予应用需要的 DML 权限；首次建表或结构升级可使用受控发布账号执行 DDL。
 
 ```bash
 # PostgreSQL 示例
 createdb guardian_prod
-psql guardian_prod -c '\dt'
-```
-
-```bash
-# MySQL 示例
-mysql -u root -p -e "CREATE DATABASE guardian_prod CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql -u root -p -e "CREATE USER 'guardian'@'10.%' IDENTIFIED BY 'REPLACE_WITH_STRONG_PASSWORD';"
-mysql -u root -p -e "GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,INDEX ON guardian_prod.* TO 'guardian'@'10.%';"
+psql guardian_prod -c "CREATE USER guardian WITH PASSWORD 'REPLACE_WITH_STRONG_PASSWORD';"
+psql guardian_prod -c "GRANT CONNECT ON DATABASE guardian_prod TO guardian;"
 ```
 
 初始化应用表：
 
 ```bash
+export FLASK_ENV=production
+export DATABASE_URL=postgresql+psycopg2://guardian:REPLACE_WITH_STRONG_PASSWORD@postgres.example.com:5432/guardian_prod
 docker compose run --rm app python -m web.init_db
+docker compose run --rm app python -m web.init_db --check
 ```
 
 检查：
@@ -186,9 +177,27 @@ print(sorted(inspect(engine).get_table_names()))
 PY
 ```
 
+当前 `python -m web.init_db` 使用 SQLAlchemy `create_all()` 生成 ORM 已定义但尚不存在的表；它适合空库首次建表，不是通用 schema migration 工具。
+
+### 3.3 后续升级与迁移策略
+
+项目当前尚未引入 Alembic/Flask-Migrate。考虑到已有代码直接依赖 Flask 工厂、后台 consumer、审计巡检和生产启动防护，立即接入迁移框架会带来额外初始化路径与发布流程风险；本次先采用最小可落地方案：
+
+- 首次生产建表：使用 `python -m web.init_db`，该入口只创建轻量 Flask app，不启动完整 Web/API 或后台任务。
+- 发布前检查：使用 `python -m web.init_db --check` 验证 ORM 表是否存在。
+- 后续结构变更：在合并代码前补充独立 SQL/脚本和回滚 SQL，先在暂存 PostgreSQL 上演练，再在维护窗口执行。
+- 中长期建议：当出现第二次以上结构变更或需要自动版本追踪时，引入 Alembic/Flask-Migrate，建立 `migrations/`、`flask db upgrade`、`flask db downgrade` 和 release gate。
+
+回滚注意：
+
+- DDL 发布前必须执行 `pg_dump -Fc` 备份，并记录应用镜像 tag、`.env` SHA256、迁移脚本版本。
+- 可逆变更必须提供 downgrade SQL；不可逆变更必须在变更单中明确恢复方式，只能通过备份恢复或补偿脚本回滚。
+- 回滚应用镜像前确认数据库结构兼容旧版本；若不兼容，先执行 downgrade SQL 或切换到恢复库。
+
 验收证据：
 
 - 初始化命令退出码为 `0`。
+- `python -m web.init_db --check` 通过。
 - 表清单截图或日志。
 - DBA 备份策略确认记录。
 - 证明 `.env` 中 `AUTO_CREATE_DB_TABLES=false`。
@@ -333,6 +342,7 @@ YAML
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d redis
 docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app python -m web.init_db
+docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app python -m web.init_db --check
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d app
 docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
 docker compose -f docker-compose.yml -f docker-compose.prod.yml logs --tail=100 app
@@ -528,14 +538,6 @@ pg_dump "$DATABASE_URL" -Fc -f backups/$TS/guardian_prod.dump
 sha256sum backups/$TS/guardian_prod.dump > backups/$TS/guardian_prod.dump.sha256
 ```
 
-备份 MySQL：
-
-```bash
-mysqldump --single-transaction --routines --triggers guardian_prod > backups/$TS/guardian_prod.sql
-gzip backups/$TS/guardian_prod.sql
-sha256sum backups/$TS/guardian_prod.sql.gz > backups/$TS/guardian_prod.sql.gz.sha256
-```
-
 备份模型：
 
 ```bash
@@ -630,14 +632,6 @@ PostgreSQL：
 createdb guardian_restore_drill
 pg_restore -d guardian_restore_drill backups/$BACKUP_TS/guardian_prod.dump
 psql guardian_restore_drill -c '\dt'
-```
-
-MySQL：
-
-```bash
-mysql -u root -p -e "CREATE DATABASE guardian_restore_drill CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-gunzip -c backups/$BACKUP_TS/guardian_prod.sql.gz | mysql -u root -p guardian_restore_drill
-mysql -u root -p -e "SHOW TABLES FROM guardian_restore_drill;"
 ```
 
 验收：
@@ -822,13 +816,6 @@ pg_restore -d guardian_restore_tmp backups/<GOOD_TS>/guardian_prod.dump
 # DBA 确认后切换连接串，或在维护窗口内恢复到正式库
 ```
 
-MySQL：
-
-```bash
-mysql -u root -p -e "CREATE DATABASE guardian_restore_tmp CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-gunzip -c backups/<GOOD_TS>/guardian_prod.sql.gz | mysql -u root -p guardian_restore_tmp
-```
-
 验收：
 
 - 核心表记录数与备份点一致。
@@ -935,6 +922,7 @@ python scripts/staging_drill.py --cleanup
 docker compose config
 docker compose up -d redis
 docker compose run --rm app python -m web.init_db
+docker compose run --rm app python -m web.init_db --check
 docker compose up -d app
 docker compose ps
 curl -fsS http://127.0.0.1:5000/api/health

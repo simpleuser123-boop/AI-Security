@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from typing import List, Type
 
+from sqlalchemy.engine import make_url
+
 from src.audit.log_paths import resolve_audit_log_dir
 from src.utils.env_loader import load_dotenv_file
 
@@ -103,6 +105,26 @@ def _validate_production_hardening(cfg: Type["Config"]) -> None:
         lo = o.lower()
         if not (lo.startswith("http://") or lo.startswith("https://")):
             raise RuntimeError(f"生产环境 CORS Origin 必须以 http:// 或 https:// 开头: {o!r}")
+
+
+def _validate_production_database_url(database_url: str) -> None:
+    """生产数据库要求：PostgreSQL 为正式路径，SQLite 仅用于开发/测试。"""
+    try:
+        url = make_url(database_url)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"生产环境 DATABASE_URL 无法解析: {exc}") from exc
+
+    driver = url.get_backend_name()
+    if driver == "sqlite":
+        raise RuntimeError(
+            "生产环境禁止使用 SQLite DATABASE_URL；SQLite 仅用于开发/测试。"
+            "请改用 PostgreSQL，例如 postgresql+psycopg2://user:pass@host:5432/dbname。"
+        )
+    if driver != "postgresql":
+        raise RuntimeError(
+            "生产环境推荐且当前支持的正式数据库为 PostgreSQL；"
+            f"当前 DATABASE_URL backend={driver!r}。"
+        )
 
 
 class Config:
@@ -237,5 +259,6 @@ def get_config() -> Type[Config]:
             os.environ.get("ALLOWED_ORIGINS", "")
         )
         _validate_production_hardening(cfg)
+        _validate_production_database_url(cfg.SQLALCHEMY_DATABASE_URI)
 
     return cfg

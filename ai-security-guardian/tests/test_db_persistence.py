@@ -52,6 +52,26 @@ def test_all_r2_tables_can_be_created(monkeypatch, tmp_path):
     assert expected_tables.issubset(existing)
 
 
+def test_init_db_lightweight_app_creates_tables(monkeypatch, tmp_path):
+    db_file = tmp_path / "init_entrypoint.db"
+    monkeypatch.setenv("FLASK_ENV", "testing")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
+
+    from sqlalchemy import inspect
+    from web.database import db, init_db_command
+    from web.init_db import create_init_app
+
+    app = create_init_app()
+    init_db_command(app)
+
+    with app.app_context():
+        existing = set(inspect(db.engine).get_table_names())
+        expected = set(db.metadata.tables.keys())
+
+    assert expected.issubset(existing)
+
+
 def test_alert_insert_and_query(monkeypatch, tmp_path):
     app = _build_test_app(monkeypatch, tmp_path)
 

@@ -75,7 +75,7 @@ CI/CD 与测试分组见 **[docs/ci-test-groups.md](docs/ci-test-groups.md)**。
 - `SECRET_KEY`：JWT 与 Flask 密钥，必须修改。
 - `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH`：管理员认证，推荐只用哈希。
 - `ADMIN_ROLE`：基础 RBAC 角色，支持 `viewer` / `analyst` / `admin`；默认 `admin`。
-- `DATABASE_URL`：数据库连接。
+- `DATABASE_URL`：数据库连接。生产必须使用 PostgreSQL；SQLite 仅用于开发/测试。
 - `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`：缓存与队列。
 - `REQUIRE_REDIS_AVAILABLE`：设为 `true` 时，Redis 不可达将启动失败（生产建议开启）。
 - `REQUIRE_MODELS_READY`：设为 `true` 时，关键模型缺失将启动失败（生产建议开启）。
@@ -125,6 +125,13 @@ python -m tests._phase8_smoke
 - **压测与 P95**：`scripts/benchmark_p95.py`（检测链路与 HTTP 粗测；Redis Stream 观测命令见脚本输出）。  
 
 手动检查流程：`/login` -> `/dashboard` -> `/alerts` -> `/settings`。
+
+## 数据库初始化说明
+
+- 开发/测试：默认使用 SQLite，应用启动会自动创建缺失表，便于本地快速验证。
+- 生产：必须显式配置 PostgreSQL `DATABASE_URL`，应用启动不会自动建表，也不应依赖 `AUTO_CREATE_DB_TABLES=true`。
+- 生产首次上线：在空库、账号和网络 ACL 准备完成后执行 `python -m web.init_db`，再执行 `python -m web.init_db --check` 验证表结构存在。
+- 后续模型变更以外的数据库结构升级：当前项目尚未引入 Alembic/Flask-Migrate；生产变更应先在暂存库验证 SQL/脚本、备份生产库，再在维护窗口执行。详见 [docs/deployment.md](docs/deployment.md)。
 
 ## 企业控制面最小闭环
 

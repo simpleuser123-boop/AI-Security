@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from sqlalchemy.engine import make_url
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -171,9 +172,24 @@ def check_database_url() -> CheckResult:
         return CheckResult("DATABASE_URL", False, "missing")
     if value in DEFAULT_DATABASE_URLS:
         return CheckResult("DATABASE_URL", False, "uses a local/default SQLite URL")
-    if "://" not in value:
-        return CheckResult("DATABASE_URL", False, "does not look like a database URL")
-    return CheckResult("DATABASE_URL", True, "configured")
+    try:
+        url = make_url(value)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("DATABASE_URL", False, f"invalid database URL: {exc}")
+    backend = url.get_backend_name()
+    if backend == "sqlite":
+        return CheckResult(
+            "DATABASE_URL",
+            False,
+            "SQLite is only allowed for development/testing; use PostgreSQL in production",
+        )
+    if backend != "postgresql":
+        return CheckResult(
+            "DATABASE_URL",
+            False,
+            f"production database must be PostgreSQL, got backend={backend!r}",
+        )
+    return CheckResult("DATABASE_URL", True, "PostgreSQL configured")
 
 
 def check_redis_password() -> CheckResult:

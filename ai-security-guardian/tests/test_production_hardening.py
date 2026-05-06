@@ -8,6 +8,7 @@ import sys
 import pytest
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+PRODUCTION_DB_URL = "postgresql+psycopg2://guardian:secret@db.example.com:5432/guardian_prod"
 
 
 def _run_fresh_config_snippet(code: str, env: dict[str, str]) -> subprocess.CompletedProcess:
@@ -27,7 +28,7 @@ def test_production_startup_fails_without_secret_key():
     code = (
         "import os, sys\n"
         "os.environ['FLASK_ENV']='production'\n"
-        "os.environ['DATABASE_URL']='sqlite:///:memory:'\n"
+        f"os.environ['DATABASE_URL']='{PRODUCTION_DB_URL}'\n"
         "if 'SECRET_KEY' in os.environ: del os.environ['SECRET_KEY']\n"
         "try:\n"
         "    import importlib\n"
@@ -46,7 +47,7 @@ def test_production_get_config_rejects_default_secret():
     code = (
         "import os, sys\n"
         "os.environ['FLASK_ENV']='production'\n"
-        "os.environ['DATABASE_URL']='sqlite:///:memory:'\n"
+        f"os.environ['DATABASE_URL']='{PRODUCTION_DB_URL}'\n"
         "os.environ['SECRET_KEY']='dev-only-insecure-key-never-use-in-production'\n"
         "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
         "os.environ['REDIS_PASSWORD']='x'\n"
@@ -71,7 +72,7 @@ def test_production_get_config_requires_admin_password_hash():
     code = (
         "import os, sys\n"
         "os.environ['FLASK_ENV']='production'\n"
-        "os.environ['DATABASE_URL']='sqlite:///:memory:'\n"
+        f"os.environ['DATABASE_URL']='{PRODUCTION_DB_URL}'\n"
         "os.environ['SECRET_KEY']='a' * 40\n"
         "os.environ.pop('ADMIN_PASSWORD_HASH', None)\n"
         "os.environ['REDIS_PASSWORD']='redis-secret'\n"
@@ -95,7 +96,7 @@ def test_production_get_config_requires_redis_password():
     code = (
         "import os, sys\n"
         "os.environ['FLASK_ENV']='production'\n"
-        "os.environ['DATABASE_URL']='sqlite:///:memory:'\n"
+        f"os.environ['DATABASE_URL']='{PRODUCTION_DB_URL}'\n"
         "os.environ['SECRET_KEY']='a' * 40\n"
         "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
         "os.environ.pop('REDIS_PASSWORD', None)\n"
@@ -119,7 +120,7 @@ def test_production_get_config_rejects_cors_wildcard():
     code = (
         "import os, sys\n"
         "os.environ['FLASK_ENV']='production'\n"
-        "os.environ['DATABASE_URL']='sqlite:///:memory:'\n"
+        f"os.environ['DATABASE_URL']='{PRODUCTION_DB_URL}'\n"
         "os.environ['SECRET_KEY']='a' * 40\n"
         "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
         "os.environ['REDIS_PASSWORD']='redis-secret'\n"
@@ -137,6 +138,43 @@ def test_production_get_config_rejects_cors_wildcard():
     )
     p = _run_fresh_config_snippet(code, {})
     assert p.returncode == 0, p.stderr + p.stdout
+
+
+def test_production_get_config_rejects_sqlite_database_url():
+    code = (
+        "import os, sys\n"
+        "os.environ['FLASK_ENV']='production'\n"
+        "os.environ['DATABASE_URL']='sqlite:///:memory:'\n"
+        "os.environ['SECRET_KEY']='a' * 40\n"
+        "os.environ['ADMIN_PASSWORD_HASH']='pbkdf2:sha256:1$test$somethinginvalid'\n"
+        "os.environ['REDIS_PASSWORD']='redis-secret'\n"
+        "os.environ['ALLOWED_ORIGINS']='https://app.example.com'\n"
+        "import importlib\n"
+        "import config.config as cc\n"
+        "importlib.reload(cc)\n"
+        "try:\n"
+        "    cc.get_config()\n"
+        "except RuntimeError as e:\n"
+        "    if 'SQLite' in str(e) or 'PostgreSQL' in str(e):\n"
+        "        sys.exit(0)\n"
+        "    raise\n"
+        "sys.exit(1)\n"
+    )
+    p = _run_fresh_config_snippet(code, {})
+    assert p.returncode == 0, p.stderr + p.stdout
+
+
+def test_readiness_check_requires_postgresql(monkeypatch):
+    from scripts.check_production_readiness import check_database_url
+
+    monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://guardian:secret@db/guardian_prod")
+    mysql_result = check_database_url()
+    assert mysql_result.ok is False
+    assert "PostgreSQL" in mysql_result.reason
+
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_DB_URL)
+    pg_result = check_database_url()
+    assert pg_result.ok is True
 
 
 def test_verify_admin_rejects_production_without_hash(monkeypatch):
