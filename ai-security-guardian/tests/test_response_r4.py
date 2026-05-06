@@ -22,6 +22,7 @@ from src.response.persistence import (  # noqa: E402
     build_persistence_app,
 )
 from src.response.responder import SecurityResponder  # noqa: E402
+from src.response.responder import STATUS_SCHEDULED_UNBLOCKED  # noqa: E402
 from src.response.webhook_url import check_webhook_url_safe  # noqa: E402
 
 
@@ -112,7 +113,7 @@ def test_high_ban_schedules_unblock_and_tick_writes_unban(monkeypatch):
     assert n >= 1
     un = [x for x in r.response_actions if x.get("action") == "unban_ip"]
     assert un, "unban should be recorded"
-    assert un[-1].get("status") == "applied"
+    assert un[-1].get("status") == STATUS_SCHEDULED_UNBLOCKED
 
 
 def test_critical_null_isolation_creates_manual_pending(monkeypatch):

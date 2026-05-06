@@ -31,7 +31,16 @@ if PROJECT_ROOT not in sys.path:
 
 from src.detectors.base import DetectionResult  # noqa: E402
 from src.response.notifier import AlertNotifier, NotificationChannel, NotifyAttempt  # noqa: E402
-from src.response.responder import SecurityResponder, validate_ip  # noqa: E402
+from src.response.firewall import IptablesFirewallManager  # noqa: E402
+from src.response.responder import (  # noqa: E402
+    STATUS_APPROVED,
+    STATUS_EXECUTED,
+    STATUS_MANUAL_UNBLOCKED,
+    STATUS_PENDING_APPROVAL,
+    STATUS_REVIEWED,
+    SecurityResponder,
+    validate_ip,
+)
 
 
 # =====================================================================
@@ -206,7 +215,12 @@ class TestDryRun:
         responder = SecurityResponder(dry_run=False)
         with patch("src.response.firewall.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            responder._ban_ip("192.0.2.10", duration=timedelta(hours=1))
+            responder.approve_and_ban_ip(
+                "192.0.2.10",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+                duration=timedelta(hours=1),
+            )
             mock_run.assert_called_once()
             called_args = mock_run.call_args
             cmd_arg = called_args.args[0]
@@ -294,8 +308,18 @@ class TestDuplicateBan:
         responder = SecurityResponder(dry_run=False)
         with patch("src.response.firewall.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            responder._ban_ip("192.0.2.5", duration=timedelta(hours=1))
-            responder._ban_ip("192.0.2.5", duration=timedelta(hours=1))
+            responder.approve_and_ban_ip(
+                "192.0.2.5",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+                duration=timedelta(hours=1),
+            )
+            responder.approve_and_ban_ip(
+                "192.0.2.5",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+                duration=timedelta(hours=1),
+            )
             # subprocess.run 只应被调用 1 次
             assert mock_run.call_count == 1
             dup = [a for a in responder.response_actions if a.get("reason") == "already_banned"]
@@ -330,6 +354,7 @@ class TestUnban:
         responder._banned_ips["192.0.2.9"] = datetime.now()  # 预置记录
         with patch("src.response.firewall.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
+            responder._banned_ips["192.0.2.9"] = datetime.now()
             responder.unban_ip("192.0.2.9")
             mock_run.assert_called_once()
             cmd_arg = mock_run.call_args.args[0]
@@ -349,7 +374,12 @@ class TestSubprocessExceptions:
         with patch("src.response.firewall.subprocess.run") as mock_run, \
                 caplog.at_level(logging.ERROR, logger="src.response.firewall"):
             mock_run.side_effect = subprocess.CalledProcessError(1, ["iptables"])
-            responder._ban_ip("192.0.2.21", duration=timedelta(hours=1))
+            responder.approve_and_ban_ip(
+                "192.0.2.21",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+                duration=timedelta(hours=1),
+            )
         assert "封禁失败" in caplog.text or "执行失败" in caplog.text
         # 失败时不应进入 _banned_ips
         assert "192.0.2.21" not in responder.banned_ips
@@ -359,7 +389,12 @@ class TestSubprocessExceptions:
         with patch("src.response.firewall.subprocess.run") as mock_run, \
                 caplog.at_level(logging.ERROR, logger="src.response.firewall"):
             mock_run.side_effect = subprocess.TimeoutExpired(["iptables"], 5)
-            responder._ban_ip("192.0.2.22", duration=timedelta(hours=1))
+            responder.approve_and_ban_ip(
+                "192.0.2.22",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+                duration=timedelta(hours=1),
+            )
         assert "封禁失败" in caplog.text or "超时" in caplog.text
         assert "192.0.2.22" not in responder.banned_ips
 
@@ -368,7 +403,12 @@ class TestSubprocessExceptions:
         with patch("src.response.firewall.subprocess.run") as mock_run, \
                 caplog.at_level(logging.ERROR, logger="src.response.firewall"):
             mock_run.side_effect = FileNotFoundError()
-            responder._ban_ip("192.0.2.23", duration=timedelta(hours=1))
+            responder.approve_and_ban_ip(
+                "192.0.2.23",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+                duration=timedelta(hours=1),
+            )
         assert "iptables" in caplog.text
         assert "192.0.2.23" not in responder.banned_ips
 
@@ -384,7 +424,7 @@ class TestWebAttackResponseActions:
         ban_rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
         assert ban_rows, "expected ban_ip response actions"
         last = ban_rows[-1]
-        assert last.get("status") == "dry_run_simulated"
+        assert last.get("status") == STATUS_EXECUTED
         assert last.get("source_ip") == "192.0.2.55"
         assert last.get("dry_run") is True
         assert last.get("iptables_cmd")
@@ -442,3 +482,72 @@ class TestBannedIPsView:
         view.clear()
         # 外部清空不应影响内部状态
         assert responder.is_banned("10.0.0.1")
+
+
+class TestApprovalFlow:
+    def test_unapproved_real_ban_only_creates_pending_approval(self):
+        responder = SecurityResponder(dry_run=False)
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            responder._ban_ip("192.0.2.101", duration=timedelta(hours=1))
+            mock_run.assert_not_called()
+        rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
+        assert rows[-1]["status"] == STATUS_PENDING_APPROVAL
+        assert not responder.is_banned("192.0.2.101")
+
+    def test_approved_real_ban_reaches_executed(self):
+        responder = SecurityResponder(dry_run=False)
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            responder.approve_and_ban_ip(
+                "192.0.2.102",
+                operator="analyst-a",
+                reason="confirmed_abuse",
+            )
+        rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
+        statuses = [r["status"] for r in rows]
+        assert STATUS_APPROVED in statuses
+        assert STATUS_EXECUTED in statuses
+        assert responder.is_banned("192.0.2.102")
+
+    def test_dry_run_records_chain_without_real_subprocess(self):
+        responder = SecurityResponder(dry_run=True)
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            responder._ban_ip("192.0.2.103", duration=timedelta(hours=1))
+            mock_run.assert_not_called()
+        rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
+        statuses = [r["status"] for r in rows]
+        assert statuses[-3:] == [STATUS_PENDING_APPROVAL, STATUS_APPROVED, STATUS_EXECUTED]
+        assert rows[-1]["dry_run"] is True
+
+    def test_manual_unblock_requires_executed_then_records_order(self):
+        responder = SecurityResponder(dry_run=True)
+        responder.manual_unban_ip("192.0.2.104", operator="analyst-a", reason="mistake")
+        assert responder.response_actions[-1]["reason"] == "unblock_requires_executed"
+        responder._ban_ip("192.0.2.104", duration=timedelta(hours=1))
+        responder.manual_unban_ip("192.0.2.104", operator="analyst-a", reason="mistake")
+        statuses = [a["status"] for a in responder.response_actions if a.get("source_ip") == "192.0.2.104"]
+        assert STATUS_EXECUTED in statuses
+        assert statuses[-1] == STATUS_MANUAL_UNBLOCKED
+
+    def test_reviewed_cannot_bypass_approval(self):
+        responder = SecurityResponder(dry_run=False)
+        assert responder.mark_response_reviewed(
+            "192.0.2.105",
+            operator="analyst-a",
+            reason="looks_ok",
+        ) is False
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            responder._ban_ip("192.0.2.105", duration=timedelta(hours=1))
+            mock_run.assert_not_called()
+        assert responder.response_actions[-1]["status"] == STATUS_PENDING_APPROVAL
+        assert STATUS_REVIEWED not in [
+            a["status"] for a in responder.response_actions if a.get("source_ip") == "192.0.2.105"
+        ]
+
+    def test_direct_firewall_call_cannot_bypass_approval(self):
+        fw = IptablesFirewallManager()
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            result = fw.ban_input_drop("192.0.2.106", dry_run=False)
+            mock_run.assert_not_called()
+        assert result.ok is False
+        assert result.message == "approval_required"

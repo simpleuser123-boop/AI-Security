@@ -3,11 +3,12 @@
 """
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
 from typing import Optional
 
+from src.response.firewall import is_approved_response_execution
 from src.response.ip_validate import validate_ip
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ class LoggingHostIsolationProvider(HostIsolationProvider):
         if dry_run:
             logger.critical("[DRY RUN][隔离] 将请求隔离主机: %s", ip)
             return IsolationResult(True, True, "dry_run_logged")
+        if not is_approved_response_execution():
+            logger.error("[审批] 拒绝未审批的真实主机隔离调用: %s", ip)
+            return IsolationResult(True, False, "approval_required")
         logger.critical("[隔离] 已请求隔离主机（占位实现）: %s", ip)
         return IsolationResult(True, True, "logged_placeholder")
 

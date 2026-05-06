@@ -8,7 +8,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from src.detectors.base import DetectionResult
-from src.response.firewall import FirewallManager, firewall_manager_from_env
+from src.response.firewall import (
+    FirewallManager,
+    approved_response_execution,
+    firewall_manager_from_env,
+)
 from src.response.host_isolation import (
     HostIsolationProvider,
     NullHostIsolationProvider,
@@ -28,6 +32,12 @@ _SYSTEM_OPERATOR = "security_responder"
 _DETECTION_TRIGGER = "detection"
 _SCHEDULER_TRIGGER = "scheduler"
 _MANUAL_TRIGGER = "manual"
+STATUS_PENDING_APPROVAL = "pending_approval"
+STATUS_APPROVED = "approved"
+STATUS_EXECUTED = "executed"
+STATUS_SCHEDULED_UNBLOCKED = "scheduled_unblocked"
+STATUS_MANUAL_UNBLOCKED = "manual_unblocked"
+STATUS_REVIEWED = "reviewed"
 
 RESPONSE_STRATEGY = {
     "low": "audit_only",
@@ -319,6 +329,7 @@ class SecurityResponder:
         operator: str = _SYSTEM_OPERATOR,
         trigger_source: str = _DETECTION_TRIGGER,
         reason_override: Optional[str] = None,
+        approval_granted: bool = False,
     ) -> None:
         ip = result.source_ip if isinstance(result.source_ip, str) else ""
         aid = self._alert_id(result)
@@ -431,7 +442,61 @@ class SecurityResponder:
             self._audit("ban_ip", ip, "skipped:already_banned")
             return
 
-        fw_res = self._firewall.ban_input_drop(ip, dry_run=effective_firewall_dry)
+        approval_reason = reason_override or policy_note or f"{level_label}_temporary_ban"
+        if not approval_granted:
+            self._append_memory_action(
+                {
+                    "action": "ban_ip",
+                    "source_ip": ip,
+                    "dry_run": self.dry_run,
+                    "status": STATUS_PENDING_APPROVAL,
+                    "reason": approval_reason,
+                    "operator": operator,
+                    "trigger_source": trigger_source,
+                    "duration_sec": int(duration.total_seconds()),
+                }
+            )
+            self._persist_action(
+                alert_id=aid,
+                action_type="ban_ip",
+                target=ip,
+                status=STATUS_PENDING_APPROVAL,
+                dry_run=self.dry_run,
+                scheduled_unblock_at=datetime.now(timezone.utc) + duration,
+                reason=approval_reason,
+                operator=operator,
+                trigger_source=trigger_source,
+                meta={"level": level_label, "approved": False},
+            )
+            self._audit("ban_ip", ip, f"{STATUS_PENDING_APPROVAL}:{approval_reason}")
+            if not self.dry_run:
+                return
+            self._append_memory_action(
+                {
+                    "action": "ban_ip",
+                    "source_ip": ip,
+                    "dry_run": True,
+                    "status": STATUS_APPROVED,
+                    "reason": "dry_run_auto_approval",
+                    "operator": operator,
+                    "trigger_source": trigger_source,
+                }
+            )
+            self._persist_action(
+                alert_id=aid,
+                action_type="ban_ip",
+                target=ip,
+                status=STATUS_APPROVED,
+                dry_run=True,
+                reason="dry_run_auto_approval",
+                operator=operator,
+                trigger_source=trigger_source,
+                meta={"level": level_label, "approved": True, "dry_run_only": True},
+            )
+            approval_granted = True
+
+        with approved_response_execution():
+            fw_res = self._firewall.ban_input_drop(ip, dry_run=effective_firewall_dry)
         until = datetime.now(timezone.utc) + duration
 
         if not fw_res.ok:
@@ -476,20 +541,22 @@ class SecurityResponder:
                 "action": "ban_ip",
                 "source_ip": ip,
                 "dry_run": effective_firewall_dry,
-                "status": ban_status,
+                "status": STATUS_EXECUTED,
                 "reason": reason_override or policy_note or f"{level_label}_temporary_ban",
                 "operator": operator,
                 "trigger_source": trigger_source,
                 "duration_sec": int(duration.total_seconds()),
                 "iptables_cmd": fw_res.command,
                 "policy_note": policy_note,
+                "execution_mode": "dry_run" if effective_firewall_dry else "real",
+                "legacy_status": ban_status,
             }
         )
         rid = self._persist_action(
             alert_id=aid,
             action_type="ban_ip",
             target=ip,
-            status=ban_status,
+            status=STATUS_EXECUTED,
             dry_run=effective_firewall_dry,
             scheduled_unblock_at=until,
             reason=reason_override or policy_note or f"{level_label}_temporary_ban",
@@ -499,6 +566,8 @@ class SecurityResponder:
                 "level": level_label,
                 "command": fw_res.command,
                 "simulated_reason": policy_note or None,
+                "execution_mode": "dry_run" if effective_firewall_dry else "real",
+                "legacy_status": ban_status,
             },
         )
         self._audit(
@@ -516,7 +585,9 @@ class SecurityResponder:
             related_response_action_id=rid or None,
         )
 
-    def _isolate_for_critical(self, result: DetectionResult) -> None:
+    def _isolate_for_critical(
+        self, result: DetectionResult, *, approval_granted: bool = False
+    ) -> None:
         ip = result.source_ip if isinstance(result.source_ip, str) else ""
         aid = self._alert_id(result)
         if not validate_ip(ip):
@@ -556,13 +627,55 @@ class SecurityResponder:
             )
             return
 
-        iso = self._isolation.isolate(ip, dry_run=self.dry_run)
+        if not approval_granted:
+            self._append_memory_action(
+                {
+                    "action": "isolate_host",
+                    "source_ip": ip,
+                    "dry_run": self.dry_run,
+                    "status": STATUS_PENDING_APPROVAL,
+                    "reason": "critical_host_isolation",
+                }
+            )
+            self._persist_action(
+                alert_id=aid,
+                action_type="isolate_host",
+                target=ip,
+                status=STATUS_PENDING_APPROVAL,
+                dry_run=self.dry_run,
+                reason="critical_host_isolation",
+                meta={"approved": False},
+            )
+            if not self.dry_run:
+                return
+            self._append_memory_action(
+                {
+                    "action": "isolate_host",
+                    "source_ip": ip,
+                    "dry_run": True,
+                    "status": STATUS_APPROVED,
+                    "reason": "dry_run_auto_approval",
+                }
+            )
+            self._persist_action(
+                alert_id=aid,
+                action_type="isolate_host",
+                target=ip,
+                status=STATUS_APPROVED,
+                dry_run=True,
+                reason="dry_run_auto_approval",
+                meta={"approved": True, "dry_run_only": True},
+            )
+            approval_granted = True
+
+        with approved_response_execution():
+            iso = self._isolation.isolate(ip, dry_run=self.dry_run)
         self._append_memory_action(
             {
                 "action": "isolate_host",
                 "source_ip": ip,
                 "dry_run": self.dry_run,
-                "status": "applied" if iso.success else "failed",
+                "status": STATUS_EXECUTED if iso.success else "failed",
                 "reason": "critical_host_isolation" if iso.success else iso.message,
                 "message": iso.message,
             }
@@ -571,7 +684,7 @@ class SecurityResponder:
             alert_id=aid,
             action_type="isolate_host",
             target=ip,
-            status="applied" if iso.success else "failed",
+            status=STATUS_EXECUTED if iso.success else "failed",
             dry_run=self.dry_run,
             error=None if iso.success else iso.message,
             reason="critical_host_isolation" if iso.success else iso.message,
@@ -592,6 +705,7 @@ class SecurityResponder:
             ),
             duration=duration,
             level_label="legacy",
+            trigger_source="legacy",
         )
 
     def _isolate_host(self, ip: str) -> None:
@@ -616,7 +730,7 @@ class SecurityResponder:
         alert_id: Optional[str] = None,
     ) -> None:
         """记录人工审批待办，不执行防火墙动作。"""
-        status = "pending"
+        status = STATUS_PENDING_APPROVAL
         normalized_ip = ip.strip() if isinstance(ip, str) else ""
         if not validate_ip(normalized_ip):
             status = "skipped"
@@ -661,6 +775,58 @@ class SecurityResponder:
         alert_id: Optional[str] = None,
     ) -> None:
         """审批后封禁入口；若 responder 仍是 dry_run=True，则只做演练封禁。"""
+        normalized_ip = ip.strip() if isinstance(ip, str) else ""
+        pending_exists = any(
+            a.get("action") in {"ban_ip", "ban_ip_approval"}
+            and a.get("source_ip") == normalized_ip
+            and a.get("status") == STATUS_PENDING_APPROVAL
+            for a in self._response_actions
+        )
+        if not pending_exists:
+            self._append_memory_action(
+                {
+                    "action": "ban_ip",
+                    "source_ip": normalized_ip,
+                    "dry_run": self.dry_run,
+                    "status": STATUS_PENDING_APPROVAL,
+                    "reason": reason.strip() or "approval_required",
+                    "operator": operator.strip() or "unknown_operator",
+                    "trigger_source": _MANUAL_TRIGGER,
+                }
+            )
+            self._persist_action(
+                alert_id=alert_id,
+                action_type="ban_ip",
+                target=normalized_ip,
+                status=STATUS_PENDING_APPROVAL,
+                dry_run=self.dry_run,
+                reason=reason.strip() or "approval_required",
+                operator=operator.strip() or "unknown_operator",
+                trigger_source=_MANUAL_TRIGGER,
+                meta={"approved": False},
+            )
+        self._append_memory_action(
+            {
+                "action": "ban_ip",
+                "source_ip": normalized_ip,
+                "dry_run": self.dry_run,
+                "status": STATUS_APPROVED,
+                "reason": reason.strip() or "approved",
+                "operator": operator.strip() or "unknown_operator",
+                "trigger_source": _MANUAL_TRIGGER,
+            }
+        )
+        self._persist_action(
+            alert_id=alert_id,
+            action_type="ban_ip",
+            target=normalized_ip,
+            status=STATUS_APPROVED,
+            dry_run=self.dry_run,
+            reason=reason.strip() or "approved",
+            operator=operator.strip() or "unknown_operator",
+            trigger_source=_MANUAL_TRIGGER,
+            meta={"approved": True},
+        )
         self._ban_for_level(
             DetectionResult(
                 threat_type="manual_approval",
@@ -675,6 +841,7 @@ class SecurityResponder:
             operator=operator.strip() or "unknown_operator",
             trigger_source=_MANUAL_TRIGGER,
             reason_override=f"approved:{reason.strip() or 'no_reason'}",
+            approval_granted=True,
         )
 
     def unban_ip(
@@ -700,11 +867,36 @@ class SecurityResponder:
             )
             return
         ip = ip.strip()
-        fw = self._firewall.unban_input_drop(ip, dry_run=self.dry_run)
+        if ip not in self._banned_ips:
+            self._append_memory_action(
+                {
+                    "action": "unban_ip",
+                    "source_ip": ip,
+                    "dry_run": self.dry_run,
+                    "status": "skipped",
+                    "reason": "unblock_requires_executed",
+                    "operator": operator,
+                    "trigger_source": trigger_source,
+                }
+            )
+            self._persist_action(
+                alert_id=None,
+                action_type="unban_ip",
+                target=ip,
+                status="skipped",
+                dry_run=self.dry_run,
+                reason="unblock_requires_executed",
+                operator=operator,
+                trigger_source=trigger_source,
+                meta={"required_previous_status": STATUS_EXECUTED},
+            )
+            return
+        with approved_response_execution():
+            fw = self._firewall.unban_input_drop(ip, dry_run=self.dry_run)
         if not fw.ok and not self.dry_run:
             logger.error("[防火墙] 解封失败: %s", fw.message)
         self._banned_ips.pop(ip, None)
-        status = "applied" if fw.ok else "failed"
+        status = STATUS_MANUAL_UNBLOCKED if fw.ok else "failed"
         self._append_memory_action(
             {
                 "action": "unban_ip",
@@ -754,6 +946,49 @@ class SecurityResponder:
             trigger_source=_MANUAL_TRIGGER,
         )
 
+    def mark_response_reviewed(
+        self,
+        target: str,
+        *,
+        operator: str,
+        reason: str = "post_execution_review",
+        alert_id: Optional[str] = None,
+    ) -> bool:
+        """Post-execution review; it never grants approval or execution."""
+        normalized_target = target.strip() if isinstance(target, str) else ""
+        prior_executed = any(
+            a.get("source_ip") == normalized_target
+            and a.get("status") in {STATUS_EXECUTED, STATUS_SCHEDULED_UNBLOCKED, STATUS_MANUAL_UNBLOCKED}
+            for a in self._response_actions
+        )
+        status = STATUS_REVIEWED if prior_executed else "skipped"
+        review_reason = reason.strip() or "post_execution_review"
+        if not prior_executed:
+            review_reason = "review_requires_executed"
+        self._append_memory_action(
+            {
+                "action": "response_review",
+                "source_ip": normalized_target,
+                "dry_run": self.dry_run,
+                "status": status,
+                "reason": review_reason,
+                "operator": operator.strip() or "unknown_operator",
+                "trigger_source": _MANUAL_TRIGGER,
+            }
+        )
+        self._persist_action(
+            alert_id=alert_id,
+            action_type="response_review",
+            target=normalized_target,
+            status=status,
+            dry_run=self.dry_run,
+            reason=review_reason,
+            operator=operator.strip() or "unknown_operator",
+            trigger_source=_MANUAL_TRIGGER,
+            meta={"required_previous_status": STATUS_EXECUTED},
+        )
+        return prior_executed
+
     def execute_scheduled_unblock(
         self,
         ip: str,
@@ -761,14 +996,42 @@ class SecurityResponder:
         dry_run: bool,
         alert_id: Optional[str],
         schedule_task_id: int,
+        related_response_action_id: Optional[int] = None,
     ) -> None:
         if not validate_ip(ip):
             logger.error("[scheduler] 无效 IP，跳过解封: %r", ip)
             return
         ip = ip.strip()
-        fw = self._firewall.unban_input_drop(ip, dry_run=dry_run)
+        if ip not in self._banned_ips and related_response_action_id is None:
+            self._persist_action(
+                alert_id=alert_id,
+                action_type="unban_ip",
+                target=ip,
+                status="skipped",
+                dry_run=dry_run,
+                reason="scheduled_unblock_requires_executed",
+                trigger_source=_SCHEDULER_TRIGGER,
+                meta={
+                    "schedule_task_id": schedule_task_id,
+                    "required_previous_status": STATUS_EXECUTED,
+                },
+            )
+            self._append_memory_action(
+                {
+                    "action": "unban_ip",
+                    "source_ip": ip,
+                    "dry_run": dry_run,
+                    "status": "skipped",
+                    "reason": "scheduled_unblock_requires_executed",
+                    "trigger_source": _SCHEDULER_TRIGGER,
+                    "schedule_task_id": schedule_task_id,
+                }
+            )
+            return
+        with approved_response_execution():
+            fw = self._firewall.unban_input_drop(ip, dry_run=dry_run)
         self._banned_ips.pop(ip, None)
-        st = "applied" if fw.ok else "failed"
+        st = STATUS_SCHEDULED_UNBLOCKED if fw.ok else "failed"
         self._persist_action(
             alert_id=alert_id,
             action_type="unban_ip",

@@ -54,7 +54,11 @@ if _PROJECT_ROOT not in sys.path:
 
 from config.config import get_config
 from src.collectors.threat_intel import ThreatIntelCollector
-from src.response.responder import validate_ip
+from src.response.responder import (
+    STATUS_MANUAL_UNBLOCKED,
+    STATUS_PENDING_APPROVAL,
+    validate_ip,
+)
 from src.response.webhook_url import check_webhook_url_safe
 from src.utils.auth import verify_admin_credentials
 from web.database import db, init_db_tables
@@ -1074,6 +1078,27 @@ def _persist_banned_ip(
     db.session.commit()
 
 
+def _record_ban_approval_request(
+    ip: str, reason: str, *, operator: Optional[str], source: str
+) -> int:
+    row = ResponseAction(
+        action_type="ban_ip",
+        target=ip,
+        status=STATUS_PENDING_APPROVAL,
+        dry_run=True,
+        meta={
+            "reason": (reason or "manual")[:200],
+            "operator": operator or "operator",
+            "trigger_source": source,
+            "approved": False,
+            "legacy_entrypoint": source,
+        },
+    )
+    db.session.add(row)
+    db.session.commit()
+    return int(row.id)
+
+
 def _delete_banned_ip_persistent(ip: str) -> bool:
     row = db.session.get(BannedIp, ip)
     if row is None:
@@ -1667,20 +1692,30 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                 jsonify(_error_payload(code="forbidden", message="需要 admin 或更高角色")),
                 403,
             )
-        _persist_banned_ip(
+        approval_id = _record_ban_approval_request(
             ip,
             reason,
             operator=str(get_jwt_identity() or "operator"),
+            source="api_banned_ips",
         )
-        _sync_banned_cache_from_db(state)
         _record_audit_event(
-            event_type="banned_ip.created",
+            event_type="response.ban_ip.pending_approval",
             actor=str(get_jwt_identity() or "operator"),
-            resource_type="banned_ip",
+            resource_type="response_action",
             resource_id=ip,
-            payload={"reason": reason},
+            payload={"reason": reason, "response_action_id": approval_id},
         )
-        return jsonify({"status": "ok", "ip": ip, "reason": reason}), 201
+        return (
+            jsonify(
+                {
+                    "status": STATUS_PENDING_APPROVAL,
+                    "ip": ip,
+                    "reason": reason,
+                    "response_action_id": approval_id,
+                }
+            ),
+            202,
+        )
 
     @app.route("/api/banned_ips/<ip>", methods=["DELETE"])
     @jwt_required()
@@ -1691,6 +1726,20 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         removed = _delete_banned_ip_persistent(ip)
         if not removed:
             return jsonify({"error": "IP 不在封禁列表"}), 404
+        db.session.add(
+            ResponseAction(
+                action_type="unban_ip",
+                target=ip,
+                status=STATUS_MANUAL_UNBLOCKED,
+                dry_run=True,
+                meta={
+                    "operator": str(get_jwt_identity() or "operator"),
+                    "trigger_source": "api_banned_ips",
+                    "reason": "manual_unban",
+                },
+            )
+        )
+        db.session.commit()
         _sync_banned_cache_from_db(state)
         _record_audit_event(
             event_type="banned_ip.deleted",
@@ -2432,9 +2481,19 @@ def _execute_safe_command(raw: str, state: _ServerState) -> Dict[str, Any]:
         return {"ok": False, "command": raw, "output": f"无效 IP: {arg!r}"}
 
     if action == "block":
-        _persist_banned_ip(arg, "command panel", operator="command_panel")
-        _sync_banned_cache_from_db(state)
-        return {"ok": True, "command": raw, "output": f"已加入封禁列表: {arg}"}
+        approval_id = _record_ban_approval_request(
+            arg,
+            "command panel",
+            operator="command_panel",
+            source="command_panel",
+        )
+        return {
+            "ok": True,
+            "command": raw,
+            "output": f"已创建封禁审批: {arg}",
+            "status": STATUS_PENDING_APPROVAL,
+            "response_action_id": approval_id,
+        }
     if action == "unblock":
         removed = _delete_banned_ip_persistent(arg)
         _sync_banned_cache_from_db(state)

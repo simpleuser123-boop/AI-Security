@@ -173,6 +173,7 @@ class ResponseScheduler:
                         dry_run=bool(task.payload.get("dry_run")),
                         alert_id=task.alert_id,
                         schedule_task_id=task.id,
+                        related_response_action_id=task.related_response_action_id,
                     )
                     self._finish_task(task, success=True, error=None)
                 elif task.task_type == TASK_NOTIFY_RETRY:
