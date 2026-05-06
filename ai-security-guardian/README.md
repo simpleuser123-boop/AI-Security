@@ -35,7 +35,9 @@ cp .env.example .env
 python scripts/check_production_readiness.py
 ```
 
-脚本只读取当前环境与 `.env`，不会自动修改 `.env`；任一关键项失败都会返回非 0 退出码。
+脚本只读取当前环境与 `.env`，不会自动修改 `.env`，也不会打印密钥、密码或管理员哈希。
+输出状态为 `[PASS]`、`[WARN]`、`[FAIL]`；任一 `[FAIL]` 都会返回非 0 退出码。
+该检查会连接 Redis 和 PostgreSQL 执行短超时探针，请在上线目标环境或具备同等网络访问的发布机上运行。
 
 3. 启动 Web/API（默认 5000）：
 

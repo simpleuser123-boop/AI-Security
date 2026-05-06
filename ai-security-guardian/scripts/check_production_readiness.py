@@ -8,15 +8,33 @@ It exits with status 0 only when every production gate passes.
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 ROOT = Path(__file__).resolve().parent.parent
+
+REQUIRED_MODEL_FILES = (
+    "intrusion_rf_v1.pkl",
+    "ddos_rf_v1.pkl",
+    "web_attack_nb_v1.pkl",
+    "anomaly_if_v1.pkl",
+    "intrusion_feature_cols_v1.pkl",
+    "intrusion_label_encoder_v1.pkl",
+    "intrusion_scaler_v1.pkl",
+    "intrusion_rf_v1.model_manifest.json",
+    "ddos_rf_v1.model_manifest.json",
+    "web_attack_nb_v1.model_manifest.json",
+    "anomaly_if_v1.model_manifest.json",
+)
 
 FORBIDDEN_SECRET_KEYS = {
     "",
@@ -46,6 +64,37 @@ DEFAULT_DATABASE_URLS = {
     "sqlite:///:memory:",
 }
 
+FORBIDDEN_DATABASE_HOSTS = {
+    "",
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+}
+
+FORBIDDEN_DATABASE_TOKENS = {
+    "example",
+    "replace",
+    "replace_me",
+    "replace-with",
+    "changeme",
+    "test",
+    "testing",
+    "dev",
+    "development",
+    "demo",
+    "sample",
+}
+
+FORBIDDEN_ALLOWED_ORIGINS = {
+    "http://localhost",
+    "http://localhost:5000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:5000",
+    "http://0.0.0.0",
+    "http://0.0.0.0:5000",
+}
+
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
 
@@ -55,6 +104,15 @@ class CheckResult:
     name: str
     ok: bool
     reason: str
+    level: str = "PASS"
+
+    @property
+    def status(self) -> str:
+        if not self.ok:
+            return "FAIL"
+        if self.level == "WARN":
+            return "WARN"
+        return "PASS"
 
 
 def _load_env_file(path: Path) -> int:
@@ -97,6 +155,30 @@ def _path_from_env(key: str, default: str) -> Path:
     return path
 
 
+def _bool_value(value: str) -> bool:
+    return value.lower() in TRUTHY
+
+
+def _shannon_entropy_bits(value: str) -> float:
+    if not value:
+        return 0.0
+    counts = {char: value.count(char) for char in set(value)}
+    entropy_per_char = -sum(
+        (count / len(value)) * math.log2(count / len(value))
+        for count in counts.values()
+    )
+    return entropy_per_char * len(value)
+
+
+def _safe_exception_type(exc: Exception) -> str:
+    return type(exc).__name__
+
+
+def _contains_forbidden_database_token(value: str) -> bool:
+    tokens = {token for token in re.split(r"[^a-z0-9]+", value.lower()) if token}
+    return bool(tokens & FORBIDDEN_DATABASE_TOKENS)
+
+
 def check_flask_env() -> CheckResult:
     value = _env("FLASK_ENV")
     if value != "production":
@@ -116,7 +198,22 @@ def check_secret_key() -> CheckResult:
         return CheckResult("SECRET_KEY", False, "uses a default/example value")
     if len(value) < 32:
         return CheckResult("SECRET_KEY", False, "must be at least 32 characters")
-    return CheckResult("SECRET_KEY", True, "set and non-default")
+    lowered = value.lower()
+    weak_secret_tokens = {"secret", "password", "changeme"}
+    weak_tokens = [token for token in weak_secret_tokens if token in lowered]
+    if weak_tokens:
+        return CheckResult("SECRET_KEY", False, "contains an obvious weak token")
+    if len(set(value)) < 12:
+        return CheckResult("SECRET_KEY", False, "has too little character variety")
+    entropy_bits = _shannon_entropy_bits(value)
+    if entropy_bits < 160:
+        return CheckResult(
+            "SECRET_KEY",
+            True,
+            "set and non-default, but recommended entropy is at least 160 bits",
+            "WARN",
+        )
+    return CheckResult("SECRET_KEY", True, "strong random-looking value configured")
 
 
 def check_admin_password_hash() -> CheckResult:
@@ -174,8 +271,8 @@ def check_database_url() -> CheckResult:
         return CheckResult("DATABASE_URL", False, "uses a local/default SQLite URL")
     try:
         url = make_url(value)
-    except Exception as exc:  # noqa: BLE001
-        return CheckResult("DATABASE_URL", False, f"invalid database URL: {exc}")
+    except Exception:  # noqa: BLE001
+        return CheckResult("DATABASE_URL", False, "invalid database URL format")
     backend = url.get_backend_name()
     if backend == "sqlite":
         return CheckResult(
@@ -189,7 +286,32 @@ def check_database_url() -> CheckResult:
             False,
             f"production database must be PostgreSQL, got backend={backend!r}",
         )
-    return CheckResult("DATABASE_URL", True, "PostgreSQL configured")
+    host = (url.host or "").strip().lower()
+    if host in FORBIDDEN_DATABASE_HOSTS:
+        return CheckResult(
+            "DATABASE_URL",
+            False,
+            "must point to a reachable production PostgreSQL host, not localhost/default",
+        )
+    database_name = (url.database or "").strip().lower()
+    if not database_name:
+        return CheckResult("DATABASE_URL", False, "database name is missing")
+    combined = " ".join(
+        part
+        for part in (
+            host,
+            database_name,
+            (url.username or "").lower(),
+        )
+        if part
+    )
+    if _contains_forbidden_database_token(combined):
+        return CheckResult(
+            "DATABASE_URL",
+            False,
+            "looks like an example, development, testing, or placeholder database",
+        )
+    return CheckResult("DATABASE_URL", True, "PostgreSQL production URL configured")
 
 
 def check_redis_password() -> CheckResult:
@@ -212,13 +334,25 @@ def check_allowed_origins() -> CheckResult:
         return CheckResult("ALLOWED_ORIGINS", False, "contains no usable origins")
     if any(origin == "*" for origin in origins):
         return CheckResult("ALLOWED_ORIGINS", False, "wildcard '*' is forbidden")
-    invalid = [
+    invalid = [origin for origin in origins if not origin.lower().startswith("https://")]
+    if invalid:
+        return CheckResult(
+            "ALLOWED_ORIGINS",
+            False,
+            f"production origins must use https://, got: {invalid[0]}",
+        )
+    forbidden = [
         origin
         for origin in origins
-        if not (origin.lower().startswith("http://") or origin.lower().startswith("https://"))
+        if origin.lower().rstrip("/") in FORBIDDEN_ALLOWED_ORIGINS
+        or "localhost" in origin.lower()
     ]
-    if invalid:
-        return CheckResult("ALLOWED_ORIGINS", False, f"invalid origin: {invalid[0]}")
+    if forbidden:
+        return CheckResult(
+            "ALLOWED_ORIGINS",
+            False,
+            f"local/default origin is forbidden in production: {forbidden[0]}",
+        )
     return CheckResult("ALLOWED_ORIGINS", True, f"{len(origins)} origin(s) configured")
 
 
@@ -231,6 +365,30 @@ def check_dry_run() -> CheckResult:
     if value.lower() in TRUTHY:
         return CheckResult("DRY_RUN", False, "must be false for production readiness")
     return CheckResult("DRY_RUN", True, "false")
+
+
+def check_required_runtime_guards() -> CheckResult:
+    problems: list[str] = []
+    warnings: list[str] = []
+    for key in ("REQUIRE_REDIS_AVAILABLE", "REQUIRE_MODELS_READY"):
+        value = _env(key)
+        if not value:
+            warnings.append(f"{key} is not explicit true")
+            continue
+        if not _is_bool(value):
+            problems.append(f"{key} must be true or false")
+            continue
+        if not _bool_value(value):
+            warnings.append(f"{key} should be true in production")
+    if problems:
+        return CheckResult("RUNTIME_GUARDS", False, "; ".join(problems))
+    if warnings:
+        return CheckResult("RUNTIME_GUARDS", True, "; ".join(warnings), "WARN")
+    return CheckResult(
+        "RUNTIME_GUARDS",
+        True,
+        "REQUIRE_REDIS_AVAILABLE and REQUIRE_MODELS_READY are true",
+    )
 
 
 def check_model_dir() -> CheckResult:
@@ -248,6 +406,21 @@ def check_model_dir() -> CheckResult:
     return CheckResult("MODEL_DIR", True, f"directory exists: {model_dir}")
 
 
+def check_model_files() -> CheckResult:
+    model_dir = _path_from_env("MODEL_DIR", "models/saved")
+    if not model_dir.exists() or not model_dir.is_dir():
+        return CheckResult("MODEL_FILES", False, "model directory is not readable")
+    missing = [name for name in REQUIRED_MODEL_FILES if not (model_dir / name).is_file()]
+    if missing:
+        shown = ", ".join(missing[:4])
+        suffix = "" if len(missing) <= 4 else f", ... (+{len(missing) - 4} more)"
+        return CheckResult("MODEL_FILES", False, f"missing required artifact(s): {shown}{suffix}")
+    unreadable = [name for name in REQUIRED_MODEL_FILES if not os.access(model_dir / name, os.R_OK)]
+    if unreadable:
+        return CheckResult("MODEL_FILES", False, f"required artifact is not readable: {unreadable[0]}")
+    return CheckResult("MODEL_FILES", True, f"{len(REQUIRED_MODEL_FILES)} required artifact(s) present")
+
+
 def check_log_integrity() -> CheckResult:
     value = _env("LOG_INTEGRITY_ENABLED")
     if not value:
@@ -259,15 +432,99 @@ def check_log_integrity() -> CheckResult:
     return CheckResult("LOG_INTEGRITY_ENABLED", True, "true")
 
 
-def check_log_dir() -> CheckResult:
-    log_dir = _path_from_env("LOG_DIR", "logs")
+def check_audit_log_dir() -> CheckResult:
+    try:
+        from src.audit.log_paths import resolve_audit_log_dir
+    except ImportError:
+        raw_dir = _env("AUDIT_LOG_DIR") or _env("GUARDIAN_LOG_DIR") or _env("LOG_DIR", "logs/production")
+    else:
+        raw_dir = resolve_audit_log_dir()
+    log_dir = Path(raw_dir)
+    if not log_dir.is_absolute():
+        log_dir = ROOT / log_dir
     if not log_dir.exists():
-        return CheckResult("LOG_DIR", False, f"directory does not exist: {log_dir}")
+        return CheckResult("AUDIT_LOG_DIR", False, f"directory does not exist: {log_dir}")
     if not log_dir.is_dir():
-        return CheckResult("LOG_DIR", False, f"not a directory: {log_dir}")
+        return CheckResult("AUDIT_LOG_DIR", False, f"not a directory: {log_dir}")
     if not os.access(log_dir, os.W_OK):
-        return CheckResult("LOG_DIR", False, f"directory is not writable: {log_dir}")
-    return CheckResult("LOG_DIR", True, f"directory exists and is writable: {log_dir}")
+        return CheckResult("AUDIT_LOG_DIR", False, f"directory is not writable: {log_dir}")
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".readiness-", dir=log_dir, delete=True):
+            pass
+    except OSError as exc:
+        return CheckResult("AUDIT_LOG_DIR", False, f"write probe failed: {_safe_exception_type(exc)}")
+    return CheckResult("AUDIT_LOG_DIR", True, f"directory exists and is writable: {log_dir}")
+
+
+def check_redis_connectivity() -> CheckResult:
+    if _env("GUARDIAN_REDIS_DISABLE_CONNECT").lower() == "true":
+        return CheckResult(
+            "REDIS_CONNECTIVITY",
+            False,
+            "GUARDIAN_REDIS_DISABLE_CONNECT=true prevents production Redis validation",
+        )
+    try:
+        import redis  # type: ignore
+    except ImportError:
+        return CheckResult("REDIS_CONNECTIVITY", False, "redis package is not installed")
+
+    host = _env("REDIS_HOST", "localhost")
+    try:
+        port = int(_env("REDIS_PORT", "6379"))
+        db = int(_env("REDIS_DB", "0"))
+        connect_timeout = float(_env("REDIS_CONNECT_TIMEOUT_SEC", "0.5"))
+        socket_timeout = float(_env("REDIS_SOCKET_TIMEOUT_SEC", "2.0"))
+    except ValueError:
+        return CheckResult("REDIS_CONNECTIVITY", False, "Redis port/db/timeout must be numeric")
+
+    try:
+        client = redis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=_env("REDIS_PASSWORD") or None,
+            socket_connect_timeout=connect_timeout,
+            socket_timeout=socket_timeout,
+            decode_responses=True,
+        )
+        if client.ping() is True:
+            return CheckResult("REDIS_CONNECTIVITY", True, "Redis ping succeeded")
+        return CheckResult("REDIS_CONNECTIVITY", False, "Redis ping returned a non-OK response")
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "REDIS_CONNECTIVITY",
+            False,
+            f"Redis ping failed ({_safe_exception_type(exc)}); check host/port/password/network",
+        )
+
+
+def check_database_connectivity() -> CheckResult:
+    value = _env("DATABASE_URL")
+    if not value:
+        return CheckResult("DB_CONNECTIVITY", False, "DATABASE_URL is missing")
+    try:
+        url = make_url(value)
+    except Exception:  # noqa: BLE001
+        return CheckResult("DB_CONNECTIVITY", False, "DATABASE_URL format is invalid")
+
+    connect_args: dict[str, object] = {}
+    if url.get_backend_name() == "postgresql":
+        try:
+            connect_args["connect_timeout"] = int(float(_env("DB_CONNECT_TIMEOUT_SEC", "3")))
+        except ValueError:
+            return CheckResult("DB_CONNECTIVITY", False, "DB_CONNECT_TIMEOUT_SEC must be numeric")
+    try:
+        engine = create_engine(value, connect_args=connect_args, pool_pre_ping=True)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "DB_CONNECTIVITY",
+            False,
+            f"database SELECT 1 failed ({_safe_exception_type(exc)}); check host/port/credentials/network",
+        )
+    return CheckResult("DB_CONNECTIVITY", True, "database SELECT 1 succeeded")
 
 
 def _checks() -> Iterable[Callable[[], CheckResult]]:
@@ -280,9 +537,13 @@ def _checks() -> Iterable[Callable[[], CheckResult]]:
         check_redis_password,
         check_allowed_origins,
         check_dry_run,
+        check_required_runtime_guards,
         check_model_dir,
+        check_model_files,
         check_log_integrity,
-        check_log_dir,
+        check_audit_log_dir,
+        check_redis_connectivity,
+        check_database_connectivity,
     )
 
 
@@ -320,14 +581,18 @@ def main(argv: list[str] | None = None) -> int:
 
     results = [check() for check in _checks()]
     for result in results:
-        status = "PASS" if result.ok else "FAIL"
-        print(f"[{status}] {result.name}: {result.reason}")
+        print(f"[{result.status}] {result.name}: {result.reason}")
 
     failures = [result for result in results if not result.ok]
+    warnings = [result for result in results if result.status == "WARN"]
     print("-" * 56)
     if failures:
-        print(f"Result: FAIL ({len(failures)} issue(s))")
+        print(f"Result: FAIL ({len(failures)} failure(s), {len(warnings)} warning(s))")
         return 1
+
+    if warnings:
+        print(f"Result: PASS with WARN ({len(warnings)} warning(s))")
+        return 0
 
     print("Result: PASS")
     return 0

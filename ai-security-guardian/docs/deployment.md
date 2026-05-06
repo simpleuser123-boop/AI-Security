@@ -118,9 +118,20 @@ python scripts/check_production_readiness.py
 python scripts/check_production_readiness.py --env-file /etc/guardian/production.env
 ```
 
+脚本会执行生产上线 gate，包括：
+
+- `SECRET_KEY` 强度、默认值与弱 token 检查。
+- `ADMIN_PASSWORD_HASH` 存在性、Werkzeug 哈希格式、是否匹配默认密码检查；生产禁止明文 `ADMIN_PASSWORD`。
+- `DATABASE_URL` 必须是非示例、非本地的 PostgreSQL，并执行 `SELECT 1` 连通性检查。
+- `REDIS_PASSWORD` 必填且非弱密码，并执行带密码 `PING` 连通性检查。
+- `ALLOWED_ORIGINS` 禁止 `*`、localhost 和非 HTTPS Origin。
+- `REQUIRE_REDIS_AVAILABLE` / `REQUIRE_MODELS_READY` 建议为 `true`；不符合时输出 `[WARN]`。
+- `MODEL_DIR` 与关键模型/manifest 文件存在且可读。
+- `LOG_INTEGRITY_ENABLED=true`，审计日志目录存在且可写。
+
 验收证据：
 
-- `scripts/check_production_readiness.py` 输出全部为 `[PASS]`。
+- `scripts/check_production_readiness.py` 输出无 `[FAIL]`，正式发布建议全部为 `[PASS]`。
 - `.env` 权限为 `600`。
 - `ALLOWED_ORIGINS` 与正式域名一致。
 - `ADMIN_PASSWORD` 在生产环境为空或未设置。
