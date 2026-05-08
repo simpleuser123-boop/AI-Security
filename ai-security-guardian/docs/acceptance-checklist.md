@@ -66,6 +66,17 @@
 - [ ] Nginx TLS + WSS 验证（若对外 WebSocket）  
 - [ ] 回滚方案演练  
 
+## SaaS Beta 运维验收（Phase C5）
+
+运维设计详见 `docs/phase-c5-saas-operations-reliability.md`。
+
+- [ ] SaaS Beta SLO 已确认：Web/API 可用性、API P95、告警消费延迟、Redis Stream lag、通知失败率、响应动作失败率、审计巡检成功率。
+- [ ] Prometheus 已抓取 `/metrics`，包含 `guardian_http_request_duration_seconds_*`、`redis_stream_group_lag`、`guardian_alert_stream_consumed_total`、`guardian_response_actions_total`、`audit_integrity_valid`。
+- [ ] Prometheus 告警规则已按 Phase C5 手册配置并完成 firing 测试。
+- [ ] Grafana Dashboard 已覆盖 Overview、Web/API、Detection、Stream、Response、Audit、Infra。
+- [ ] 值班手册已发给运维团队，SEV1/SEV2 升级联系人和响应目标已确认。
+- [ ] HA 方案已确认：Web/API 多实例、Redis/PostgreSQL 高可用、LB `/readyz` 摘除、备份恢复演练。
+
 ## 映射：路线图 §8 十大场景
 
 | 场景 | 脚本/测试 |

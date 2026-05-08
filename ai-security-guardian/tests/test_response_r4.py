@@ -15,6 +15,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.detectors.base import DetectionResult  # noqa: E402
+from src.response.firewall import FirewallManager, FirewallResult  # noqa: E402
 from src.response.host_isolation import NullHostIsolationProvider  # noqa: E402
 from src.response.notifier import AlertNotifier, WebhookNotificationChannel  # noqa: E402
 from src.response.persistence import (  # noqa: E402
@@ -24,6 +25,40 @@ from src.response.persistence import (  # noqa: E402
 from src.response.responder import SecurityResponder  # noqa: E402
 from src.response.responder import STATUS_SCHEDULED_UNBLOCKED  # noqa: E402
 from src.response.webhook_url import check_webhook_url_safe  # noqa: E402
+
+
+class _RecordingFirewall(FirewallManager):
+    def __init__(self) -> None:
+        self.ban_calls = []
+        self.unban_calls = []
+
+    def ban_input_drop(self, ip: str, *, dry_run: bool) -> FirewallResult:
+        self.ban_calls.append((ip, dry_run))
+        return FirewallResult(True, dry_run, "recorded", command=["ban", ip])
+
+    def unban_input_drop(self, ip: str, *, dry_run: bool) -> FirewallResult:
+        self.unban_calls.append((ip, dry_run))
+        return FirewallResult(True, dry_run, "recorded", command=["unban", ip])
+
+
+class _MissingRuleFirewall(_RecordingFirewall):
+    def unban_input_drop(self, ip: str, *, dry_run: bool) -> FirewallResult:
+        self.unban_calls.append((ip, dry_run))
+        return FirewallResult(False, dry_run, "rule_not_found", command=["unban", ip])
+
+
+class _FailingUnbanFirewall(_RecordingFirewall):
+    def unban_input_drop(self, ip: str, *, dry_run: bool) -> FirewallResult:
+        self.unban_calls.append((ip, dry_run))
+        return FirewallResult(False, dry_run, "provider_timeout", command=["unban", ip])
+
+
+def _set_real_enforcement_env(monkeypatch):
+    monkeypatch.setenv("REAL_ENFORCEMENT_APPROVAL_REQUIRED", "true")
+    monkeypatch.setenv("REAL_ENFORCEMENT_AUDIT_VERIFIED", "true")
+    monkeypatch.setenv("REAL_ENFORCEMENT_ROLLBACK_READY", "true")
+    monkeypatch.setenv("REAL_ENFORCEMENT_UNBLOCK_READY", "true")
+    monkeypatch.setenv("REAL_ENFORCEMENT_REVIEW_REQUIRED", "true")
 
 
 @pytest.mark.parametrize(
@@ -114,6 +149,124 @@ def test_high_ban_schedules_unblock_and_tick_writes_unban(monkeypatch):
     un = [x for x in r.response_actions if x.get("action") == "unban_ip"]
     assert un, "unban should be recorded"
     assert un[-1].get("status") == STATUS_SCHEDULED_UNBLOCKED
+
+
+def test_scheduled_unblock_missing_rule_is_skipped_not_retried(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    fw = _MissingRuleFirewall()
+    r = SecurityResponder(dry_run=True, firewall=fw)
+    task_id = r.scheduler.schedule_unblock(
+        ip="192.0.2.45",
+        run_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        dry_run=True,
+        alert_id=None,
+        related_response_action_id=123,
+    )
+
+    assert r.scheduler.tick(r, now=datetime.now(timezone.utc)) == 1
+    task = next(t for t in r.scheduler._mem_tasks if t.id == task_id)  # noqa: SLF001
+    assert task.status == "completed"
+    assert task.last_error is None
+    un = [x for x in r.response_actions if x.get("action") == "unban_ip"]
+    assert un[-1]["status"] == "skipped"
+    assert un[-1]["reason"] == "scheduled_unblock_rule_absent"
+
+
+def test_scheduled_unblock_failure_retries_and_records_last_error(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    fw = _FailingUnbanFirewall()
+    r = SecurityResponder(dry_run=True, firewall=fw)
+    task_id = r.scheduler.schedule_unblock(
+        ip="192.0.2.46",
+        run_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        dry_run=True,
+        alert_id=None,
+        related_response_action_id=456,
+    )
+
+    assert r.scheduler.tick(r, now=datetime.now(timezone.utc)) == 1
+    task = next(t for t in r.scheduler._mem_tasks if t.id == task_id)  # noqa: SLF001
+    assert task.status == "pending"
+    assert task.attempt_count == 1
+    assert task.last_error == "provider_timeout"
+    un = [x for x in r.response_actions if x.get("action") == "unban_ip"]
+    assert un[-1]["status"] == "failed"
+
+
+def test_dry_run_true_never_calls_real_firewall(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_GATE", raising=False)
+    fw = _RecordingFirewall()
+    r = SecurityResponder(dry_run=True, firewall=fw)
+
+    r.approve_ban_ip(
+        "198.51.100.11",
+        operator="tester",
+        reason="dry run approval drill",
+        duration=timedelta(seconds=30),
+    )
+    r.execute_approved_ban_ip(
+        "198.51.100.11",
+        operator="tester",
+        reason="dry run execution drill",
+        duration=timedelta(seconds=30),
+    )
+
+    assert fw.ban_calls == [("198.51.100.11", True)]
+    executed = [x for x in r.response_actions if x.get("action") == "ban_ip"]
+    assert executed[-1]["status"] == "executed"
+    assert executed[-1]["execution_mode"] == "dry_run"
+
+
+def test_dry_run_false_without_gate_rejects_before_firewall(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("REAL_ENFORCEMENT_GATE", raising=False)
+    fw = _RecordingFirewall()
+    r = SecurityResponder(dry_run=False, firewall=fw)
+
+    r.approve_ban_ip(
+        "198.51.100.12",
+        operator="tester",
+        reason="missing gate should stop real ban",
+        duration=timedelta(seconds=30),
+    )
+    r.execute_approved_ban_ip(
+        "198.51.100.12",
+        operator="tester",
+        reason="execute missing gate should stop real ban",
+        duration=timedelta(seconds=30),
+    )
+
+    assert fw.ban_calls == []
+    rejected = [x for x in r.response_actions if x.get("status") == "rejected"]
+    assert rejected
+    assert rejected[-1]["reason"] == "real_enforcement_gate_required"
+
+
+def test_dry_run_false_with_real_enforcement_gate_reaches_real_path(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("REAL_ENFORCEMENT_GATE", "real-enforcement")
+    _set_real_enforcement_env(monkeypatch)
+    fw = _RecordingFirewall()
+    r = SecurityResponder(dry_run=False, firewall=fw)
+
+    r.approve_ban_ip(
+        "198.51.100.13",
+        operator="tester",
+        reason="approved real enforcement drill",
+        duration=timedelta(seconds=30),
+    )
+    r.execute_approved_ban_ip(
+        "198.51.100.13",
+        operator="tester",
+        reason="execute approved real enforcement drill",
+        duration=timedelta(seconds=30),
+    )
+
+    assert fw.ban_calls == [("198.51.100.13", False)]
+    executed = [x for x in r.response_actions if x.get("action") == "ban_ip"]
+    assert executed[-1]["status"] == "executed"
+    assert executed[-1]["execution_mode"] == "real"
 
 
 def test_critical_null_isolation_creates_manual_pending(monkeypatch):

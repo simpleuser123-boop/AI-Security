@@ -212,13 +212,19 @@ class TestDryRun:
         assert not responder.is_banned("10.0.0.1")
 
     def test_non_dry_run_invokes_subprocess(self):
-        responder = SecurityResponder(dry_run=False)
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip(
+            "192.0.2.10",
+            operator="analyst-a",
+            reason="confirmed_abuse",
+            duration=timedelta(hours=1),
+        )
         with patch("src.response.firewall.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            responder.approve_and_ban_ip(
+            responder.execute_approved_ban_ip(
                 "192.0.2.10",
                 operator="analyst-a",
-                reason="confirmed_abuse",
+                reason="execute confirmed_abuse",
                 duration=timedelta(hours=1),
             )
             mock_run.assert_called_once()
@@ -305,19 +311,25 @@ class TestDuplicateBan:
         assert responder.banned_ips["10.0.0.5"] == first_time
 
     def test_duplicate_ban_skipped_in_real_mode(self):
-        responder = SecurityResponder(dry_run=False)
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip(
+            "192.0.2.5",
+            operator="analyst-a",
+            reason="confirmed_abuse",
+            duration=timedelta(hours=1),
+        )
         with patch("src.response.firewall.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            responder.approve_and_ban_ip(
+            responder.execute_approved_ban_ip(
                 "192.0.2.5",
                 operator="analyst-a",
-                reason="confirmed_abuse",
+                reason="execute confirmed_abuse",
                 duration=timedelta(hours=1),
             )
-            responder.approve_and_ban_ip(
+            responder.execute_approved_ban_ip(
                 "192.0.2.5",
                 operator="analyst-a",
-                reason="confirmed_abuse",
+                reason="execute confirmed_abuse again",
                 duration=timedelta(hours=1),
             )
             # subprocess.run 只应被调用 1 次
@@ -370,14 +382,15 @@ class TestSubprocessExceptions:
     """验证三类异常都被捕获，且不会导致程序崩溃。"""
 
     def test_called_process_error_handled(self, caplog):
-        responder = SecurityResponder(dry_run=False)
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip("192.0.2.21", operator="analyst-a", reason="confirmed_abuse")
         with patch("src.response.firewall.subprocess.run") as mock_run, \
                 caplog.at_level(logging.ERROR, logger="src.response.firewall"):
             mock_run.side_effect = subprocess.CalledProcessError(1, ["iptables"])
-            responder.approve_and_ban_ip(
+            responder.execute_approved_ban_ip(
                 "192.0.2.21",
                 operator="analyst-a",
-                reason="confirmed_abuse",
+                reason="execute confirmed_abuse",
                 duration=timedelta(hours=1),
             )
         assert "封禁失败" in caplog.text or "执行失败" in caplog.text
@@ -385,28 +398,30 @@ class TestSubprocessExceptions:
         assert "192.0.2.21" not in responder.banned_ips
 
     def test_timeout_expired_handled(self, caplog):
-        responder = SecurityResponder(dry_run=False)
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip("192.0.2.22", operator="analyst-a", reason="confirmed_abuse")
         with patch("src.response.firewall.subprocess.run") as mock_run, \
                 caplog.at_level(logging.ERROR, logger="src.response.firewall"):
             mock_run.side_effect = subprocess.TimeoutExpired(["iptables"], 5)
-            responder.approve_and_ban_ip(
+            responder.execute_approved_ban_ip(
                 "192.0.2.22",
                 operator="analyst-a",
-                reason="confirmed_abuse",
+                reason="execute confirmed_abuse",
                 duration=timedelta(hours=1),
             )
         assert "封禁失败" in caplog.text or "超时" in caplog.text
         assert "192.0.2.22" not in responder.banned_ips
 
     def test_file_not_found_handled(self, caplog):
-        responder = SecurityResponder(dry_run=False)
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip("192.0.2.23", operator="analyst-a", reason="confirmed_abuse")
         with patch("src.response.firewall.subprocess.run") as mock_run, \
                 caplog.at_level(logging.ERROR, logger="src.response.firewall"):
             mock_run.side_effect = FileNotFoundError()
-            responder.approve_and_ban_ip(
+            responder.execute_approved_ban_ip(
                 "192.0.2.23",
                 operator="analyst-a",
-                reason="confirmed_abuse",
+                reason="execute confirmed_abuse",
                 duration=timedelta(hours=1),
             )
         assert "iptables" in caplog.text
@@ -447,6 +462,22 @@ class TestWebAttackResponseActions:
         assert ban_rows
         assert ban_rows[-1].get("status") == "skipped"
         assert "whitelist" in ban_rows[-1].get("reason", "")
+
+    def test_business_cidr_whitelist_protects_from_auto_ban(self, monkeypatch):
+        monkeypatch.setenv("RESPONSE_BUSINESS_IP_WHITELIST", "192.0.2.64/28")
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip("192.0.2.66", operator="analyst-a", reason="confirmed_abuse")
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            responder.execute_approved_ban_ip(
+                "192.0.2.66",
+                operator="analyst-a",
+                reason="execute confirmed_abuse",
+            )
+            mock_run.assert_not_called()
+        assert not responder.is_banned("192.0.2.66")
+        ban_rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
+        assert ban_rows[-1].get("status") == "skipped"
+        assert "business_whitelist" in ban_rows[-1].get("reason", "")
 
     def test_notify_failure_records_status_and_schedules_retry(self):
         class FailingChannel(NotificationChannel):
@@ -494,14 +525,34 @@ class TestApprovalFlow:
         assert rows[-1]["status"] == STATUS_PENDING_APPROVAL
         assert not responder.is_banned("192.0.2.101")
 
-    def test_approved_real_ban_reaches_executed(self):
-        responder = SecurityResponder(dry_run=False)
+    def test_approve_only_does_not_execute_provider(self):
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
         with patch("src.response.firewall.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
             responder.approve_and_ban_ip(
                 "192.0.2.102",
                 operator="analyst-a",
                 reason="confirmed_abuse",
+            )
+            mock_run.assert_not_called()
+        rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
+        statuses = [r["status"] for r in rows]
+        assert STATUS_APPROVED in statuses
+        assert STATUS_EXECUTED not in statuses
+        assert not responder.is_banned("192.0.2.102")
+
+    def test_execute_approved_real_ban_reaches_executed(self):
+        responder = SecurityResponder(dry_run=False, real_enforcement_gate="real-enforcement")
+        responder.approve_ban_ip(
+            "192.0.2.102",
+            operator="analyst-a",
+            reason="confirmed_abuse",
+        )
+        with patch("src.response.firewall.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            responder.execute_approved_ban_ip(
+                "192.0.2.102",
+                operator="analyst-a",
+                reason="execute confirmed abuse",
             )
         rows = [a for a in responder.response_actions if a.get("action") == "ban_ip"]
         statuses = [r["status"] for r in rows]

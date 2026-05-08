@@ -503,6 +503,26 @@
   border-color: rgba(16, 185, 129, 0.3);
 }
 
+.badge--danger {
+  color: var(--threat-high);
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.alert-banner {
+  padding: 10px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+}
+
+.alert-banner--warning {
+  color: var(--threat-medium);
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.28);
+}
+
 /* =============================================================
  * 表格
  * ============================================================= */
@@ -545,6 +565,17 @@
   font-family: var(--font-mono);
   font-size: var(--fs-mono);
   color: var(--info-blue);
+}
+
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.table-wrap .table {
+  min-width: 720px;
 }
 
 /* =============================================================

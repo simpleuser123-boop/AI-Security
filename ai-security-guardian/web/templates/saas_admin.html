@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}SaaS 控制面 · AI Security Guardian{% endblock %}
+{% block topbar_title %}SaaS 控制面{% endblock %}
+
+{% block topbar_actions %}
+  <button class="btn btn--ghost btn--sm" id="saas-refresh" type="button">刷新</button>
+{% endblock %}
+
+{% block content %}
+  <div class="settings-shell" id="saas-admin" aria-busy="true">
+    <section class="settings-section">
+      <header class="settings-section__header">
+        <h3 class="settings-section__title">租户</h3>
+        <span class="settings-section__caption">平台管理员可管理租户状态、套餐、License 和配额</span>
+      </header>
+      <div class="settings-section__body">
+        <div class="settings-inline">
+          <input class="form-input" id="tenant-q" type="search" placeholder="搜索租户" />
+          <button class="btn btn--primary btn--sm" id="tenant-search" type="button">查询</button>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>租户</th>
+                <th>状态</th>
+                <th>套餐</th>
+                <th>告警量</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tenant-rows">
+              <tr><td colspan="5" class="text-tertiary">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <header class="settings-section__header">
+        <h3 class="settings-section__title">租户详情</h3>
+        <span class="settings-section__caption" id="tenant-detail-caption">请选择一个租户</span>
+      </header>
+      <div class="settings-section__body" id="tenant-detail">
+        <p class="text-tertiary">暂无租户详情</p>
+      </div>
+    </section>
+  </div>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="{{ url_for('static', filename='js/saas_admin.js') }}"></script>
+{% endblock %}

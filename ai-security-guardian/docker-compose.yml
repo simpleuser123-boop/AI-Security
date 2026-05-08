@@ -13,41 +13,49 @@
 #
 # 使用：
 #   1) 首次：cp .env.example .env 并修改 SECRET_KEY / ADMIN_PASSWORD_HASH / REDIS_PASSWORD
+#      .env 中包含 $ 的值必须用单引号包住，例如 ADMIN_PASSWORD_HASH='...$...'
 #   2) 仅 Web/API 层（日常调试 / 前端联调，默认）：
 #        docker compose up --build
 #   3) Web + 完整检测链路（需要 CAP_NET_RAW，宿主机需支持）：
 #        docker compose --profile full-chain up --build
+x-required-production-env:
+  SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required for production; set it in .env}
+  ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH is required for production; set a Werkzeug hash in .env}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required for production; set a strong Redis password in .env}
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must point to a reachable PostgreSQL database for production}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must be the HTTPS production origin}
+
 services:
   app:
     build:
       context: .
       dockerfile: Dockerfile
       args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-public.ecr.aws/docker/library/python:3.11-slim}
         # 国内网络构建时可在 .env 中设置 PIP_INDEX_URL / APT_MIRROR 加速
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-        APT_MIRROR: ${APT_MIRROR:-}
+        APT_MIRROR: ${APT_MIRROR:-mirrors.ustc.edu.cn}
     image: ai-security-guardian:latest
     container_name: ai-security-guardian-app
     restart: unless-stopped
     ports:
       - "5000:5000"
     env_file:
-      - .env
+      - path: .env
+        required: true
+        format: raw
     environment:
       # 关键变量：compose 允许上层 shell 覆盖，未设置时退回 .env
       FLASK_ENV: ${FLASK_ENV:-production}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_DB: ${REDIS_DB:-0}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must point to a reachable PostgreSQL database for Beta/production}
       AUTO_CREATE_DB_TABLES: ${AUTO_CREATE_DB_TABLES:-false}
       DRY_RUN: ${DRY_RUN:-true}
       # Web/API 层默认不启用抓包 / 日志采集
       ENABLE_PACKET_CAPTURE: "false"
       ENABLE_WEB_LOG: "false"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must be the HTTPS private Beta/production origin}
       RUNTIME_GUARDS_ENABLED: ${RUNTIME_GUARDS_ENABLED:-true}
       REQUIRE_REDIS_AVAILABLE: ${REQUIRE_REDIS_AVAILABLE:-true}
       REQUIRE_MODELS_READY: ${REQUIRE_MODELS_READY:-true}
@@ -99,13 +107,14 @@ services:
     profiles:
       - full-chain
     env_file:
-      - .env
+      - path: .env
+        required: true
+        format: raw
     environment:
       FLASK_ENV: ${FLASK_ENV:-production}
       REDIS_HOST: ${REDIS_HOST_FOR_GUARDIAN:-127.0.0.1}
       REDIS_PORT: "6379"
       REDIS_DB: ${REDIS_DB:-0}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       DRY_RUN: ${DRY_RUN:-true}
       RUNTIME_GUARDS_ENABLED: ${RUNTIME_GUARDS_ENABLED:-true}
       REQUIRE_REDIS_AVAILABLE: ${REQUIRE_REDIS_AVAILABLE:-true}
@@ -155,8 +164,10 @@ services:
     # 纯 bridge 内访问可删除 ports 段并改用 profile「dev-publish-redis」（见 docs/deployment.md）。
     ports:
       - "127.0.0.1:6379:6379"
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    env_file:
+      - path: .env
+        required: true
+        format: raw
     # 有 REDIS_PASSWORD 时才启用 --requirepass；空密码时不在命令行写入弱口令
     command:
       - /bin/sh

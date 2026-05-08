@@ -33,6 +33,18 @@ class ResponseScheduler:
     def _use_memory(self) -> bool:
         return isinstance(self._persist, NullResponsePersistence)
 
+    @property
+    def tenant_id(self) -> str:
+        return self._persist.tenant_id
+
+    def _payload_with_tenant(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(payload)
+        tid = str(out.get("tenant_id") or self.tenant_id).strip()
+        if tid != self.tenant_id:
+            raise ValueError("task payload tenant_id does not match scheduler tenant")
+        out["tenant_id"] = self.tenant_id
+        return out
+
     def schedule_unblock(
         self,
         *,
@@ -42,13 +54,14 @@ class ResponseScheduler:
         alert_id: Optional[str],
         related_response_action_id: Optional[int],
     ) -> int:
-        payload: Dict[str, Any] = {"ip": ip, "dry_run": dry_run}
+        payload: Dict[str, Any] = self._payload_with_tenant({"ip": ip, "dry_run": dry_run})
         if self._use_memory():
             tid = self._mem_seq
             self._mem_seq += 1
             self._mem_tasks.append(
                 ScheduleTaskRow(
                     id=tid,
+                    tenant_id=self.tenant_id,
                     task_type=TASK_SCHEDULED_UNBLOCK,
                     alert_id=alert_id,
                     payload=payload,
@@ -79,13 +92,14 @@ class ResponseScheduler:
         meta: Dict[str, Any],
         max_attempts: int = 5,
     ) -> int:
-        payload = {"subject": subject, "body": body, "meta": meta}
+        payload = self._payload_with_tenant({"subject": subject, "body": body, "meta": meta})
         if self._use_memory():
             tid = self._mem_seq
             self._mem_seq += 1
             self._mem_tasks.append(
                 ScheduleTaskRow(
                     id=tid,
+                    tenant_id=self.tenant_id,
                     task_type=TASK_NOTIFY_RETRY,
                     alert_id=alert_id,
                     payload=payload,
@@ -120,6 +134,7 @@ class ResponseScheduler:
             if t.id == task_id:
                 self._mem_tasks[i] = ScheduleTaskRow(
                     id=t.id,
+                    tenant_id=t.tenant_id,
                     task_type=t.task_type,
                     alert_id=t.alert_id,
                     payload=t.payload,
@@ -139,6 +154,7 @@ class ResponseScheduler:
             if t.id == task_id:
                 self._mem_tasks[i] = ScheduleTaskRow(
                     id=t.id,
+                    tenant_id=t.tenant_id,
                     task_type=t.task_type,
                     alert_id=t.alert_id,
                     payload=t.payload,
@@ -157,6 +173,14 @@ class ResponseScheduler:
         due = self.fetch_due(before=ts, limit=30)
         processed = 0
         for task in due:
+            if task.tenant_id != self.tenant_id:
+                logger.error(
+                    "[scheduler] skip cross-tenant task id=%s expected=%s got=%s",
+                    task.id,
+                    self.tenant_id,
+                    task.tenant_id,
+                )
+                continue
             executed_attempts = task.attempt_count + 1
             if self._use_memory():
                 self.mark_running_memory(task.id)
@@ -168,14 +192,22 @@ class ResponseScheduler:
                 )
             try:
                 if task.task_type == TASK_SCHEDULED_UNBLOCK:
-                    responder.execute_scheduled_unblock(
+                    unblock_error = responder.execute_scheduled_unblock(
                         task.payload.get("ip", ""),
                         dry_run=bool(task.payload.get("dry_run")),
                         alert_id=task.alert_id,
                         schedule_task_id=task.id,
                         related_response_action_id=task.related_response_action_id,
                     )
-                    self._finish_task(task, success=True, error=None)
+                    if unblock_error is None:
+                        self._finish_task(task, success=True, error=None)
+                    else:
+                        self._fail_or_reschedule(
+                            task,
+                            unblock_error,
+                            now=ts,
+                            executed_attempts=executed_attempts,
+                        )
                 elif task.task_type == TASK_NOTIFY_RETRY:
                     ok = responder.execute_notify_retry(
                         subject=str(task.payload.get("subject", "")),
@@ -242,6 +274,7 @@ class ResponseScheduler:
                 if t.id == task.id:
                     self._mem_tasks[i] = ScheduleTaskRow(
                         id=t.id,
+                        tenant_id=t.tenant_id,
                         task_type=t.task_type,
                         alert_id=t.alert_id,
                         payload=t.payload,

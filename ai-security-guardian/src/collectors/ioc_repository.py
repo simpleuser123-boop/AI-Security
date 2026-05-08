@@ -47,8 +47,18 @@ def merge_source_lists(a: Optional[Sequence[str]], b: Optional[Sequence[str]]) -
 class IOCRepository:
     """Flask-SQLAlchemy ``Session`` 上的 IOC CRUD / 合并。"""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, tenant_id: Optional[str] = None) -> None:
         self.session = session
+        if tenant_id is None:
+            try:
+                from web.tenant import current_tenant_id
+
+                tenant_id = current_tenant_id()
+            except Exception:  # noqa: BLE001
+                from web.models import DEFAULT_TENANT_ID
+
+                tenant_id = DEFAULT_TENANT_ID
+        self.tenant_id = str(tenant_id)
 
     def _model(self):  # lazy import：避免无 Flask 时加载失败
         from web.models import IOC
@@ -64,6 +74,7 @@ class IOCRepository:
         row = (
             self.session.query(IOC)
             .filter(
+                IOC.tenant_id == self.tenant_id,
                 IOC.ioc_type == ioc_type,
                 IOC.value == canon,
             )
@@ -79,7 +90,8 @@ class IOCRepository:
         IOC = self._model()
         now = now or utc_now()
         q = self.session.query(IOC).filter(
-            (IOC.expires_at.is_(None)) | (IOC.expires_at > now)
+            IOC.tenant_id == self.tenant_id,
+            (IOC.expires_at.is_(None)) | (IOC.expires_at > now),
         )
         return [self._row_to_dict(r) for r in q.all()]
 
@@ -123,7 +135,11 @@ class IOCRepository:
         src = (source or "manual").strip() or "manual"
         row = (
             self.session.query(IOC)
-            .filter(IOC.ioc_type == ioc_type, IOC.value == canon)
+            .filter(
+                IOC.tenant_id == self.tenant_id,
+                IOC.ioc_type == ioc_type,
+                IOC.value == canon,
+            )
             .one_or_none()
         )
 
@@ -146,6 +162,7 @@ class IOCRepository:
             meta_merged = dict(metadata) if metadata else None
             row = IOC(
                 id=uuid.uuid4().hex,
+                tenant_id=self.tenant_id,
                 ioc_type=ioc_type,
                 value=canon,
                 sources=[src],
@@ -190,7 +207,11 @@ class IOCRepository:
         canon = _canonical_value(ioc_type, value)
         row = (
             self.session.query(IOC)
-            .filter(IOC.ioc_type == ioc_type, IOC.value == canon)
+            .filter(
+                IOC.tenant_id == self.tenant_id,
+                IOC.ioc_type == ioc_type,
+                IOC.value == canon,
+            )
             .one_or_none()
         )
         if row is None:

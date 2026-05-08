@@ -5,21 +5,35 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import re
 from dataclasses import dataclass
-from typing import FrozenSet, Optional, Set
+from datetime import datetime, timezone
+from typing import FrozenSet, Iterable, Optional, Set, Tuple
 
 from src.response.ip_validate import validate_ip
 
 # 复用 responder 的 IPv4 严格格式校验；本模块在其之上叠加路由/业务语义。
 
 
+WHITELIST_SCOPES: FrozenSet[str] = frozenset(
+    {"business", "private", "control_plane", "office", "monitoring"}
+)
+
+
 def _parse_csv_ips(raw: str) -> FrozenSet[str]:
     out: Set[str] = set()
     for part in (raw or "").split(","):
         s = part.strip()
-        if s and validate_ip(s):
+        if not s:
+            continue
+        if validate_ip(s):
             out.add(s)
+            continue
+        try:
+            net = ipaddress.ip_network(s, strict=False)
+        except ValueError:
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            out.add(str(net))
     return frozenset(out)
 
 
@@ -48,6 +62,8 @@ class BanEligibility:
 
     allowed: bool
     reason: str = ""
+    matched_whitelist_id: Optional[int] = None
+    matched_whitelist_scope: Optional[str] = None
 
     @property
     def rejection_reason(self) -> str:
@@ -63,12 +79,111 @@ def load_private_whitelist_from_env() -> FrozenSet[str]:
     return _parse_csv_ips(os.environ.get("RESPONSE_PRIVATE_IP_WHITELIST", ""))
 
 
+def _whitelist_contains(entries: Iterable[str], addr: ipaddress.IPv4Address) -> bool:
+    ip_s = str(addr)
+    for raw in entries:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        if item == ip_s:
+            return True
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            continue
+        if isinstance(net, ipaddress.IPv4Network) and addr in net:
+            return True
+    return False
+
+
+def _scope_rejection_reason(scope: str) -> str:
+    if scope == "business":
+        return "business_whitelist"
+    if scope == "private":
+        return "private_ip_whitelist"
+    if scope in WHITELIST_SCOPES:
+        return f"{scope}_whitelist"
+    return "db_whitelist"
+
+
+def is_whitelist_rejection(reason: str) -> bool:
+    return reason in {
+        "business_whitelist",
+        "private_ip_whitelist",
+        "control_plane_whitelist",
+        "office_whitelist",
+        "monitoring_whitelist",
+        "db_whitelist",
+    }
+
+
+def _active_db_whitelist_match(
+    addr: ipaddress.IPv4Address,
+    *,
+    tenant_id: Optional[str] = None,
+) -> Optional[Tuple[str, int]]:
+    """Best-effort DB whitelist lookup; returns (scope, id) when an active row matches."""
+    try:
+        from flask import has_app_context
+
+        if not has_app_context():
+            return None
+        from web.database import db
+        from web.models import DEFAULT_TENANT_ID, ResponseWhitelistEntry
+        from web.tenant import current_tenant_id
+    except Exception:  # noqa: BLE001
+        return None
+
+    tid = tenant_id
+    if not tid:
+        try:
+            tid = current_tenant_id()
+        except Exception:  # noqa: BLE001
+            tid = DEFAULT_TENANT_ID
+    now = datetime.now(timezone.utc)
+    try:
+        rows = (
+            db.session.query(ResponseWhitelistEntry)
+            .filter(
+                ResponseWhitelistEntry.tenant_id == tid,
+                ResponseWhitelistEntry.status == "active",
+                ResponseWhitelistEntry.scope.in_(tuple(WHITELIST_SCOPES)),
+                ResponseWhitelistEntry.value_type.in_(("ip", "cidr")),
+            )
+            .all()
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    ip_s = str(addr)
+    for row in rows:
+        expires_at = row.expires_at
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= now:
+                continue
+        value = str(row.value or "").strip()
+        if row.value_type == "ip" and value == ip_s:
+            return row.scope, row.id
+        if row.value_type == "cidr":
+            try:
+                net = ipaddress.ip_network(value, strict=False)
+            except ValueError:
+                continue
+            if isinstance(net, ipaddress.IPv4Network) and addr in net:
+                return row.scope, row.id
+    return None
+
+
 def check_real_ban_eligibility(
     ip: str,
     *,
     business_whitelist: Optional[FrozenSet[str]] = None,
     private_whitelist: Optional[FrozenSet[str]] = None,
     allow_private_ban: Optional[bool] = None,
+    tenant_id: Optional[str] = None,
+    use_db_whitelist: bool = True,
 ) -> BanEligibility:
     """
     生产真实封禁前校验。
@@ -97,12 +212,23 @@ def check_real_ban_eligibility(
         return BanEligibility(False, "reserved_or_localhost")
 
     biz = business_whitelist if business_whitelist is not None else load_business_whitelist_from_env()
-    if s in biz:
+    if _whitelist_contains(biz, addr):
         return BanEligibility(False, "business_whitelist")
 
     priv = private_whitelist if private_whitelist is not None else load_private_whitelist_from_env()
-    if s in priv:
+    if _whitelist_contains(priv, addr):
         return BanEligibility(False, "private_ip_whitelist")
+
+    if use_db_whitelist:
+        matched = _active_db_whitelist_match(addr, tenant_id=tenant_id)
+        if matched is not None:
+            scope, row_id = matched
+            return BanEligibility(
+                False,
+                _scope_rejection_reason(scope),
+                matched_whitelist_id=row_id,
+                matched_whitelist_scope=scope,
+            )
 
     allow_priv = (
         allow_private_ban

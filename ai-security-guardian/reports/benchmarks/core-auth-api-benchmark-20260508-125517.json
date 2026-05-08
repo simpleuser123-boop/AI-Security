@@ -1,0 +1,157 @@
+{
+  "tool": "scripts/benchmark_http.py",
+  "started_at": "2026-05-08T04:55:13+00:00",
+  "base_url": "http://127.0.0.1:5097",
+  "mode": "requests:200",
+  "workers": 8,
+  "warmup": {
+    "requests": 20,
+    "seconds": 0.0
+  },
+  "elapsed_sec": 4.296564299962483,
+  "throughput_rps": 46.54882041489437,
+  "ok_statuses": [
+    200
+  ],
+  "auth": {
+    "login_attempted": true,
+    "authorization_header_used": true
+  },
+  "targets": {
+    "core_api_p95_ms": 300.0,
+    "detection_p95_ms": 100.0
+  },
+  "summary": {
+    "overall": {
+      "requests": 200,
+      "successful_requests": 200,
+      "failed_requests": 0,
+      "error_rate": 0.0,
+      "avg_ms": 168.23928250058088,
+      "p50_ms": 129.0016999701038,
+      "p95_ms": 467.9417998995632,
+      "p99_ms": 524.3274999083951,
+      "min_ms": 10.228600003756583,
+      "max_ms": 1825.5252999952063,
+      "status_codes": {
+        "200": 200
+      },
+      "errors_by_type": {}
+    },
+    "endpoints": {
+      "/api/alerts/types": {
+        "requests": 40,
+        "successful_requests": 40,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 140.18790750124026,
+        "p50_ms": 111.14649998489767,
+        "p95_ms": 431.6814999328926,
+        "p99_ms": 517.8867999929935,
+        "min_ms": 11.126700090244412,
+        "max_ms": 517.8867999929935,
+        "status_codes": {
+          "200": 40
+        },
+        "errors_by_type": {}
+      },
+      "/api/metrics/traffic": {
+        "requests": 40,
+        "successful_requests": 40,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 131.84971500595566,
+        "p50_ms": 92.55970001686364,
+        "p95_ms": 442.4306000582874,
+        "p99_ms": 524.3274999083951,
+        "min_ms": 16.30660006776452,
+        "max_ms": 524.3274999083951,
+        "status_codes": {
+          "200": 40
+        },
+        "errors_by_type": {}
+      },
+      "/api/rules": {
+        "requests": 40,
+        "successful_requests": 40,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 153.44605499703903,
+        "p50_ms": 129.0016999701038,
+        "p95_ms": 392.04459998290986,
+        "p99_ms": 498.4538999851793,
+        "min_ms": 16.29759999923408,
+        "max_ms": 498.4538999851793,
+        "status_codes": {
+          "200": 40
+        },
+        "errors_by_type": {}
+      },
+      "/api/settings": {
+        "requests": 40,
+        "successful_requests": 40,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 191.80687500047497,
+        "p50_ms": 136.52770000044256,
+        "p95_ms": 424.3572000414133,
+        "p99_ms": 1825.5252999952063,
+        "min_ms": 10.228600003756583,
+        "max_ms": 1825.5252999952063,
+        "status_codes": {
+          "200": 40
+        },
+        "errors_by_type": {}
+      },
+      "/api/stats": {
+        "requests": 40,
+        "successful_requests": 40,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 223.9058599981945,
+        "p50_ms": 195.6800000043586,
+        "p95_ms": 500.6071000825614,
+        "p99_ms": 886.5890998858958,
+        "min_ms": 47.418100060895085,
+        "max_ms": 886.5890998858958,
+        "status_codes": {
+          "200": 40
+        },
+        "errors_by_type": {}
+      }
+    }
+  },
+  "detection": {
+    "enabled": false
+  },
+  "judgement": {
+    "api_target": "core API P95 < 300ms",
+    "api_pass": false,
+    "api_p95_ms": 467.9417998995632,
+    "api_endpoint_failures": {
+      "/api/alerts/types": {
+        "p95_ms": 431.6814999328926,
+        "error_rate": 0.0
+      },
+      "/api/metrics/traffic": {
+        "p95_ms": 442.4306000582874,
+        "error_rate": 0.0
+      },
+      "/api/rules": {
+        "p95_ms": 392.04459998290986,
+        "error_rate": 0.0
+      },
+      "/api/settings": {
+        "p95_ms": 424.3572000414133,
+        "error_rate": 0.0
+      },
+      "/api/stats": {
+        "p95_ms": 500.6071000825614,
+        "error_rate": 0.0
+      }
+    },
+    "detection_target": "detection segment P95 < 100ms",
+    "detection_pass": null,
+    "detection_p95_ms": null
+  }
+}

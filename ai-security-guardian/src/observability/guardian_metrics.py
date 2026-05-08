@@ -31,6 +31,10 @@ class GuardianMetricsCollector:
         self._latency_count: int = 0
         self._alerts_total: int = 0
         self._model_ready_gauge: int = 0
+        self._model_expected_count: int = 0
+        self._model_loaded_count: int = 0
+        self._model_missing_count: int = 0
+        self._model_status_updated_ts: float = 0.0
         self._last_detection_ts: float = 0.0
         self._collection_packet: bool = False
         self._collection_web: bool = False
@@ -77,7 +81,22 @@ class GuardianMetricsCollector:
 
     def set_model_ready_gauge(self, value: int) -> None:
         with self._lock:
-            self._model_ready_gauge = max(0, min(255, int(value)))
+            self._model_ready_gauge = 1 if int(value) > 0 else 0
+            self._model_status_updated_ts = time.time()
+
+    def set_model_load_state(self, *, expected: int, loaded: int) -> None:
+        """Set binary readiness plus counts for the critical model set."""
+        expected_count = max(0, int(expected))
+        loaded_count = max(0, min(expected_count, int(loaded)))
+        missing_count = max(0, expected_count - loaded_count)
+        with self._lock:
+            self._model_expected_count = expected_count
+            self._model_loaded_count = loaded_count
+            self._model_missing_count = missing_count
+            self._model_ready_gauge = (
+                1 if expected_count > 0 and loaded_count == expected_count else 0
+            )
+            self._model_status_updated_ts = time.time()
 
     def set_collection_flags(self, packet: bool, web: bool) -> None:
         with self._lock:
@@ -100,6 +119,10 @@ class GuardianMetricsCollector:
                 "detection_latency_count": self._latency_count,
                 "alerts_total": self._alerts_total,
                 "model_ready": self._model_ready_gauge,
+                "model_expected_count": self._model_expected_count,
+                "model_loaded_count": self._model_loaded_count,
+                "model_missing_count": self._model_missing_count,
+                "model_status_updated_ts": self._model_status_updated_ts,
                 "last_detection_ts": self._last_detection_ts,
                 "collection_packet": int(self._collection_packet),
                 "collection_web": int(self._collection_web),
@@ -122,6 +145,10 @@ class GuardianMetricsCollector:
                 "detection_latency_count": str(self._latency_count),
                 "alerts_total": str(self._alerts_total),
                 "model_ready": str(self._model_ready_gauge),
+                "model_expected_count": str(self._model_expected_count),
+                "model_loaded_count": str(self._model_loaded_count),
+                "model_missing_count": str(self._model_missing_count),
+                "model_status_updated_ts": str(self._model_status_updated_ts),
                 "last_detection_ts": str(self._last_detection_ts),
                 "collection_packet": str(int(self._collection_packet)),
                 "collection_web": str(int(self._collection_web)),

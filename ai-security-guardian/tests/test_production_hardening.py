@@ -264,6 +264,17 @@ def test_private_beta_readiness_allows_dry_run(monkeypatch):
     assert "private Beta" in result.reason
 
 
+def test_private_beta_readiness_rejects_real_enforcement_mode(monkeypatch):
+    from scripts.check_production_readiness import check_dry_run
+
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    result = check_dry_run("private-beta")
+
+    assert result.ok is False
+    assert "must be true" in result.reason
+
+
 def test_real_enforcement_readiness_rejects_dry_run(monkeypatch):
     from scripts.check_production_readiness import check_dry_run
 
@@ -296,6 +307,247 @@ def test_real_enforcement_readiness_requires_safety_gates(monkeypatch):
     assert "REAL_ENFORCEMENT_ROLLBACK_READY" in failed_names
     assert "REAL_ENFORCEMENT_UNBLOCK_READY" in failed_names
     assert "REAL_ENFORCEMENT_REVIEW_REQUIRED" in failed_names
+    assert "RESPONSE_PROVIDER_CONFIG" in failed_names
+    assert "RESPONSE_RECOVERY_DRILL" in failed_names
+
+
+def test_real_enforcement_gate_can_pass_with_db_evidence(monkeypatch, tmp_path):
+    import redis
+    from sqlalchemy import create_engine, text
+    import scripts.check_production_readiness as readiness
+
+    db_file = tmp_path / "gate.db"
+    engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE response_whitelist_entries (
+                    status TEXT,
+                    scope TEXT,
+                    value_type TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE response_provider_configs (
+                    id INTEGER,
+                    provider_type TEXT,
+                    provider_name TEXT,
+                    status TEXT,
+                    last_validated_at TEXT,
+                    last_validation_result TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE response_drills (
+                    status TEXT,
+                    drill_type TEXT,
+                    ended_at TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO response_whitelist_entries(status, scope, value_type)
+                VALUES ('active', 'business', 'ip')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO response_provider_configs(
+                    id, provider_type, provider_name, status, last_validated_at, last_validation_result
+                )
+                VALUES (1, 'iptables', 'iptables', 'active', '2026-05-07T10:00:00Z', '{"ok": true}')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO response_drills(status, drill_type, ended_at)
+                VALUES ('passed', 'real_ban_unblock', '2026-05-07T10:30:00Z')
+                """
+            )
+        )
+    engine.dispose()
+
+    class FakeRedis:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def ping(self):
+            return True
+
+    env_values = {
+        "FLASK_ENV": "production",
+        "SECRET_KEY": "0123456789abcdef" * 4,
+        "ADMIN_PASSWORD_HASH": generate_password_hash("real-gate-password"),
+        "DATABASE_URL": f"sqlite:///{db_file.as_posix()}",
+        "REDIS_HOST": "redis.internal",
+        "REDIS_PORT": "6379",
+        "REDIS_DB": "0",
+        "REDIS_PASSWORD": "secret-redis-password",
+        "ALLOWED_ORIGINS": "https://console.beta.acme-security.cn",
+        "DRY_RUN": "false",
+        "RUNTIME_GUARDS_ENABLED": "true",
+        "REQUIRE_REDIS_AVAILABLE": "true",
+        "REQUIRE_MODELS_READY": "true",
+        "LOG_INTEGRITY_ENABLED": "true",
+        "AUDIT_LOG_DIR": str(tmp_path / "audit"),
+        "RESPONSE_BUSINESS_IP_WHITELIST": "",
+        "REAL_ENFORCEMENT_GATE": "real-enforcement",
+        "REAL_ENFORCEMENT_APPROVAL_REQUIRED": "true",
+        "REAL_ENFORCEMENT_AUDIT_VERIFIED": "true",
+        "REAL_ENFORCEMENT_ROLLBACK_READY": "true",
+        "REAL_ENFORCEMENT_UNBLOCK_READY": "true",
+        "REAL_ENFORCEMENT_REVIEW_REQUIRED": "true",
+        "MODEL_DIR": str(tmp_path / "models"),
+    }
+    (tmp_path / "audit").mkdir()
+    (tmp_path / "models").mkdir()
+    for name in readiness.REQUIRED_MODEL_FILES:
+        (tmp_path / "models" / name).write_text("model", encoding="utf-8")
+
+    for key, value in env_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("GUARDIAN_REDIS_DISABLE_CONNECT", raising=False)
+    monkeypatch.setattr(redis, "Redis", FakeRedis)
+    monkeypatch.setattr(
+        readiness,
+        "check_database_url",
+        lambda: readiness.CheckResult("DATABASE_URL", True, "PostgreSQL production URL configured"),
+    )
+
+    results = [check() for check in readiness._checks("real-enforcement")]
+    failed_names = {result.name for result in results if not result.ok}
+
+    assert failed_names == set()
+
+
+def test_real_enforcement_whitelist_allows_active_db_whitelist(monkeypatch, tmp_path):
+    from sqlalchemy import create_engine, text
+    from scripts.check_production_readiness import check_response_business_whitelist
+
+    db_file = tmp_path / "readiness.db"
+    engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE response_whitelist_entries (
+                    status TEXT,
+                    scope TEXT,
+                    value_type TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO response_whitelist_entries(status, scope, value_type)
+                VALUES ('active', 'business', 'cidr')
+                """
+            )
+        )
+    engine.dispose()
+
+    monkeypatch.delenv("RESPONSE_BUSINESS_IP_WHITELIST", raising=False)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+
+    result = check_response_business_whitelist()
+
+    assert result.ok is True
+    assert "DB whitelist" in result.reason
+
+
+def test_real_enforcement_provider_config_requires_successful_validation(monkeypatch, tmp_path):
+    from sqlalchemy import create_engine, text
+    from scripts.check_production_readiness import check_real_enforcement_provider_tested
+
+    db_file = tmp_path / "provider.db"
+    engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE response_provider_configs (
+                    id INTEGER,
+                    provider_type TEXT,
+                    provider_name TEXT,
+                    status TEXT,
+                    last_validated_at TEXT,
+                    last_validation_result TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO response_provider_configs(
+                    id, provider_type, provider_name, status, last_validated_at, last_validation_result
+                )
+                VALUES (1, 'iptables', 'iptables', 'active', '2026-05-07T10:00:00Z', '{"ok": true}')
+                """
+            )
+        )
+    engine.dispose()
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+
+    result = check_real_enforcement_provider_tested()
+
+    assert result.ok is True
+    assert "iptables/iptables" in result.reason
+
+
+def test_real_enforcement_recovery_drill_record_required(monkeypatch, tmp_path):
+    from sqlalchemy import create_engine, text
+    from scripts.check_production_readiness import check_real_enforcement_recovery_drill_record
+
+    db_file = tmp_path / "drill.db"
+    engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE response_drills (
+                    status TEXT,
+                    drill_type TEXT,
+                    ended_at TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO response_drills(status, drill_type, ended_at)
+                VALUES ('passed', 'misblock_recovery', '2026-05-07T10:30:00Z')
+                """
+            )
+        )
+    engine.dispose()
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+
+    result = check_real_enforcement_recovery_drill_record()
+
+    assert result.ok is True
+    assert "passed recovery drill" in result.reason
 
 
 def test_readiness_model_files_require_known_artifacts(monkeypatch, tmp_path):
@@ -436,7 +688,7 @@ def test_readiness_main_reports_warn_fail_and_never_prints_secrets(monkeypatch, 
         "REDIS_DB": "0",
         "REDIS_PASSWORD": redis_password,
         "ALLOWED_ORIGINS": "https://console.beta.acme-security.cn",
-        "DRY_RUN": "false",
+        "DRY_RUN": "true",
         "RUNTIME_GUARDS_ENABLED": "true",
         "REQUIRE_REDIS_AVAILABLE": "true",
         "REQUIRE_MODELS_READY": "true",

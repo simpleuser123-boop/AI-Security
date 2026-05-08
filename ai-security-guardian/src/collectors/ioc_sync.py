@@ -44,6 +44,7 @@ def run_ioc_sync(
             from src.collectors.ioc_repository import utc_now
 
             now = utc_now()
+            # tenant-scan: allow global collector maintenance path.
             stale = (
                 db.session.query(IOC)
                 .filter(

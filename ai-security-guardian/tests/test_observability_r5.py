@@ -167,6 +167,57 @@ def test_readyz_redis_auth_failure_content(monkeypatch, tmp_path):
     assert "RuntimeError" in body["checks"]["redis"]["detail"]
 
 
+def test_alert_consumer_exception_does_not_pollute_readyz(monkeypatch, tmp_path):
+    app = _make_app(monkeypatch, tmp_path)
+
+    from flask_socketio import SocketIO
+
+    from src.utils.redis_client import RedisClient
+    from web.alert_stream_consumer import GuardianAlertStreamConsumer
+
+    class HealthyRedis:
+        def ping(self):
+            return True
+
+    class BrokenConsumerRedis:
+        def xgroup_create(self, **_kwargs):
+            raise RuntimeError("consumer stream socket failed")
+
+    shared_rds = RedisClient(host="127.0.0.1", port=63999)
+    shared_rds._client = HealthyRedis()  # noqa: SLF001
+    shared_rds._mode = "redis"  # noqa: SLF001
+
+    consumer_rds = RedisClient(host="127.0.0.1", port=63999)
+    consumer_rds._client = BrokenConsumerRedis()  # noqa: SLF001
+    consumer_rds._mode = "redis"  # noqa: SLF001
+
+    monkeypatch.setattr(shared_rds, "fork_for_stream_consumer", lambda: consumer_rds)
+    app.extensions["guardian_redis_client"] = shared_rds
+
+    consumer = GuardianAlertStreamConsumer(
+        app=app,
+        redis_client=shared_rds,
+        socketio=SocketIO(app, async_mode="threading"),
+        stream_key="guardian:alerts",
+        group_name="guardian:web",
+        consumer_name="pytest-isolated-consumer",
+        normalizer=lambda fields: dict(fields),
+        upsert_alert=lambda payload: dict(payload),
+        alert_to_api_dict=lambda row: dict(row),
+    )
+
+    assert consumer._redis is consumer_rds  # noqa: SLF001
+    consumer._redis.stream_ensure_group("guardian:alerts", "guardian:web")  # noqa: SLF001
+
+    r = app.test_client().get("/readyz")
+    body = r.get_json()
+    assert consumer_rds.mode == "memory"
+    assert shared_rds.mode == "redis"
+    assert r.status_code == 200
+    assert body["checks"]["redis"]["ok"] is True
+    assert "redis" not in body.get("degraded", [])
+
+
 def test_metrics_contains_key_series(monkeypatch, tmp_path):
     app = _make_app(monkeypatch, tmp_path)
     client = app.test_client()
@@ -181,10 +232,82 @@ def test_metrics_contains_key_series(monkeypatch, tmp_path):
         "guardian_detection_latency_ms",
         "guardian_alerts_total",
         "guardian_model_ready",
+        "guardian_model_expected",
+        "guardian_model_loaded",
+        "guardian_model_missing",
+        "guardian_model_state",
+        "guardian_model_status_updated_timestamp_seconds",
+        "guardian_metrics_snapshot_updated_timestamp_seconds",
+        "guardian_redis_stream_writes_total",
         "redis_stream_pending",
+        "redis_stream_group_lag",
+        "guardian_alert_stream_consumed_total",
+        "guardian_alert_consume_latency_ms_count",
         "audit_integrity_valid",
+        "audit_integrity_patrol_runs_total",
+        "guardian_response_actions_total",
+        "guardian_http_requests_total",
+        "guardian_http_request_duration_seconds_bucket",
     ):
         assert name in text
+
+
+def test_guardian_metrics_model_ready_is_binary():
+    from src.observability.guardian_metrics import GuardianMetricsCollector
+
+    c = GuardianMetricsCollector()
+    c.set_model_load_state(expected=4, loaded=4)
+    snap = c.snapshot()
+    assert snap["model_ready"] == 1
+    assert snap["model_expected_count"] == 4
+    assert snap["model_loaded_count"] == 4
+    assert snap["model_missing_count"] == 0
+    assert snap["model_status_updated_ts"] > 0
+
+    c.set_model_load_state(expected=4, loaded=2)
+    snap = c.snapshot()
+    assert snap["model_ready"] == 0
+    assert snap["model_loaded_count"] == 2
+    assert snap["model_missing_count"] == 2
+
+    c.set_model_load_state(expected=4, loaded=0)
+    snap = c.snapshot()
+    assert snap["model_ready"] == 0
+    assert snap["model_loaded_count"] == 0
+    assert snap["model_missing_count"] == 4
+
+
+@pytest.mark.parametrize(
+    ("loaded", "ready", "active_state"),
+    [(4, 1, "ready"), (2, 0, "partial"), (0, 0, "missing")],
+)
+def test_metrics_model_state_series(monkeypatch, tmp_path, loaded, ready, active_state):
+    app = _make_app(monkeypatch, tmp_path)
+
+    from web import observability_routes
+
+    def _snapshot(_rds):
+        return {
+            "model_ready": float(ready),
+            "model_expected_count": 4.0,
+            "model_loaded_count": float(loaded),
+            "model_missing_count": float(4 - loaded),
+            "model_status_updated_ts": 123.0,
+            "updated_ts": 124.0,
+        }
+
+    monkeypatch.setattr(observability_routes, "read_guardian_redis_snapshot", _snapshot)
+
+    r = app.test_client().get("/metrics")
+    assert r.status_code == 200
+    text = r.data.decode("utf-8")
+    assert f"guardian_model_ready {ready}" in text
+    assert "guardian_model_expected 4" in text
+    assert f"guardian_model_loaded {loaded}" in text
+    assert f"guardian_model_missing {4 - loaded}" in text
+    assert f'guardian_model_state{{state="{active_state}"}} 1' in text
+    assert "guardian_model_status_updated_timestamp_seconds 123.0" in text
+    assert "guardian_metrics_snapshot_updated_timestamp_seconds 124.0" in text
 
 
 def test_audit_integrity_failure_creates_critical_trace(monkeypatch, tmp_path):

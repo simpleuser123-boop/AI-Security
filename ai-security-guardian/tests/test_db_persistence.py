@@ -35,6 +35,12 @@ def test_all_r2_tables_can_be_created(monkeypatch, tmp_path):
     from web.database import db
 
     expected_tables = {
+        "tenants",
+        "organizations",
+        "users",
+        "memberships",
+        "roles",
+        "api_keys",
         "alerts",
         "alert_histories",
         "rules",
@@ -102,6 +108,31 @@ def test_alert_insert_and_query(monkeypatch, tmp_path):
         assert queried is not None
         assert queried.threat_type == "sql_injection"
         assert queried.status == "open"
+        assert queried.tenant_id == "tenant_default"
+
+
+def test_default_tenant_seed_supports_single_enterprise_compat(monkeypatch, tmp_path):
+    app = _build_test_app(monkeypatch, tmp_path)
+
+    from web.database import db
+    from web.models import Membership, Organization, Role, Tenant, User
+
+    with app.app_context():
+        tenant = db.session.get(Tenant, "tenant_default")
+        org = db.session.get(Organization, "org_default")
+        user = db.session.get(User, "user_system")
+        role = db.session.get(Role, "role_owner")
+        membership = db.session.get(Membership, "membership_default_owner")
+
+        assert tenant is not None
+        assert tenant.slug == "default"
+        assert org is not None
+        assert org.tenant_id == tenant.id
+        assert user is not None
+        assert role is not None
+        assert role.tenant_id == tenant.id
+        assert membership is not None
+        assert membership.tenant_id == tenant.id
 
 
 def test_alert_history_status_transition(monkeypatch, tmp_path):

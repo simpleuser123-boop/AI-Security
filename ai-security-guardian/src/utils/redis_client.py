@@ -41,6 +41,25 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 
+def tenant_stream_key(stream: str, tenant_id: str) -> str:
+    """Return the Redis Stream key reserved for one tenant."""
+    base = str(stream or "").strip()
+    tid = str(tenant_id or "").strip()
+    if not base:
+        raise ValueError("stream key is required")
+    if not tid:
+        raise ValueError("tenant_id is required")
+    suffix = f":tenant:{tid}"
+    return base if base.endswith(suffix) else f"{base}{suffix}"
+
+
+def _is_redis_timeout(exc: Exception) -> bool:
+    """Return True for redis-py socket/read timeout exceptions."""
+    if type(exc).__name__ == "TimeoutError":
+        return True
+    return "Timeout reading from socket" in str(exc)
+
+
 # =====================================================================
 # 内存模式 Streams 实现（极简版）
 # =====================================================================
@@ -149,6 +168,23 @@ class RedisClient:
         """显式重连 Redis；成功则切回 redis 模式。"""
         self._try_connect()
         return self.is_available
+
+    def fork_for_stream_consumer(self) -> "RedisClient":
+        """Return an isolated Redis connection for blocking Stream consumers.
+
+        Background consumers can issue long-polling ``XREADGROUP BLOCK`` calls. If
+        redis-py marks that socket unhealthy, the process-wide RedisClient used by
+        health checks must not be degraded as a side effect. In memory mode we keep
+        returning ``self`` so tests and local fallback streams share the same data.
+        """
+        if not self.is_available:
+            return self
+        return RedisClient(
+            host=self.host,
+            port=self.port,
+            db=self.db,
+            password=self.password or "",
+        )
 
     # ------------------------------------------------------------------
     # 属性
@@ -324,6 +360,30 @@ class RedisClient:
             st.trim(maxlen)
             return msg_id
 
+    def stream_add_for_tenant(
+        self,
+        stream: str,
+        tenant_id: str,
+        fields: Dict[str, Any],
+        maxlen: Optional[int] = None,
+        approximate: bool = True,
+    ) -> Optional[str]:
+        """Append to the tenant-owned stream and stamp the message tenant."""
+        payload = dict(fields)
+        existing = str(payload.get("tenant_id") or "").strip()
+        tid = str(tenant_id or "").strip()
+        if not tid:
+            raise ValueError("tenant_id is required")
+        if existing and existing != tid:
+            raise ValueError("message tenant_id does not match target tenant stream")
+        payload["tenant_id"] = tid
+        return self.stream_add(
+            tenant_stream_key(stream, tid),
+            payload,
+            maxlen=maxlen,
+            approximate=approximate,
+        )
+
     def stream_ensure_group(
         self,
         stream: str,
@@ -385,6 +445,14 @@ class RedisClient:
                         out.append((msg_id, decoded))
                 return out
             except Exception as exc:
+                if block_ms is not None and _is_redis_timeout(exc):
+                    logger.debug(
+                        "[RedisClient] xreadgroup block timed out stream=%s group=%s consumer=%s",
+                        stream,
+                        group,
+                        consumer,
+                    )
+                    return []
                 logger.warning("[RedisClient] xreadgroup 失败降级: %s", exc)
                 self._degrade()
 
@@ -437,7 +505,7 @@ class RedisClient:
                     consumername=consumer,
                     streams={stream: "0"},
                     count=int(count),
-                    block=0,
+                    block=None,
                 )
                 out: List[Tuple[str, Dict[str, Any]]] = []
                 for _stream_name, entries in raw or []:

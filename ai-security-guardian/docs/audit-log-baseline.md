@@ -72,4 +72,15 @@ PY
 - 重建后 `security.log` 首条基线事件及其完整性校验结果
 - 外部记录的归档文件 SHA-256 摘要，和脚本元数据中的 `archive_sha256` 交叉核对
 
+Private Deployment GA 证据包应同时保存当前 hash-chain 校验结果：
+
+```bash
+python scripts/generate_private_deployment_evidence.py \
+  --audit-env production \
+  --audit-log-dir logs/production \
+  --output-dir reports/private-deployment-evidence/<UTC timestamp>
+```
+
+生成的 `audit/hash-chain-verification.json` 只包含校验结果、日志目录和失败摘要，不包含密钥。`manifest.json` 会引用该结果，但不会复制 `.env` 内容或数据库密码。若 `valid=false`，不得把证据包标记为通过；先冻结当前 `security.log` 和归档元数据，再按事件响应流程处理。
+
 生产证据建议同步到只读对象存储或 WORM 介质，并记录外部 SHA-256 摘要。不要把生产归档拷入测试目录，也不要用测试日志覆盖生产基线。

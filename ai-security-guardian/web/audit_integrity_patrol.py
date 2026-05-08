@@ -31,11 +31,17 @@ def run_audit_integrity_patrol_once(app: Any) -> dict:
     log_dir = app.config.get("GUARDIAN_LOG_DIR", "logs")
     integrity_on = bool(app.config.get("LOG_INTEGRITY_ENABLED", True))
     sl = SecurityLogger(log_dir=log_dir, enable_integrity=integrity_on)
-    result = sl.verify_integrity()
+    try:
+        result = sl.verify_integrity()
+    except Exception:
+        sl.close()
+        raise
     valid = bool(result.get("valid"))
     _last_audit_integrity_valid = valid
+    _record_patrol_stats(app, valid)
 
     if valid:
+        sl.close()
         return result
 
     now_m = time.monotonic()
@@ -58,6 +64,8 @@ def run_audit_integrity_patrol_once(app: Any) -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("[AuditPatrol] 写入审计失败: %s", exc)
+    finally:
+        sl.close()
 
     # 测试环境下禁用冷却，避免跨用例共享模块全局状态导致漏写告警。
     testing = bool(app.config.get("TESTING", False))
@@ -108,6 +116,20 @@ def run_audit_integrity_patrol_once(app: Any) -> dict:
         logger.error("[AuditPatrol] 写入告警表失败: %s", exc)
 
     return result
+
+
+def _record_patrol_stats(app: Any, valid: bool) -> None:
+    now = time.time()
+    stats = dict(app.extensions.get("audit_integrity_patrol_stats") or {})
+    stats["runs_total"] = int(stats.get("runs_total", 0) or 0) + 1
+    stats["last_run_ts"] = now
+    if valid:
+        stats["last_success_ts"] = now
+    else:
+        stats["failed_total"] = int(stats.get("failed_total", 0) or 0) + 1
+    stats.setdefault("failed_total", 0)
+    stats.setdefault("last_success_ts", 0.0)
+    app.extensions["audit_integrity_patrol_stats"] = stats
 
 
 def _patrol_loop(app: Any, interval_sec: float, stop_event: threading.Event) -> None:

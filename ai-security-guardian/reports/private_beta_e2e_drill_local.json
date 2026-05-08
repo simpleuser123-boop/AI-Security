@@ -1,0 +1,149 @@
+{
+  "drill_id": "e03f09aed7",
+  "generated_at": "2026-05-08T03:22:55.949387+00:00",
+  "base_url": "in-process",
+  "database_url": "postgresql+psycopg2://guardian:***@REPLACE_WITH_POSTGRES_HOST:5432/guardian_beta",
+  "steps": [
+    {
+      "no": 1,
+      "name": "生产 readiness 检查",
+      "status": "FAIL",
+      "detail": "readiness failed: DATABASE_URL, ALLOWED_ORIGINS, DRY_RUN, DB_CONNECTIVITY",
+      "data": {
+        "elapsed_ms": 3414
+      }
+    },
+    {
+      "no": 2,
+      "name": "数据库迁移状态检查",
+      "status": "FAIL",
+      "detail": "OperationalError: (psycopg2.OperationalError) could not translate host name \"REPLACE_WITH_POSTGRES_HOST\" to address: Name or service not known\n\n(Background on this error at: https://sqlalche.me/e/20/e3q8)",
+      "data": {
+        "elapsed_ms": 1264
+      }
+    },
+    {
+      "no": 3,
+      "name": "Redis 连通和 Stream 状态检查",
+      "status": "PASS",
+      "detail": "Redis ping ok; stream=guardian:alerts xlen=0 xpending=0",
+      "data": {
+        "stream": "guardian:alerts",
+        "group": "guardian:web",
+        "xinfo_groups": [
+          {
+            "name": "guardian:web",
+            "consumers": 6,
+            "pending": 0,
+            "last-delivered-id": "0-0",
+            "entries-read": null,
+            "lag": 0
+          }
+        ],
+        "elapsed_ms": 22
+      }
+    },
+    {
+      "no": 4,
+      "name": "模型 manifest 检查",
+      "status": "PASS",
+      "detail": "model artifacts ok; manifests=4",
+      "data": {
+        "model_dir": "models\\saved",
+        "elapsed_ms": 7
+      }
+    },
+    {
+      "no": 5,
+      "name": "Web/API 登录",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 1541
+      }
+    },
+    {
+      "no": 6,
+      "name": "告警模拟或注入",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 7,
+      "name": "告警处置",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 8,
+      "name": "通知测试",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 9,
+      "name": "响应审批测试",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 10,
+      "name": "DRY_RUN 响应验证",
+      "status": "FAIL",
+      "detail": "response action was not created",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 11,
+      "name": "审计事件查询",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 12,
+      "name": "报表查询",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 13,
+      "name": "/metrics 指标检查",
+      "status": "FAIL",
+      "detail": "RuntimeError: 生产环境 CORS Origin 必须使用正式域名: 'https://REPLACE_WITH_PRIVATE_BETA_FQDN'",
+      "data": {
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "no": 14,
+      "name": "备份和恢复抽检",
+      "status": "PASS",
+      "detail": "backup artifact sampled: guardian-task4-20260506.dump.sha256",
+      "data": {
+        "artifact": "C:\\Users\\yyl\\Desktop\\ai安全\\ai-security-guardian\\backups\\20260506-task4-db-drill\\guardian-task4-20260506.dump.sha256",
+        "elapsed_ms": 20
+      }
+    }
+  ],
+  "passed": false
+}

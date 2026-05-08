@@ -2,6 +2,8 @@
 
 本文档面向 AI-Security-Guardian 企业级上线、变更、回滚与灾备演练。内容与 `Dockerfile`、`docker-compose.yml`、`.env.example`、`README.md` 保持一致，默认部署形态为：
 
+SaaS Beta 运维 SLO、Prometheus 告警、Grafana Dashboard、值班升级和 HA 方案见 `docs/phase-c5-saas-operations-reliability.md`。生产上线时，本手册负责部署和恢复动作，Phase C5 手册负责运行期健康判断和告警响应。
+
 - `app`：Flask Web/API/Socket.IO，容器内监听 `5000`，非 root 用户 `guardian` 运行。
 - `redis`：Redis 7，Compose 中仅绑定宿主机 `127.0.0.1:6379`，生产必须配置 `REDIS_PASSWORD`。
 - `guardian`：完整检测链路，可选 `full-chain` profile，使用 `network_mode: host` 并需要 `NET_ADMIN` / `NET_RAW`。
@@ -79,17 +81,19 @@ find models/saved -maxdepth 1 -type f | sort
 | `FLASK_ENV` | 必须为 `production` |
 | `SECRET_KEY` | 至少 32 字符，禁止使用示例值或开发默认值 |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 必须使用哈希；禁止生产使用明文 `ADMIN_PASSWORD` |
-| `DATABASE_URL` | 生产必须指向可连接 PostgreSQL；SQLite、localhost、示例/占位连接串仅允许开发/测试 |
+| `DATABASE_URL` | Private Beta / production 必须指向客户真实可连接 PostgreSQL；SQLite、localhost、`db.prod.company.tld`、`postgres.example.com`、示例/占位连接串仅允许开发/测试 |
 | `AUTO_CREATE_DB_TABLES` | 生产保持 `false`，首次上线和后续升级使用 Flask-Migrate/Alembic |
-| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` | `REDIS_PASSWORD` 必填，必须与 Redis `requirepass` 一致 |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` | `REDIS_PASSWORD` 必填，必须与 Redis `requirepass` 一致，且不能是默认弱口令或 `REPLACE_WITH...` 占位值 |
 | `REDIS_CONNECT_TIMEOUT_SEC` / `REDIS_SOCKET_TIMEOUT_SEC` | Redis 客户端连接/读写超时，默认 `0.5` / `2.0` 秒，避免健康检查长时间阻塞 |
 | `ALLOWED_ORIGINS` | 填正式 HTTPS Origin，例如 `https://guardian-console.company.tld`；禁止 `*`、`http://`、localhost、127.0.0.1、占位域名 |
-| `DRY_RUN` | 私有化 Beta 建议 `true`；真实封禁 readiness 才要求 `false` |
+| `DRY_RUN` | 私有化 Beta 必须为 `true`；真实封禁 readiness 才允许改为 `false` |
+| `REAL_ENFORCEMENT_GATE` | 默认留空；只有完成 `--gate real-enforcement` 验收后，才允许显式设为 `real-enforcement` |
 | `REAL_ENFORCEMENT_APPROVAL_REQUIRED` | 仅真实封禁 gate 使用；必须确认审批门禁已启用 |
 | `REAL_ENFORCEMENT_AUDIT_VERIFIED` | 仅真实封禁 gate 使用；必须确认审计和哈希链证据已验证 |
 | `REAL_ENFORCEMENT_ROLLBACK_READY` | 仅真实封禁 gate 使用；必须确认回滚/止血路径已演练 |
 | `REAL_ENFORCEMENT_UNBLOCK_READY` | 仅真实封禁 gate 使用；必须确认手工解封或等效恢复已演练 |
 | `REAL_ENFORCEMENT_REVIEW_REQUIRED` | 仅真实封禁 gate 使用；必须确认响应后复盘要求 |
+| `RESPONSE_BUSINESS_IP_WHITELIST` | 真实封禁 gate 要求非空；若留空，必须已在 `response_whitelist_entries` 上传 active IP/CIDR 白名单 |
 | `RUNTIME_GUARDS_ENABLED` | Private Beta / production 必须显式为 `true`，作为运行期保护已开启的总开关 |
 | `REQUIRE_REDIS_AVAILABLE` | Private Beta / production 必须显式为 `true`，Redis 不可用时启动失败 |
 | `REQUIRE_MODELS_READY` | Private Beta / production 必须显式为 `true`，关键模型缺失时启动失败 |
@@ -128,10 +132,10 @@ python scripts/check_production_readiness.py --env-file /etc/guardian/production
 
 - `SECRET_KEY` 强度、默认值与弱 token 检查。
 - `ADMIN_PASSWORD_HASH` 存在性、Werkzeug 哈希格式、是否匹配默认密码检查；生产禁止明文 `ADMIN_PASSWORD`。
-- `DATABASE_URL` 必须是非示例、非本地的 PostgreSQL，并执行 `SELECT 1` 连通性检查。
+- `DATABASE_URL` 必须是非示例、非本地、非占位的客户 PostgreSQL，并执行 `SELECT 1` 连通性检查；静态配置仍是占位时，`DB_CONNECTIVITY` 会先提示替换真实连接串。
 - `REDIS_PASSWORD` 必填且非弱密码，并执行带密码 `PING` 连通性检查。
 - `ALLOWED_ORIGINS` 禁止 `*`、localhost、127.0.0.1、`http://`、占位域名和非正式域名；Private Beta 也必须使用客户正式 HTTPS 域名。
-- `DRY_RUN=true` 通过；若为 `false`，输出 `[WARN]`，提示必须另走真实封禁 gate。
+- `DRY_RUN=true` 通过；若为 `false`，输出 `[FAIL]`。私有化 Beta 有条件放行不允许真实封禁。
 - `RUNTIME_GUARDS_ENABLED` / `REQUIRE_REDIS_AVAILABLE` / `REQUIRE_MODELS_READY` 必须显式为 `true`；不符合时输出 `[FAIL]`。
 - `MODEL_DIR` 与关键模型/manifest 文件存在且可读。
 - `LOG_INTEGRITY_ENABLED=true`，审计日志目录存在且可写。
@@ -142,12 +146,12 @@ python scripts/check_production_readiness.py --env-file /etc/guardian/production
 python scripts/check_production_readiness.py --gate real-enforcement
 ```
 
-该 gate 必须满足 `DRY_RUN=false`，并显式检查业务白名单、审批门禁、审计证据、回滚路径、解封路径和响应后复盘要求。不要把私有化 Beta readiness 通过解读为真实封禁已可上线。
+该 gate 必须满足 `DRY_RUN=false`，并显式检查业务白名单、审批门禁、审计证据、回滚路径、解封路径和响应后复盘要求。它还会只读查询数据库，确认已存在 active DB 白名单（当 `RESPONSE_BUSINESS_IP_WHITELIST` 为空时）、至少一个 active 且 `last_validation_result.ok=true` 的 provider 配置，以及至少一条 `passed` 的恢复/回滚/误封演练记录。通过后在同一变更单中设置 `REAL_ENFORCEMENT_GATE=real-enforcement`；运行时若 `DRY_RUN=false` 但缺少该 gate，真实封禁会被拒绝并写入响应审计。真实 `ban_ip` 执行成功必须同时写入未来时间的 `scheduled_unblock_at` 并创建 `scheduled_unblock` 任务；如果任务创建失败，系统必须立即走回滚解封并写审计，不允许留下没有 TTL 的真实封禁。不要把私有化 Beta readiness 通过解读为真实封禁已可上线；私有化 Beta 的放行条件之一是 `DRY_RUN=true`。
 
 验收证据：
 
 - 私有化 Beta：`scripts/check_production_readiness.py` 输出无 `[FAIL]`，允许 `DRY_RUN=true`。
-- 真实封禁：`scripts/check_production_readiness.py --gate real-enforcement` 输出无 `[FAIL]`，且 `DRY_RUN=false` 和安全门禁证据齐备。
+- 真实封禁：`scripts/check_production_readiness.py --gate real-enforcement` 输出无 `[FAIL]`，且 `DRY_RUN=false`、`REAL_ENFORCEMENT_GATE=real-enforcement`、审批/审计/回滚/解封/复盘门禁、白名单、provider 测试和恢复演练证据齐备。
 - `.env` 权限为 `600`。
 - `ALLOWED_ORIGINS` 与正式域名一致。
 - `ADMIN_PASSWORD` 在生产环境为空或未设置。
@@ -364,57 +368,67 @@ find models/saved -maxdepth 1 -type f -exec sha256sum {} \; | sort > backups/mod
 
 ## 6. Docker Compose 部署流程
 
-### 6.1 构建镜像
+### 6.1 空环境最小复演
 
 ```bash
+cp .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"
+python scripts/generate_admin_password_hash.py
+```
+
+编辑 `.env`，至少替换并确认：
+
+- `FLASK_ENV=production`
+- `SECRET_KEY=<上一步生成的 64 位 hex>`
+- `ADMIN_PASSWORD_HASH='<Werkzeug 哈希值>'`
+- `DATABASE_URL=postgresql+psycopg2://<user>:<password>@<postgres-host>:5432/<database>`
+- `REDIS_PASSWORD=<至少 12 字符强密码>`
+- `ALLOWED_ORIGINS=https://<正式控制台域名>`
+- `AUTO_CREATE_DB_TABLES=false`
+- `RUNTIME_GUARDS_ENABLED=true`
+- `REQUIRE_REDIS_AVAILABLE=true`
+- `REQUIRE_MODELS_READY=true`
+
+`.env` 中任何包含 `$` 的值必须使用单引号包住，尤其是 `ADMIN_PASSWORD_HASH`。否则 `docker compose config --quiet` 会把 `$...` 误判为 Compose 变量并输出未设置变量告警。
+
+检查配置、构建镜像、执行迁移并启动 Web/API：
+
+```bash
+docker compose config --quiet
 docker compose build app
-docker image ls ai-security-guardian
+docker compose up -d redis
+docker compose run --rm app flask --app web.migration_app:create_migration_app db upgrade
+docker compose run --rm app python -m web.init_db --check
+docker compose up -d app
+docker compose ps
+```
+
+检查健康、就绪和 Prometheus 指标：
+
+```bash
+curl -fsS http://127.0.0.1:5000/healthz
+curl -fsS http://127.0.0.1:5000/readyz
+curl -fsS http://127.0.0.1:5000/metrics | head
 ```
 
 国内网络可在 `.env` 中设置：
 
 ```bash
+PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+APT_MIRROR=mirrors.ustc.edu.cn
 ```
 
-建议给镜像打不可变版本标签：
+### 6.2 本机端口限制
+
+生产建议使用 override 将 `app` 端口限制在本机，避免绕过 Nginx TLS 直接访问 `5000`。仓库内置 `docker-compose.prod-drill.yml` 已只覆盖端口绑定：
 
 ```bash
-export RELEASE_TAG=v1.0.0-$(date +%Y%m%d%H%M%S)
-docker build -t ai-security-guardian:${RELEASE_TAG} .
-docker tag ai-security-guardian:${RELEASE_TAG} ai-security-guardian:latest
-docker image inspect ai-security-guardian:${RELEASE_TAG} --format '{{.Id}}'
-```
-
-### 6.2 首次部署 Web/API
-
-生产建议使用 override 将 `app` 端口限制在本机，避免绕过 Nginx TLS 直接访问 `5000`：
-
-```bash
-cat > docker-compose.prod.yml <<'YAML'
-services:
-  app:
-    ports:
-      - "127.0.0.1:5000:5000"
-YAML
-```
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d redis
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app flask --app web.migration_app:create_migration_app db upgrade
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm app python -m web.init_db --check
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d app
-docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
-docker compose -f docker-compose.yml -f docker-compose.prod.yml logs --tail=100 app
-```
-
-健康检查：
-
-```bash
-curl -fsS http://127.0.0.1:5000/api/health
-curl -fsS http://127.0.0.1:5000/healthz
-curl -fsS http://127.0.0.1:5000/readyz
+docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml up -d redis
+docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml run --rm app flask --app web.migration_app:create_migration_app db upgrade
+docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml run --rm app python -m web.init_db --check
+docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml up -d app
 ```
 
 ### 6.3 Web/API 生产启动方式
@@ -617,6 +631,26 @@ docker compose logs --tail=100 app
 
 ### 9.1 备份命令
 
+Private Deployment GA 建议优先用自动化证据包脚本生成备份恢复证据骨架。脚本只写 `.env` SHA256，不复制 `.env` 内容；无真实 PostgreSQL 访问时只生成 `pg_dump` 与恢复演练命令模板，并在 `customer-actions.md` 标记待客户环境执行，不伪造通过结果。
+
+```bash
+python scripts/generate_private_deployment_evidence.py \
+  --audit-env production \
+  --audit-log-dir logs/production \
+  --output-dir reports/private-deployment-evidence/$TS
+```
+
+如客户环境已提供真实 PostgreSQL dump：
+
+```bash
+python scripts/generate_private_deployment_evidence.py \
+  --db-dump backups/$TS/guardian_prod.dump \
+  --base-url http://127.0.0.1:5000 \
+  --output-dir reports/private-deployment-evidence/$TS
+```
+
+生成的 `database/migration-version.json` 会区分三类版本：`local_latest_revision` 是交付包内最新迁移脚本版本，`source_database_current_revision` 是可连接源库的 `alembic_version`，`restore_drill_current_revision` 必须来自隔离恢复库。只有 dump 文件或只有源库版本时，恢复演练仍应标记为待客户环境执行。
+
 创建备份目录：
 
 ```bash
@@ -678,9 +712,12 @@ sha256sum backups/$TS/logs.tar.gz > backups/$TS/logs.tar.gz.sha256
 
 - 备份文件存在且大小非 0。
 - SHA256 文件已生成。
-- `.env` 备份权限为 `600`，备份目录权限为 `700`。
+- `.env` 备份权限为 `600`，备份目录权限为 `700`；交付证据包只保存 `.env` SHA256，不保存明文。
 - 数据库备份可在临时库恢复。
 - 模型备份清单与上线前 SHA256 一致。
+- `audit/hash-chain-verification.json` 中 `valid=true`；失败时先保全日志并走事件响应。
+- `health/health-summary.json` 覆盖 `/api/health`、`/healthz`、`/readyz`、`/metrics` 摘要；无法访问客户服务时保留 `health/health-check-commands.md` 待客户执行。
+- `manifest.json` 与 `customer-actions.md` 中不得出现数据库密码、Redis 密码、管理员密码哈希、API Token 或 `.env` 明文。
 
 ## 10. 恢复演练
 
@@ -793,8 +830,11 @@ WSS 验收：
 
 - 演练计划：时间、参与人、备份时间点、目标 RTO/RPO。
 - `sha256sum -c` 输出。
-- 数据库恢复命令输出和表清单。
-- 应用健康检查输出。
+- `.env` SHA256，不能包含 `.env` 明文。
+- 数据库 dump SHA256、恢复命令输出、表清单和迁移版本。
+- 模型文件 SHA256 与 manifest。
+- 审计日志 hash-chain 校验结果。
+- 应用健康检查输出：`/api/health`、`/healthz`、`/readyz`、`/metrics` 摘要。
 - WSS 连接截图。
 - 模型 SHA256 对比结果。
 - Redis `XLEN` / `XINFO STREAM` 输出。
@@ -977,6 +1017,14 @@ python scripts/verify_v1.py
 - `DRY_RUN=false` 后误封业务 IP、办公出口 IP、LB、监控探针。
 - iptables 或云安全组规则导致控制台不可达。
 
+详细 SOP 见 `templates/misblock-recovery-sop.md`。实操顺序必须按“止血、解封、加白、审计、复盘”执行：
+
+1. 止血：立即把应用切回 `DRY_RUN=true`，并移除或置空 `REAL_ENFORCEMENT_GATE`，防止新的真实封禁继续下发。
+2. 解封：从 iptables、云安全组或等效防火墙中删除误封 IP 的 deny/drop 规则，先恢复业务访问。
+3. 加白：把误封来源加入 `RESPONSE_BUSINESS_IP_WHITELIST` 或对应客户侧白名单，重新执行 readiness 校验。
+4. 审计：保留 `logs/security.log`、`response_actions`、`audit_events`、变更单和防火墙规则变更证据。
+5. 复盘：确认触发规则、审批记录、检测样本和恢复耗时；复盘完成前不得重新设置 `DRY_RUN=false` 和 `REAL_ENFORCEMENT_GATE=real-enforcement`。
+
 先定位误封 IP：
 
 ```bash
@@ -989,6 +1037,7 @@ docker compose logs --tail=200 app | egrep -i 'block|ban|iptables|firewall|respo
 ```bash
 cp .env backups/incident-$INCIDENT_TS/env.before-dry-run
 perl -0pi -e 's/^DRY_RUN=.*/DRY_RUN=true/m' .env
+perl -0pi -e 's/^REAL_ENFORCEMENT_GATE=.*/REAL_ENFORCEMENT_GATE=/' .env
 docker compose up -d app guardian
 ```
 
@@ -1020,6 +1069,8 @@ docker compose up -d app guardian
 - 被误封来源可以访问控制台或业务探针恢复。
 - `iptables -S` 或云安全组中无对应 deny 规则。
 - `logs/security.log` 和 `response_actions` 保留误封、解封、白名单变更证据。
+- `manual_unban_ip` / `rollback_ban` 写入 `audit_events`；若解封任务已经到期但 provider 规则不存在，`scheduled_unblock` 记录为 `skipped`，不反复失败。
+- 解封失败的 `response_schedule_tasks.last_error` 有错误信息，`attempt_count` 递增，并按退避策略重试。
 - 复盘后再决定是否将 `DRY_RUN=false`。
 
 ## 17. 上线前自检命令
@@ -1031,15 +1082,15 @@ python scripts/verify_v1.py
 python scripts/benchmark_p95.py
 BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' python scripts/benchmark_http.py --base-url http://127.0.0.1:5000 --requests 1000 --workers 32 --warmup-requests 100
 python scripts/staging_drill.py --cleanup
-docker compose config
+docker compose config --quiet
 docker compose up -d redis
 docker compose run --rm app flask --app web.migration_app:create_migration_app db upgrade
 docker compose run --rm app python -m web.init_db --check
 docker compose up -d app
 docker compose ps
-curl -fsS http://127.0.0.1:5000/api/health
 curl -fsS http://127.0.0.1:5000/healthz
 curl -fsS http://127.0.0.1:5000/readyz
+curl -fsS http://127.0.0.1:5000/metrics | head
 ```
 
 生产首次启动前建议在临时环境验证：`FLASK_ENV=production` 且故意省略 `SECRET_KEY` 或 `ADMIN_PASSWORD_HASH` 时进程应立即失败。
@@ -1049,7 +1100,7 @@ curl -fsS http://127.0.0.1:5000/readyz
 上线包：
 
 - 镜像 tag、镜像 ID、构建日志。
-- `docker compose config` 输出。
+- `docker compose config --quiet` 通过记录；如需保存完整 config，必须先脱敏环境变量。
 - `.env` SHA256，不包含明文内容。
 - 模型 manifest 与 SHA256。
 - 数据库迁移输出和 `flask db current` 版本。
@@ -1072,7 +1123,12 @@ curl -fsS http://127.0.0.1:5000/readyz
 备份恢复：
 
 - 发布前备份目录清单。
-- 数据库、模型、日志、环境变量 SHA256。
+- `.env` SHA256，不包含明文内容。
+- 数据库 dump SHA256；无真实 PostgreSQL 时必须列入客户环境待执行项。
+- 模型文件 SHA256 与 manifest。
+- 审计日志 hash-chain 校验结果。
+- 迁移版本：本地最新 revision 与恢复库 `alembic_version`。
+- `/api/health`、`/healthz`、`/readyz`、`/metrics` 摘要。
 - 恢复演练记录与 RTO/RPO 结论。
 
 回滚：

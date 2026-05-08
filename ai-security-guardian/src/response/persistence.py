@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional
 
 from flask import Flask
@@ -14,9 +14,38 @@ from flask import Flask
 from web.database import db
 
 
+def _require_ttl_for_real_ban(
+    *,
+    action_type: str,
+    status: str,
+    dry_run: bool,
+    scheduled_unblock_at: Optional[datetime],
+) -> None:
+    if (
+        action_type == "ban_ip"
+        and status == "executed"
+        and not dry_run
+        and scheduled_unblock_at is None
+    ):
+        raise ValueError("real ban_ip executed action requires scheduled_unblock_at")
+    if (
+        action_type == "ban_ip"
+        and status == "executed"
+        and not dry_run
+        and scheduled_unblock_at is not None
+    ):
+        now = datetime.now(timezone.utc)
+        compare_at = scheduled_unblock_at
+        if compare_at.tzinfo is None:
+            compare_at = compare_at.replace(tzinfo=timezone.utc)
+        if compare_at <= now:
+            raise ValueError("real ban_ip executed action requires future scheduled_unblock_at")
+
+
 @dataclass
 class ScheduleTaskRow:
     id: int
+    tenant_id: str
     task_type: str
     alert_id: Optional[str]
     payload: Dict[str, Any]
@@ -86,8 +115,18 @@ class ResponsePersistence:
         """可选写入 audit_events 表。"""
         raise NotImplementedError
 
+    @property
+    def tenant_id(self) -> str:
+        raise NotImplementedError
+
 
 class NullResponsePersistence(ResponsePersistence):
+    @property
+    def tenant_id(self) -> str:
+        from web.tenant import configured_default_tenant_id
+
+        return configured_default_tenant_id()
+
     def save_response_action(
         self,
         *,
@@ -103,6 +142,12 @@ class NullResponsePersistence(ResponsePersistence):
         operator: Optional[str] = None,
         trigger_source: Optional[str] = None,
     ) -> int:
+        _require_ttl_for_real_ban(
+            action_type=action_type,
+            status=status,
+            dry_run=dry_run,
+            scheduled_unblock_at=scheduled_unblock_at,
+        )
         return 0
 
     def enqueue_schedule_task(
@@ -146,8 +191,17 @@ class NullResponsePersistence(ResponsePersistence):
 class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
     """使用独立 Flask app 上下文绑定 SQLAlchemy。"""
 
-    def __init__(self, app: Flask) -> None:
+    def __init__(self, app: Flask, tenant_id: Optional[str] = None) -> None:
         self._app = app
+        from web.tenant import configured_default_tenant_id
+
+        self._tenant_id = str(tenant_id or configured_default_tenant_id()).strip()
+        if not self._tenant_id:
+            raise ValueError("tenant_id is required")
+
+    @property
+    def tenant_id(self) -> str:
+        return self._tenant_id
 
     @contextmanager
     def _write(self) -> Iterator[None]:
@@ -183,13 +237,33 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
         trigger_source: Optional[str] = None,
     ) -> int:
         from web.models import ResponseAction
+        from web.models import Alert
+        from web.billing import (
+            METRIC_RESPONSE_ACTIONS,
+            ensure_quota,
+            record_usage,
+        )
+
+        _require_ttl_for_real_ban(
+            action_type=action_type,
+            status=status,
+            dry_run=dry_run,
+            scheduled_unblock_at=scheduled_unblock_at,
+        )
 
         action_meta = dict(meta or {})
         action_meta.setdefault("reason", reason or "")
         action_meta.setdefault("operator", operator or "")
         action_meta.setdefault("trigger_source", trigger_source or "")
         with self._write():
+            if alert_id:
+                # tenant-scan: allow tenant checked immediately after load.
+                alert = db.session.get(Alert, alert_id)
+                if alert is None or alert.tenant_id != self._tenant_id:
+                    raise ValueError("alert tenant mismatch for response action")
+            ensure_quota(db.session, self._tenant_id, METRIC_RESPONSE_ACTIONS, requested=1)
             row = ResponseAction(
+                tenant_id=self._tenant_id,
                 alert_id=alert_id,
                 action_type=action_type,
                 target=target,
@@ -202,6 +276,14 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
             db.session.add(row)
             db.session.flush()
             rid = int(row.id)
+            record_usage(
+                db.session,
+                self._tenant_id,
+                METRIC_RESPONSE_ACTIONS,
+                actor=operator or "response_persistence",
+                resource_type="response_action",
+                resource_id=str(rid),
+            )
         return rid
 
     def enqueue_schedule_task(
@@ -215,12 +297,24 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
         max_attempts: int = 5,
     ) -> int:
         from web.models import ResponseScheduleTask
+        from web.models import Alert
 
         with self._write():
+            if alert_id:
+                # tenant-scan: allow tenant checked immediately after load.
+                alert = db.session.get(Alert, alert_id)
+                if alert is None or alert.tenant_id != self._tenant_id:
+                    raise ValueError("alert tenant mismatch for schedule task")
+            task_payload = dict(payload or {})
+            task_tenant = str(task_payload.get("tenant_id") or self._tenant_id).strip()
+            if task_tenant != self._tenant_id:
+                raise ValueError("payload tenant_id does not match scheduler tenant")
+            task_payload["tenant_id"] = self._tenant_id
             row = ResponseScheduleTask(
+                tenant_id=self._tenant_id,
                 task_type=task_type,
                 alert_id=alert_id,
-                payload=payload,
+                payload=task_payload,
                 run_at=run_at,
                 status="pending",
                 max_attempts=max_attempts,
@@ -239,6 +333,7 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
                 db.session.query(ResponseScheduleTask)
                 .filter(
                     ResponseScheduleTask.status == "pending",
+                    ResponseScheduleTask.tenant_id == self._tenant_id,
                     ResponseScheduleTask.run_at <= before,
                 )
                 .order_by(ResponseScheduleTask.run_at.asc())
@@ -248,6 +343,7 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
             out = [
                 ScheduleTaskRow(
                     id=int(r.id),
+                    tenant_id=r.tenant_id,
                     task_type=r.task_type,
                     alert_id=r.alert_id,
                     payload=dict(r.payload or {}),
@@ -274,8 +370,9 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
         from web.models import ResponseScheduleTask
 
         with self._write():
+            # tenant-scan: allow tenant checked immediately after load.
             row = db.session.get(ResponseScheduleTask, task_id)
-            if row is None:
+            if row is None or row.tenant_id != self._tenant_id:
                 return
             row.status = status
             if attempt_count is not None:
@@ -299,6 +396,7 @@ class FlaskSqlalchemyResponsePersistence(ResponsePersistence):
         with self._write():
             db.session.add(
                 AuditEvent(
+                    tenant_id=self._tenant_id,
                     event_type=event_type,
                     actor=actor,
                     resource_type="response",
@@ -326,4 +424,7 @@ def create_response_persistence_from_env() -> ResponsePersistence:
     if not uri:
         return NullResponsePersistence()
     app = build_persistence_app(uri)
-    return FlaskSqlalchemyResponsePersistence(app)
+    return FlaskSqlalchemyResponsePersistence(
+        app,
+        tenant_id=os.environ.get("RESPONSE_WORKER_TENANT_ID") or None,
+    )

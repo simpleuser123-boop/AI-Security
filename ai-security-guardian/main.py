@@ -61,6 +61,13 @@ logger = logging.getLogger("main")
 
 load_dotenv_file()
 
+CRITICAL_MODEL_FAMILIES = (
+    ("ddos", "DDoS"),
+    ("intrusion", "Intrusion"),
+    ("web_attack", "WebAttack"),
+    ("anomaly", "Anomaly"),
+)
+
 
 # =====================================================================
 # 运行时配置（从环境变量读取，避免硬编码）
@@ -323,10 +330,16 @@ class SecurityGuardian:
             dict[str, bool]: 各引擎是否成功加载。
         """
         plan = [
-            ("ddos", "DDoS", self.ddos_detector),
-            ("intrusion", "Intrusion", self.intrusion_detector),
-            ("web_attack", "WebAttack", self.web_detector),
-            ("anomaly", "Anomaly", self.anomaly_detector),
+            (family, label, detector)
+            for (family, label), detector in zip(
+                CRITICAL_MODEL_FAMILIES,
+                (
+                    self.ddos_detector,
+                    self.intrusion_detector,
+                    self.web_detector,
+                    self.anomaly_detector,
+                ),
+            )
         ]
         results: Dict[str, bool] = {}
         for family, label, detector in plan:
@@ -369,14 +382,11 @@ class SecurityGuardian:
         logger.info("[Guardian] 模型加载汇总：成功 %d / 共 %d", loaded, len(plan))
 
         try:
-            engines = [
-                self.ddos_detector,
-                self.intrusion_detector,
-                self.web_detector,
-                self.anomaly_detector,
-            ]
-            n_ready = sum(1 for e in engines if bool(getattr(e, "is_ready", False)))
-            self._metrics.set_model_ready_gauge(n_ready)
+            self._metrics.set_model_load_state(expected=len(plan), loaded=loaded)
+            self._metrics.flush_to_redis(self.redis, min_interval_sec=0.0)
+            self._metrics.write_status_file(
+                os.environ.get("GUARDIAN_STATUS_FILE", "logs/guardian_status.json")
+            )
         except Exception:  # noqa: BLE001
             pass
 

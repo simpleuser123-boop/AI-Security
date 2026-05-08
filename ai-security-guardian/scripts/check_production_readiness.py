@@ -8,6 +8,7 @@ It exits with status 0 only when every selected readiness gate passes.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import re
@@ -23,6 +24,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.response.real_enforcement_gate import (  # noqa: E402
+    REAL_ENFORCEMENT_GATE_ENV,
+    REAL_ENFORCEMENT_GATE_VALUE,
+    REQUIRED_REAL_ENFORCEMENT_TRUE_ENV,
+)
 
 REQUIRED_MODEL_FILES = (
     "intrusion_rf_v1.pkl",
@@ -72,6 +81,11 @@ FORBIDDEN_DATABASE_HOSTS = {
     "127.0.0.1",
     "0.0.0.0",
     "::1",
+    "db.prod.company.tld",
+    "db.example.com",
+    "database.example.com",
+    "postgres.example.com",
+    "postgres.prod.company.tld",
 }
 
 FORBIDDEN_DATABASE_TOKENS = {
@@ -107,11 +121,11 @@ FORBIDDEN_ORIGIN_HOSTS = {
 FORBIDDEN_ORIGIN_TOKENS = {
     "example",
     "replace",
+    "replacewith",
     "replace_with",
     "change_me",
     "changeme",
     "placeholder",
-    "localhost",
 }
 
 TRUTHY = {"1", "true", "yes", "on"}
@@ -194,9 +208,71 @@ def _safe_exception_type(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _database_engine_for_readiness():
+    value = _env("DATABASE_URL")
+    if not value:
+        raise RuntimeError("DATABASE_URL is missing")
+    connect_args: dict[str, object] = {}
+    try:
+        url = make_url(value)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("DATABASE_URL format is invalid") from exc
+    if url.get_backend_name() == "postgresql":
+        try:
+            connect_args["connect_timeout"] = int(float(_env("DB_CONNECT_TIMEOUT_SEC", "3")))
+        except ValueError as exc:
+            raise RuntimeError("DB_CONNECT_TIMEOUT_SEC must be numeric") from exc
+    return create_engine(value, connect_args=connect_args, pool_pre_ping=True)
+
+
+def _json_ok(value: object) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("ok"))
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(parsed, dict) and bool(parsed.get("ok"))
+    return False
+
+
+def _valid_ipv4_or_cidr_count(raw: str) -> int:
+    if not raw:
+        return 0
+    import ipaddress
+
+    count = 0
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            if "/" in item:
+                net = ipaddress.ip_network(item, strict=False)
+                if net.version == 4:
+                    count += 1
+            else:
+                addr = ipaddress.ip_address(item)
+                if addr.version == 4:
+                    count += 1
+        except ValueError:
+            continue
+    return count
+
+
 def _contains_forbidden_database_token(value: str) -> bool:
     tokens = {token for token in re.split(r"[^a-z0-9]+", value.lower()) if token}
     return bool(tokens & FORBIDDEN_DATABASE_TOKENS)
+
+
+def _contains_forbidden_origin_token(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    tokens = {token for token in normalized.split() if token}
+    compact = re.sub(r"[^a-z0-9]+", "", value.lower())
+    return bool(tokens & FORBIDDEN_ORIGIN_TOKENS) or any(
+        token in compact for token in ("replacewith", "placeholder", "changeme")
+    )
 
 
 def check_flask_env() -> CheckResult:
@@ -311,7 +387,7 @@ def check_database_url() -> CheckResult:
         return CheckResult(
             "DATABASE_URL",
             False,
-            "must point to a reachable production PostgreSQL host, not localhost/default",
+            "must replace the placeholder/local host with the customer's real reachable PostgreSQL host",
         )
     database_name = (url.database or "").strip().lower()
     if not database_name:
@@ -329,7 +405,7 @@ def check_database_url() -> CheckResult:
         return CheckResult(
             "DATABASE_URL",
             False,
-            "looks like an example, development, testing, or placeholder database",
+            "looks like an example, development, testing, or placeholder database; replace it with the customer's real PostgreSQL URL",
         )
     return CheckResult("DATABASE_URL", True, "PostgreSQL production URL configured")
 
@@ -338,8 +414,11 @@ def check_redis_password() -> CheckResult:
     value = _env("REDIS_PASSWORD")
     if not value:
         return CheckResult("REDIS_PASSWORD", False, "missing")
-    if value.lower() in FORBIDDEN_PASSWORD_VALUES:
-        return CheckResult("REDIS_PASSWORD", False, "uses a default/weak password")
+    lowered = value.lower()
+    if lowered in FORBIDDEN_PASSWORD_VALUES or any(
+        token in lowered for token in ("replace", "placeholder", "changeme", "example")
+    ):
+        return CheckResult("REDIS_PASSWORD", False, "uses a default/weak/placeholder password")
     if len(value) < 12:
         return CheckResult("REDIS_PASSWORD", False, "must be at least 12 characters")
     return CheckResult("REDIS_PASSWORD", True, "set and non-default")
@@ -369,6 +448,12 @@ def check_allowed_origins() -> CheckResult:
             return CheckResult("ALLOWED_ORIGINS", False, f"invalid origin URL: {origin}")
         if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
             return CheckResult("ALLOWED_ORIGINS", False, f"origin must not include path/query/fragment: {origin}")
+        if _contains_forbidden_origin_token(host):
+            return CheckResult(
+                "ALLOWED_ORIGINS",
+                False,
+                f"origin looks like an example or placeholder; replace it with the customer's formal HTTPS console origin: {origin}",
+            )
         if normalized in FORBIDDEN_ALLOWED_ORIGINS or host in FORBIDDEN_ORIGIN_HOSTS:
             return CheckResult(
                 "ALLOWED_ORIGINS",
@@ -384,7 +469,7 @@ def check_allowed_origins() -> CheckResult:
             return CheckResult(
                 "ALLOWED_ORIGINS",
                 False,
-                f"origin looks like an example or placeholder, not a real Beta/production domain: {origin}",
+                f"origin looks like an example or placeholder; replace it with the customer's formal HTTPS console origin: {origin}",
             )
     return CheckResult("ALLOWED_ORIGINS", True, f"{len(origins)} origin(s) configured")
 
@@ -401,74 +486,230 @@ def check_dry_run(gate: ReadinessGate = "private-beta") -> CheckResult:
             return CheckResult(
                 "DRY_RUN",
                 False,
-                "must be false for real-enforcement readiness",
+                (
+                    "currently true; keep this as the default, and set DRY_RUN=false "
+                    "only during an approved real-enforcement window after every "
+                    "REAL_ENFORCEMENT_* env and DB evidence check passes"
+                ),
             )
         return CheckResult("DRY_RUN", True, "false; real enforcement explicitly enabled")
     if is_dry_run:
         return CheckResult("DRY_RUN", True, "true; private Beta runs in non-enforcing mode")
     return CheckResult(
         "DRY_RUN",
-        True,
-        "false; allowed for private Beta only when real enforcement is separately approved",
-        "WARN",
+        False,
+        "must be true for private-beta readiness; use --gate real-enforcement only after real blocking is approved",
     )
 
 
 def _check_required_true(key: str, reason: str) -> CheckResult:
     value = _env(key)
     if not value:
-        return CheckResult(key, False, f"missing; {reason}")
+        return CheckResult(key, False, f"missing env {key}=true; {reason}")
     if not _is_bool(value):
-        return CheckResult(key, False, "must be true or false")
+        return CheckResult(key, False, f"invalid env {key}; must be true or false")
     if not _bool_value(value):
-        return CheckResult(key, False, reason)
+        return CheckResult(key, False, f"env {key} must be true; {reason}")
     return CheckResult(key, True, "true")
 
 
 def check_response_business_whitelist() -> CheckResult:
     whitelist = _env("RESPONSE_BUSINESS_IP_WHITELIST")
-    if not whitelist:
+    if whitelist:
+        valid_count = _valid_ipv4_or_cidr_count(whitelist)
+        if valid_count <= 0:
+            return CheckResult(
+                "RESPONSE_BUSINESS_IP_WHITELIST",
+                False,
+                (
+                    "env RESPONSE_BUSINESS_IP_WHITELIST is set but contains no "
+                    "valid IPv4/CIDR entry; add customer business/control-plane "
+                    "IPv4/CIDR evidence or active DB rows in response_whitelist_entries"
+                ),
+            )
+        return CheckResult(
+            "RESPONSE_BUSINESS_IP_WHITELIST",
+            True,
+            f"{valid_count} valid business whitelist entrie(s) configured from env",
+        )
+    try:
+        engine = _database_engine_for_readiness()
+        with engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM response_whitelist_entries
+                    WHERE status = 'active'
+                      AND scope IN ('business', 'private', 'control_plane', 'office', 'monitoring')
+                      AND value_type IN ('ip', 'cidr')
+                    """
+                )
+            ).scalar()
+        engine.dispose()
+    except Exception as exc:  # noqa: BLE001
         return CheckResult(
             "RESPONSE_BUSINESS_IP_WHITELIST",
             False,
-            "must be non-empty before real enforcement to protect business/LB/monitoring IPs",
+            (
+                "missing business whitelist evidence: set env "
+                "RESPONSE_BUSINESS_IP_WHITELIST to valid IPv4/CIDR entries or add "
+                "active DB rows in response_whitelist_entries(status='active', "
+                "scope in business/private/control_plane/office/monitoring, "
+                "value_type in ip/cidr); "
+                f"DB check failed: {_safe_exception_type(exc)}"
+            ),
         )
-    return CheckResult("RESPONSE_BUSINESS_IP_WHITELIST", True, "business whitelist configured")
+    if int(count or 0) <= 0:
+        return CheckResult(
+            "RESPONSE_BUSINESS_IP_WHITELIST",
+            False,
+            (
+                "missing business whitelist evidence: set env "
+                "RESPONSE_BUSINESS_IP_WHITELIST to valid IPv4/CIDR entries or add "
+                "at least one active DB row in response_whitelist_entries with "
+                "scope in business/private/control_plane/office/monitoring and "
+                "value_type in ip/cidr before DRY_RUN=false"
+            ),
+        )
+    return CheckResult(
+        "RESPONSE_BUSINESS_IP_WHITELIST",
+        True,
+        f"{int(count or 0)} active DB whitelist entrie(s) configured",
+    )
+
+
+def check_real_enforcement_provider_tested() -> CheckResult:
+    try:
+        engine = _database_engine_for_readiness()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, provider_type, provider_name, last_validated_at, last_validation_result
+                    FROM response_provider_configs
+                    WHERE status = 'active'
+                    """
+                )
+            ).mappings().all()
+        engine.dispose()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "RESPONSE_PROVIDER_CONFIG",
+            False,
+            (
+                "missing provider validation evidence: DB table "
+                "response_provider_configs must contain an active row with "
+                "last_validated_at and last_validation_result.ok=true; "
+                f"DB check failed: {_safe_exception_type(exc)}"
+            ),
+        )
+    passing = [
+        row
+        for row in rows
+        if row.get("last_validated_at") is not None
+        and _json_ok(row.get("last_validation_result"))
+    ]
+    if not passing:
+        return CheckResult(
+            "RESPONSE_PROVIDER_CONFIG",
+            False,
+            (
+                f"found {len(rows)} active provider config row(s), but none has "
+                "last_validated_at plus last_validation_result.ok=true; run the "
+                "provider test/validation flow and keep the DB evidence before "
+                "DRY_RUN=false"
+            ),
+        )
+    provider = passing[0]
+    return CheckResult(
+        "RESPONSE_PROVIDER_CONFIG",
+        True,
+        f"tested provider config present: {provider.get('provider_type')}/{provider.get('provider_name')}",
+    )
+
+
+def check_real_enforcement_recovery_drill_record() -> CheckResult:
+    try:
+        engine = _database_engine_for_readiness()
+        with engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM response_drills
+                    WHERE status = 'passed'
+                      AND drill_type IN ('real_ban_unblock', 'provider_rollback', 'misblock_recovery')
+                      AND ended_at IS NOT NULL
+                    """
+                )
+            ).scalar()
+        engine.dispose()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "RESPONSE_RECOVERY_DRILL",
+            False,
+            (
+                "missing recovery drill evidence: DB table response_drills must "
+                "contain a passed real_ban_unblock/provider_rollback/"
+                "misblock_recovery row with ended_at; "
+                f"DB check failed: {_safe_exception_type(exc)}"
+            ),
+        )
+    if int(count or 0) <= 0:
+        return CheckResult(
+            "RESPONSE_RECOVERY_DRILL",
+            False,
+            (
+                "missing recovery drill DB record: add at least one response_drills "
+                "row with status='passed', drill_type in real_ban_unblock/"
+                "provider_rollback/misblock_recovery, and ended_at before "
+                "DRY_RUN=false"
+            ),
+        )
+    return CheckResult(
+        "RESPONSE_RECOVERY_DRILL",
+        True,
+        f"{int(count or 0)} passed recovery drill record(s) present",
+    )
 
 
 def check_real_enforcement_approval_required() -> CheckResult:
-    return _check_required_true(
-        "REAL_ENFORCEMENT_APPROVAL_REQUIRED",
-        "real enforcement must have an explicit approval gate",
+    return _check_required_true(*REQUIRED_REAL_ENFORCEMENT_TRUE_ENV[0])
+
+
+def check_real_enforcement_gate_marker() -> CheckResult:
+    value = _env(REAL_ENFORCEMENT_GATE_ENV).strip().lower()
+    if value == REAL_ENFORCEMENT_GATE_VALUE:
+        return CheckResult(
+            "REAL_ENFORCEMENT_GATE",
+            True,
+            "runtime gate marker is explicitly real-enforcement",
+        )
+    return CheckResult(
+        "REAL_ENFORCEMENT_GATE",
+        False,
+        (
+            f"missing env {REAL_ENFORCEMENT_GATE_ENV}="
+            f"{REAL_ENFORCEMENT_GATE_VALUE}; current value={_env(REAL_ENFORCEMENT_GATE_ENV)!r}"
+        ),
     )
 
 
 def check_real_enforcement_audit_verified() -> CheckResult:
-    return _check_required_true(
-        "REAL_ENFORCEMENT_AUDIT_VERIFIED",
-        "real enforcement must verify audit logging and hash-chain evidence",
-    )
+    return _check_required_true(*REQUIRED_REAL_ENFORCEMENT_TRUE_ENV[1])
 
 
 def check_real_enforcement_rollback_ready() -> CheckResult:
-    return _check_required_true(
-        "REAL_ENFORCEMENT_ROLLBACK_READY",
-        "real enforcement must have a tested rollback/stop-the-bleed path",
-    )
+    return _check_required_true(*REQUIRED_REAL_ENFORCEMENT_TRUE_ENV[2])
 
 
 def check_real_enforcement_unblock_ready() -> CheckResult:
-    return _check_required_true(
-        "REAL_ENFORCEMENT_UNBLOCK_READY",
-        "real enforcement must have tested manual unblock or equivalent recovery",
-    )
+    return _check_required_true(*REQUIRED_REAL_ENFORCEMENT_TRUE_ENV[3])
 
 
 def check_real_enforcement_review_required() -> CheckResult:
-    return _check_required_true(
-        "REAL_ENFORCEMENT_REVIEW_REQUIRED",
-        "real enforcement must require post-action review/复盘",
-    )
+    return _check_required_true(*REQUIRED_REAL_ENFORCEMENT_TRUE_ENV[4])
 
 
 def check_required_runtime_guards() -> CheckResult:
@@ -610,6 +851,16 @@ def check_redis_connectivity() -> CheckResult:
 
 
 def check_database_connectivity() -> CheckResult:
+    url_check = check_database_url()
+    if not url_check.ok:
+        return CheckResult(
+            "DB_CONNECTIVITY",
+            False,
+            (
+                "skipped because DATABASE_URL is not ready for private-beta: "
+                f"{url_check.reason}; replace placeholder values before testing SELECT 1"
+            ),
+        )
     value = _env("DATABASE_URL")
     if not value:
         return CheckResult("DB_CONNECTIVITY", False, "DATABASE_URL is missing")
@@ -660,11 +911,14 @@ def _checks(gate: ReadinessGate) -> Iterable[Callable[[], CheckResult]]:
         checks.extend(
             [
                 check_response_business_whitelist,
+                check_real_enforcement_gate_marker,
                 check_real_enforcement_approval_required,
                 check_real_enforcement_audit_verified,
                 check_real_enforcement_rollback_ready,
                 check_real_enforcement_unblock_ready,
                 check_real_enforcement_review_required,
+                check_real_enforcement_provider_tested,
+                check_real_enforcement_recovery_drill_record,
             ]
         )
     return checks

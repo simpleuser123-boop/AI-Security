@@ -1,0 +1,228 @@
+{
+  "tool": "scripts/benchmark_http.py",
+  "started_at": "2026-05-08T05:05:08+00:00",
+  "base_url": "http://127.0.0.1:5097",
+  "mode": "requests:200",
+  "workers": 8,
+  "warmup": {
+    "requests": 20,
+    "seconds": 0.0
+  },
+  "elapsed_sec": 2.217681200010702,
+  "throughput_rps": 90.18428798469088,
+  "ok_statuses": [
+    200
+  ],
+  "auth": {
+    "login_attempted": true,
+    "authorization_header_used": true
+  },
+  "targets": {
+    "core_api_p95_ms": 300.0,
+    "detection_p95_ms": 100.0
+  },
+  "summary": {
+    "overall": {
+      "requests": 200,
+      "successful_requests": 200,
+      "failed_requests": 0,
+      "error_rate": 0.0,
+      "avg_ms": 85.73565350670833,
+      "p50_ms": 51.2110999552533,
+      "p95_ms": 408.44509995076805,
+      "p99_ms": 554.8902999144047,
+      "min_ms": 12.933099991641939,
+      "max_ms": 584.2729000141844,
+      "status_codes": {
+        "200": 200
+      },
+      "errors_by_type": {}
+    },
+    "endpoints": {
+      "/api/alerts": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 399.3936400045641,
+        "p50_ms": 417.40769997704774,
+        "p95_ms": 560.4880000464618,
+        "p99_ms": 584.2729000141844,
+        "min_ms": 97.15150005649775,
+        "max_ms": 584.2729000141844,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/alerts/types": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 41.2389500066638,
+        "p50_ms": 41.30300006363541,
+        "p95_ms": 56.66200001724064,
+        "p99_ms": 81.43489994108677,
+        "min_ms": 20.63889999408275,
+        "max_ms": 81.43489994108677,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/health": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 65.07754500489682,
+        "p50_ms": 63.02660005167127,
+        "p95_ms": 87.60259998962283,
+        "p99_ms": 101.40459996182472,
+        "min_ms": 42.79720003250986,
+        "max_ms": 101.40459996182472,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/metrics/attack_types": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 77.53276001894847,
+        "p50_ms": 77.05449999775738,
+        "p95_ms": 116.9260999886319,
+        "p99_ms": 128.44829994719476,
+        "min_ms": 39.259100100025535,
+        "max_ms": 128.44829994719476,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/metrics/top_attackers": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 56.03318500216119,
+        "p50_ms": 54.01309998705983,
+        "p95_ms": 84.69930000137538,
+        "p99_ms": 125.33960002474487,
+        "min_ms": 31.37169999536127,
+        "max_ms": 125.33960002474487,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/metrics/traffic": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 31.19156001484953,
+        "p50_ms": 29.98180000577122,
+        "p95_ms": 46.28080001566559,
+        "p99_ms": 55.929900030605495,
+        "min_ms": 17.199199995957315,
+        "max_ms": 55.929900030605495,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/rules": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 43.78260499215685,
+        "p50_ms": 44.35209999792278,
+        "p95_ms": 56.54409993439913,
+        "p99_ms": 58.704699971713126,
+        "min_ms": 25.245799915865064,
+        "max_ms": 58.704699971713126,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/settings": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 39.14183501037769,
+        "p50_ms": 36.67810000479221,
+        "p95_ms": 58.273900067433715,
+        "p99_ms": 68.035600008443,
+        "min_ms": 20.572599954903126,
+        "max_ms": 68.035600008443,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/api/stats": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 38.47909500473179,
+        "p50_ms": 37.37979999277741,
+        "p95_ms": 62.77690001297742,
+        "p99_ms": 75.19639993552119,
+        "min_ms": 12.933099991641939,
+        "max_ms": 75.19639993552119,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      },
+      "/readyz": {
+        "requests": 20,
+        "successful_requests": 20,
+        "failed_requests": 0,
+        "error_rate": 0.0,
+        "avg_ms": 65.4853600077331,
+        "p50_ms": 66.82670000009239,
+        "p95_ms": 80.92249999754131,
+        "p99_ms": 105.4399999557063,
+        "min_ms": 32.22550009377301,
+        "max_ms": 105.4399999557063,
+        "status_codes": {
+          "200": 20
+        },
+        "errors_by_type": {}
+      }
+    }
+  },
+  "detection": {
+    "enabled": true,
+    "iterations": 400,
+    "avg_ms": 0.004717000410892069,
+    "p50_ms": 0.004400033503770828,
+    "p95_ms": 0.005999929271638393,
+    "p99_ms": 0.009500072337687016,
+    "target_p95_ms": 100.0,
+    "pass": true
+  },
+  "judgement": {
+    "api_target": "core API P95 < 300ms",
+    "api_pass": false,
+    "api_p95_ms": 408.44509995076805,
+    "api_endpoint_failures": {
+      "/api/alerts": {
+        "p95_ms": 560.4880000464618,
+        "error_rate": 0.0
+      }
+    },
+    "detection_target": "detection segment P95 < 100ms",
+    "detection_pass": true,
+    "detection_p95_ms": 0.005999929271638393
+  }
+}

@@ -23,11 +23,15 @@ CI 使用 Python 3.10，和 `Dockerfile` 中的 `python:3.10-slim` 运行基线�
    - `python -m pytest tests/test_production_hardening.py -q --tb=short --maxfail=1`
    - 覆盖生产密钥、管理员口令策略、JWT 保护、CORS、Webhook SSRF 与 Redis 密码等关键硬化行为。
 
-4. **schema/manifest 测试**
+4. **SaaS 租户隔离静态扫描**
+   - `python scripts/tenant_query_scan.py`
+   - 阻断生产路径中未豁免的 tenant-scoped ORM 直读；输出包含文件、行号、模型、访问类型、分类和建议修复方式。测试专用直读必须用 `tenant-scan: allow ...` 标注原因，生产脚本直读必须修复或明确标注业务原因。
+
+5. **schema/manifest 测试**
    - `python -m pytest tests/test_schema_manifest.py tests/test_model_registry.py -q --tb=short --maxfail=1`
    - 覆盖特征 schema、模型 manifest、模型治理字段、版本切换和上线策略。
 
-5. **v1 验收脚本**
+6. **v1 验收脚本**
    - `python scripts/verify_v1.py`
    - 覆盖 v1 场景 1 到 9。场景 10 由 E2E 分组覆盖。
 
@@ -52,5 +56,6 @@ CI 将不同风险面拆成独立 step：
 - 依赖安装失败：先看 `Install dependencies` 或 `Dependency sanity check`。
 - 普通逻辑回归：看 `Unit and offline tests`。
 - 安全配置回归：看 `Critical security hardening tests`。
+- SaaS 租户隔离回归：看 `SaaS tenant isolation static scan` 输出的 `ERROR ... suggestion=...` 行。
 - schema 或模型治理回归：看 `Schema and manifest tests`。
 - v1 场景回归：看 `v1 acceptance scenarios` 输出的具体 `[PASS]` / 失败场景。

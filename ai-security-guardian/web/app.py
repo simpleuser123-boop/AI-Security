@@ -8,7 +8,7 @@
 
 安全与通信基线（硬要求）：
     1. SECRET_KEY / JWT_SECRET_KEY 从 `config.get_config()` 读取（环境变量驱动）
-    2. 所有 `/api/*` 默认加 `@jwt_required()`；仅 `/api/auth/login`、`/api/health`、
+    2. 所有 `/api/*` 默认加 `@_auth_required()`；仅 `/api/auth/login`、`/api/health`、
        `/healthz`、`/readyz`、`/metrics` 匿名
     3. CORS 仅允许 `config.ALLOWED_ORIGINS` 白名单，禁止 `*`
     4. Flask-Limiter：默认 `config.API_RATE_LIMIT`，登录接口额外 `5 per minute`
@@ -19,12 +19,18 @@
 from __future__ import annotations
 
 import atexit
+import copy
+import hashlib
+import ipaddress
 import json
 import logging
 import os
 import random
 import re
+import secrets
 import sys
+import threading
+import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -39,12 +45,13 @@ from flask_jwt_extended import (
     create_refresh_token,
     get_jwt,
     get_jwt_identity,
+    verify_jwt_in_request,
     jwt_required,
 )
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_socketio import SocketIO, disconnect
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError
 
 # Ensure project root is importable for script-style startup (`python web/app.py`).
@@ -55,24 +62,75 @@ if _PROJECT_ROOT not in sys.path:
 from config.config import get_config
 from src.collectors.threat_intel import ThreatIntelCollector
 from src.response.responder import (
+    STATUS_APPROVED,
+    STATUS_EXECUTED,
     STATUS_MANUAL_UNBLOCKED,
     STATUS_PENDING_APPROVAL,
+    STATUS_REVIEWED,
+    STATUS_SCHEDULED_UNBLOCKED,
     validate_ip,
+)
+from src.response.ip_policy import WHITELIST_SCOPES, check_real_ban_eligibility
+from src.response.real_enforcement_gate import (
+    REAL_ENFORCEMENT_GATE_VALUE,
+    real_enforcement_env_failures,
+    first_failure_code,
 )
 from src.response.webhook_url import check_webhook_url_safe
 from src.utils.auth import verify_admin_credentials
 from web.database import db, init_db_tables
+from web.billing import (
+    METRIC_ALERTS,
+    METRIC_API_CALLS,
+    METRIC_IOCS,
+    METRIC_NOTIFICATIONS,
+    METRIC_RESPONSE_ACTIONS,
+    METRIC_RULES,
+    METRIC_USERS,
+    METERED_METRICS,
+    OVERAGE_POLICIES,
+    QuotaExceededError,
+    ensure_quota,
+    quota_snapshot,
+    quota_error_response,
+    record_usage,
+    sync_quota_rows,
+    usage_buckets,
+    usage_period,
+)
 from web import models as _db_models  # noqa: F401
 from web.models import (
     Alert,
     AlertHistory,
+    APIKey,
     AuditEvent,
     BannedIp,
+    DEFAULT_TENANT_ID,
     IOC,
+    LicenseKey,
     ModelVersion,
+    Organization,
+    Plan,
+    Quota,
     ResponseAction,
+    ResponseApproval,
+    ResponseDrill,
+    ResponseProviderConfig,
+    ResponseScheduleTask,
+    ResponseWhitelistEntry,
     Rule,
     Setting,
+    Subscription,
+    Tenant,
+    UsageMeter,
+)
+from web.tenant import (
+    assign_tenant,
+    configured_default_tenant_id,
+    current_tenant_id,
+    login_tenant_id,
+    tenant_get,
+    tenant_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +185,24 @@ def _runtime_dependency_checks(app: Flask, cfg: Any) -> Dict[str, Any]:
     return checks
 
 
+def _ensure_core_api_indexes(app: Flask) -> None:
+    """Idempotently add indexes used by high-read dashboard API paths."""
+    statements = (
+        "CREATE INDEX IF NOT EXISTS ix_alerts_tenant_timestamp ON alerts (tenant_id, timestamp)",
+        "CREATE INDEX IF NOT EXISTS ix_alerts_tenant_threat_type ON alerts (tenant_id, threat_type)",
+        "CREATE INDEX IF NOT EXISTS ix_alerts_tenant_level ON alerts (tenant_id, level)",
+        "CREATE INDEX IF NOT EXISTS ix_rules_tenant_priority_updated ON rules (tenant_id, priority, updated_at)",
+        "CREATE INDEX IF NOT EXISTS ix_rules_tenant_type_enabled_priority ON rules (tenant_id, type, enabled, priority)",
+    )
+    with app.app_context():
+        try:
+            with db.engine.begin() as conn:
+                for stmt in statements:
+                    conn.execute(text(stmt))
+        except Exception:  # noqa: BLE001
+            logger.warning("[Perf] core API index bootstrap skipped", exc_info=True)
+
+
 def _enforce_startup_guards(app: Flask, cfg: Any) -> Dict[str, Any]:
     checks = _runtime_dependency_checks(app, cfg)
     if checks["redis"]["required"] and not checks["redis"]["ok"]:
@@ -179,10 +255,12 @@ def create_app() -> tuple[Flask, SocketIO]:
     app.extensions["guardian_os_config"] = cfg
     db.init_app(app)
     init_db_tables(app)
+    _ensure_core_api_indexes(app)
 
     # ---- JWT ---------------------------------------------------------
     jwt = JWTManager(app)
     _register_jwt_error_handlers(jwt)
+    _register_api_auth_gate(app)
 
     # ---- CORS（严格白名单）-------------------------------------------
     CORS(
@@ -263,6 +341,10 @@ def create_app() -> tuple[Flask, SocketIO]:
                 socketio=socketio,
                 stream_key=getattr(cfg, "GUARDIAN_ALERT_STREAM", "guardian:alerts"),
                 group_name=getattr(cfg, "GUARDIAN_ALERT_STREAM_GROUP", "guardian:web"),
+                tenant_id=configured_default_tenant_id(),
+                per_tenant_stream=bool(
+                    getattr(cfg, "GUARDIAN_ALERT_STREAM_PER_TENANT", True)
+                ),
                 normalizer=normalize_guardian_stream_fields,
                 upsert_alert=_upsert_alert_to_db,
                 alert_to_api_dict=_alert_to_api_dict,
@@ -323,6 +405,7 @@ RULE_ACTIONS: Tuple[str, ...] = ("alert", "block", "monitor")
 #: 最小企业 RBAC 角色。当前为单管理员账号的角色化基础，不引入多用户/多租户。
 RBAC_ROLES: Tuple[str, ...] = ("viewer", "analyst", "admin")
 RBAC_ROLE_LEVEL: Dict[str, int] = {"viewer": 0, "analyst": 1, "admin": 2}
+TENANT_STATUSES: Tuple[str, ...] = ("active", "suspended", "expired")
 #: 规则 pattern 的最大长度，防止滥用
 _RULE_PATTERN_MAX: int = 1024
 _RULE_NAME_MAX: int = 80
@@ -790,6 +873,7 @@ def _alert_to_api_dict(alert: Alert) -> Dict[str, Any]:
     )
     return {
         "id": alert.id,
+        "tenant_id": alert.tenant_id,
         "external_id": alert.external_id,
         "timestamp": _dt_iso(alert.timestamp) or _now_iso(),
         "source_ip": alert.source_ip or "",
@@ -828,11 +912,23 @@ def _upsert_alert_to_db(alert_payload: Dict[str, Any]) -> Optional[Alert]:
         return None
 
     ts = _parse_iso(str(alert_payload.get("timestamp") or "")) or datetime.now(timezone.utc)
-    item = db.session.get(Alert, alert_id)
+    tenant_id = str(alert_payload.get("tenant_id") or current_tenant_id()).strip()
+    item = tenant_get(db.session, Alert, alert_id, tenant_id)
+    if item is not None and item.tenant_id != tenant_id:
+        logger.warning("[Alert] reject cross-tenant upsert alert_id=%s", alert_id)
+        return None
     is_new = item is None
+    if is_new:
+        ensure_quota(db.session, tenant_id, METRIC_ALERTS, requested=1)
     if item is None:
-        item = Alert(id=alert_id, timestamp=ts, source_ip=str(alert_payload.get("source_ip") or ""))
+        item = Alert(
+            id=alert_id,
+            tenant_id=tenant_id,
+            timestamp=ts,
+            source_ip=str(alert_payload.get("source_ip") or ""),
+        )
         db.session.add(item)
+    item.tenant_id = tenant_id
     item.external_id = str(alert_payload.get("external_id") or "") or None
     item.timestamp = ts
     item.source_ip = str(alert_payload.get("source_ip") or "")
@@ -848,30 +944,51 @@ def _upsert_alert_to_db(alert_payload: Dict[str, Any]) -> Optional[Alert]:
     item.raw_payload = str(raw) if raw not in (None, "") else None
     item.model_version = str(alert_payload.get("model_version") or "") or None
 
-    db.session.flush()
-    if is_new:
-        db.session.add(
-            AlertHistory(
-                alert_id=item.id,
-                from_status=None,
-                to_status=item.status,
-                operator="system",
-                note="alert_ingested",
-            )
-        )
     try:
+        db.session.flush()
+        if is_new:
+            db.session.add(
+                AlertHistory(
+                    tenant_id=item.tenant_id,
+                    alert_id=item.id,
+                    from_status=None,
+                    to_status=item.status,
+                    operator="system",
+                    note="alert_ingested",
+                )
+            )
+            record_usage(
+                db.session,
+                tenant_id,
+                METRIC_ALERTS,
+                actor="system",
+                resource_type="alert",
+                resource_id=item.id,
+            )
         db.session.commit()
+        _api_cache_invalidate("stats")
+        _api_cache_invalidate("alert_types")
+        _api_cache_invalidate("traffic")
     except IntegrityError:
         db.session.rollback()
-        existing = db.session.get(Alert, alert_id)
+        existing = tenant_get(db.session, Alert, alert_id, tenant_id)
         if existing is not None:
             return existing
         ext = str(alert_payload.get("external_id") or "").strip()
         if ext:
-            dup = db.session.query(Alert).filter(Alert.external_id == ext).one_or_none()
+            dup = (
+                tenant_query(db.session.query(Alert), Alert, tenant_id)
+                .filter(Alert.external_id == ext)
+                .one_or_none()
+            )
             if dup is not None:
                 return dup
-        raise
+        logger.warning(
+            "[Alert] reject conflicting cross-tenant alert insert alert_id=%s tenant_id=%s",
+            alert_id,
+            tenant_id,
+        )
+        return None
     return item
 
 
@@ -899,6 +1016,7 @@ def normalize_guardian_stream_fields(fields: Dict[str, Any]) -> Optional[Dict[st
     raw_blob = {k: v for k, v in fields.items()}
     return {
         "id": aid,
+        "tenant_id": str(fields.get("tenant_id") or DEFAULT_TENANT_ID).strip(),
         "external_id": aid,
         "timestamp": ts_str,
         "source_ip": str(fields.get("source_ip") or "").strip(),
@@ -928,7 +1046,7 @@ def _query_alerts_from_db(
     until: Optional[datetime],
     q: Optional[str],
 ) -> Tuple[List[Dict[str, Any]], int]:
-    query = db.session.query(Alert)
+    query = tenant_query(db.session.query(Alert), Alert)
     if level:
         query = query.filter(Alert.level == level)
     if threat_type:
@@ -958,13 +1076,14 @@ def _query_alerts_from_db(
 def _update_alert_status_in_db(
     *, alert_id: str, new_status: str, operator: Optional[str], note: Optional[str]
 ) -> Optional[Dict[str, Any]]:
-    row = db.session.get(Alert, alert_id)
+    row = tenant_get(db.session, Alert, alert_id)
     if not row:
         return None
     prev = row.status
     row.status = new_status
     db.session.add(
         AlertHistory(
+            tenant_id=row.tenant_id,
             alert_id=alert_id,
             from_status=prev,
             to_status=new_status,
@@ -983,7 +1102,7 @@ def _recent_alerts_from_db(
     since: Optional[datetime] = None,
     until: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
-    query = db.session.query(Alert)
+    query = tenant_query(db.session.query(Alert), Alert)
     if since:
         query = query.filter(Alert.timestamp >= since)
     if until:
@@ -995,6 +1114,7 @@ def _recent_alerts_from_db(
 def _audit_event_to_api_dict(row: AuditEvent) -> Dict[str, Any]:
     return {
         "id": row.id,
+        "tenant_id": row.tenant_id,
         "event_type": row.event_type,
         "actor": row.actor,
         "resource_type": row.resource_type,
@@ -1018,6 +1138,7 @@ def _record_audit_event(
         ip_address = get_remote_address() if has_request_context() else None
         db.session.add(
             AuditEvent(
+                tenant_id=_current_tenant_id(),
                 event_type=event_type[:64],
                 actor=(actor or "anonymous")[:128],
                 resource_type=(resource_type or "")[:64] or None,
@@ -1067,20 +1188,33 @@ def _hydrate_settings_from_db(state: _ServerState) -> None:
     """用数据库中的设置覆盖进程内默认值（生产真源）。"""
     try:
         for key in SETTINGS_EDITABLE_KEYS:
-            row = db.session.get(Setting, key)
+            row = (
+                tenant_query(db.session.query(Setting), Setting)
+                .filter(Setting.key == key)
+                .one_or_none()
+            )
             if row is not None and row.value is not None:
                 state._settings[key] = row.value
     except Exception:  # noqa: BLE001
         logger.warning("[Settings] 从 DB 加载失败，使用进程默认值", exc_info=True)
 
 
+def _current_tenant_id() -> str:
+    """Return the tenant carried by the JWT, falling back to legacy single-tenant mode."""
+    return current_tenant_id()
+
+
 def _persist_settings_to_db(updates: Dict[str, Any]) -> None:
     for key, val in updates.items():
         if key not in SETTINGS_EDITABLE_KEYS:
             continue
-        row = db.session.get(Setting, key)
+        row = (
+            tenant_query(db.session.query(Setting), Setting)
+            .filter(Setting.key == key)
+            .one_or_none()
+        )
         if row is None:
-            row = Setting(key=key)
+            row = assign_tenant(Setting(key=key))
             db.session.add(row)
         row.value = val
     db.session.commit()
@@ -1089,7 +1223,7 @@ def _persist_settings_to_db(updates: Dict[str, Any]) -> None:
 def _sync_banned_cache_from_db(state: _ServerState) -> None:
     """封禁列表真源为 ``BannedIp`` 表；``state.banned_ips`` 仅为兼容缓存。"""
     try:
-        rows = db.session.query(BannedIp).all()
+        rows = tenant_query(db.session.query(BannedIp), BannedIp).all()
         state.banned_ips = {r.ip: r.reason for r in rows}
         state.stats["banned_ips"] = len(state.banned_ips)
     except Exception:  # noqa: BLE001
@@ -1100,10 +1234,23 @@ def _persist_banned_ip(
     ip: str, reason: str, *, operator: Optional[str] = None
 ) -> None:
     reason_s = (reason or "manual")[:200]
-    row = db.session.get(BannedIp, ip)
+    row = (
+        tenant_query(db.session.query(BannedIp), BannedIp)
+        .filter(BannedIp.ip == ip)
+        .one_or_none()
+    )
     if row is None:
-        db.session.add(BannedIp(ip=ip, reason=reason_s, operator=operator))
+        db.session.add(
+            BannedIp(
+                ip=ip,
+                tenant_id=_current_tenant_id(),
+                reason=reason_s,
+                operator=operator,
+            )
+        )
     else:
+        if row.tenant_id != _current_tenant_id():
+            return
         row.reason = reason_s
         row.operator = operator
     db.session.commit()
@@ -1112,7 +1259,9 @@ def _persist_banned_ip(
 def _record_ban_approval_request(
     ip: str, reason: str, *, operator: Optional[str], source: str
 ) -> int:
+    ensure_quota(db.session, _current_tenant_id(), METRIC_RESPONSE_ACTIONS, requested=1)
     row = ResponseAction(
+        tenant_id=_current_tenant_id(),
         action_type="ban_ip",
         target=ip,
         status=STATUS_PENDING_APPROVAL,
@@ -1126,12 +1275,532 @@ def _record_ban_approval_request(
         },
     )
     db.session.add(row)
+    record_usage(
+        db.session,
+        _current_tenant_id(),
+        METRIC_RESPONSE_ACTIONS,
+        actor=operator or _current_actor(),
+        resource_type="response_action",
+        resource_id=ip,
+    )
     db.session.commit()
     return int(row.id)
 
 
+_REAL_RESPONSE_GATE_VALUE = "real-enforcement"
+_REAL_RESPONSE_ACTION_TYPES = {
+    "ban_ip",
+    "unban_ip",
+    "isolate_host",
+    "release_host",
+    "cloud_security_group_block",
+    "cloud_security_group_unblock",
+}
+_REAL_RESPONSE_TARGET_TYPES = {"ip", "cidr", "asset", "host", "security_group_rule", "tag"}
+_REAL_RESPONSE_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _response_dry_run() -> bool:
+    return os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+
+
+def _response_gate() -> str:
+    return os.environ.get("REAL_ENFORCEMENT_GATE", "").strip()
+
+
+def _response_runtime_payload(
+    *,
+    status: str,
+    reason: str,
+    response_action_id: Optional[int] = None,
+    approval_id: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": status,
+        "dry_run": _response_dry_run(),
+        "gate": _response_gate(),
+        "reason": reason,
+        "response_action_id": response_action_id,
+    }
+    if approval_id is not None:
+        payload["approval_id"] = approval_id
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _required_body_text(data: Dict[str, Any], key: str, *, max_len: int = 2000) -> str:
+    value = data.get(key)
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:max_len]
+
+
+def _response_action_to_api_dict(row: ResponseAction) -> Dict[str, Any]:
+    meta = row.meta if isinstance(row.meta, dict) else {}
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "alert_id": row.alert_id,
+        "action_type": row.action_type,
+        "target": row.target,
+        "status": row.status,
+        "dry_run": row.dry_run,
+        "gate": meta.get("gate") or meta.get("gate_id") or "",
+        "reason": meta.get("reason") or row.error or "",
+        "provider": meta.get("provider"),
+        "provider_config_id": meta.get("provider_config_id"),
+        "scheduled_unblock_at": _dt_iso(row.scheduled_unblock_at),
+        "meta": meta,
+        "error": row.error,
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _response_approval_to_api_dict(row: ResponseApproval) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "alert_id": row.alert_id,
+        "response_action_id": row.response_action_id,
+        "provider_config_id": row.provider_config_id,
+        "gate_id": row.gate_id,
+        "action_type": row.action_type,
+        "target_type": row.target_type,
+        "target": row.target,
+        "provider": row.provider,
+        "ttl_seconds": row.ttl_seconds,
+        "status": row.status,
+        "reason": row.reason,
+        "requested_by": row.requested_by,
+        "approved_by": row.approved_by,
+        "approved_at": _dt_iso(row.approved_at),
+        "rejected_by": row.rejected_by,
+        "rejected_at": _dt_iso(row.rejected_at),
+        "rejection_reason": row.rejection_reason,
+        "executed_by": row.executed_by,
+        "executed_at": _dt_iso(row.executed_at),
+        "reviewed_by": row.reviewed_by,
+        "reviewed_at": _dt_iso(row.reviewed_at),
+        "expires_at": _dt_iso(row.expires_at),
+        "evidence": row.evidence or {},
+        "rollback_plan": row.rollback_plan or {},
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _response_whitelist_to_api_dict(row: ResponseWhitelistEntry) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "scope": row.scope,
+        "value_type": row.value_type,
+        "value": row.value,
+        "environment": row.environment,
+        "status": row.status,
+        "reason": row.reason,
+        "owner": row.owner,
+        "created_by": row.created_by,
+        "approved_by": row.approved_by,
+        "approved_at": _dt_iso(row.approved_at),
+        "expires_at": _dt_iso(row.expires_at),
+        "evidence": row.evidence or {},
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _response_provider_to_api_dict(row: ResponseProviderConfig) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "provider_type": row.provider_type,
+        "provider_name": row.provider_name,
+        "environment": row.environment,
+        "status": row.status,
+        "config_ref": row.config_ref,
+        "credential_ref": row.credential_ref,
+        "secret_fingerprint": row.secret_fingerprint,
+        "config_metadata": row.config_metadata or {},
+        "capabilities": row.capabilities or {},
+        "last_validated_at": _dt_iso(row.last_validated_at),
+        "last_validation_result": row.last_validation_result or {},
+        "created_by": row.created_by,
+        "updated_by": row.updated_by,
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _response_schedule_to_api_dict(row: ResponseScheduleTask) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "task_type": row.task_type,
+        "alert_id": row.alert_id,
+        "payload": row.payload or {},
+        "run_at": _dt_iso(row.run_at),
+        "status": row.status,
+        "attempt_count": row.attempt_count,
+        "max_attempts": row.max_attempts,
+        "related_response_action_id": row.related_response_action_id,
+        "last_error": row.last_error,
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _response_drill_to_api_dict(row: ResponseDrill) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "provider_config_id": row.provider_config_id,
+        "response_action_id": row.response_action_id,
+        "approval_id": row.approval_id,
+        "environment": row.environment,
+        "drill_type": row.drill_type,
+        "target_type": row.target_type,
+        "target": row.target,
+        "status": row.status,
+        "started_at": _dt_iso(row.started_at),
+        "ended_at": _dt_iso(row.ended_at),
+        "rto_seconds": row.rto_seconds,
+        "result": row.result,
+        "participants": row.participants or [],
+        "evidence": row.evidence or {},
+        "created_by": row.created_by,
+        "approved_by": row.approved_by,
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _validate_response_target(target_type: str, target: str) -> Optional[str]:
+    if target_type == "ip" and not validate_ip(target):
+        return "invalid_ip"
+    if target_type == "cidr":
+        try:
+            ipaddress.ip_network(target, strict=False)
+        except ValueError:
+            return "invalid_cidr"
+    if target_type in {"asset", "host", "security_group_rule", "tag"} and not target:
+        return "target_required"
+    return None
+
+
+def _normalize_response_whitelist_value(value_type: str, value: str) -> Tuple[Optional[str], Optional[str]]:
+    raw = str(value or "").strip()
+    if value_type == "ip":
+        if not validate_ip(raw):
+            return None, "invalid_ip"
+        return raw, None
+    if value_type == "cidr":
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            return None, "invalid_cidr"
+        if net.version != 4:
+            return None, "invalid_cidr"
+        return str(net), None
+    return None, "invalid_value_type"
+
+
+def _parse_whitelist_expires_at(raw: Any) -> Optional[datetime]:
+    if raw in (None, ""):
+        return None
+    dt = _parse_iso(str(raw))
+    if dt is None:
+        raise ValueError("invalid_expires_at")
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _response_whitelist_match(target_type: str, target: str) -> Optional[ResponseWhitelistEntry]:
+    now = datetime.now(timezone.utc)
+    rows = (
+        db.session.query(ResponseWhitelistEntry)
+        .filter(
+            ResponseWhitelistEntry.tenant_id == _current_tenant_id(),
+            ResponseWhitelistEntry.status == "active",
+            ResponseWhitelistEntry.scope.in_(tuple(WHITELIST_SCOPES)),
+        )
+        .all()
+    )
+    for row in rows:
+        expires_at = row.expires_at
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= now:
+                continue
+        if row.value_type == target_type and row.value == target:
+            return row
+        if target_type == "ip" and row.value_type == "cidr":
+            try:
+                if ipaddress.ip_address(target) in ipaddress.ip_network(row.value, strict=False):
+                    return row
+            except ValueError:
+                continue
+        if target_type == "cidr" and row.value_type == "cidr":
+            try:
+                if ipaddress.ip_network(target, strict=False).subnet_of(
+                    ipaddress.ip_network(row.value, strict=False)
+                ):
+                    return row
+            except ValueError:
+                continue
+    return None
+
+
+def _response_whitelist_check_payload(target: str) -> Dict[str, Any]:
+    normalized = str(target or "").strip()
+    eligibility = check_real_ban_eligibility(
+        normalized,
+        tenant_id=_current_tenant_id(),
+        use_db_whitelist=True,
+    )
+    matched = None
+    if eligibility.matched_whitelist_id is not None:
+        row = tenant_get(db.session, ResponseWhitelistEntry, eligibility.matched_whitelist_id)
+        if row is not None:
+            matched = _response_whitelist_to_api_dict(row)
+    return {
+        "target": normalized,
+        "allowed": eligibility.allowed,
+        "reason": eligibility.rejection_reason,
+        "matched": matched,
+        "dry_run": _response_dry_run(),
+        "gate": _response_gate(),
+    }
+
+
+def _append_response_action_event(
+    action: ResponseAction,
+    *,
+    status: str,
+    reason: str,
+    actor: str,
+    extra: Optional[Dict[str, Any]] = None,
+    commit: bool = False,
+) -> None:
+    meta = dict(action.meta or {})
+    history = list(meta.get("history") or [])
+    history.append(
+        {
+            "status": status,
+            "reason": reason,
+            "actor": actor,
+            "at": _now_iso(),
+        }
+    )
+    meta["history"] = history
+    meta["reason"] = reason
+    if extra:
+        meta.update(extra)
+    action.status = status
+    action.meta = meta
+    db.session.add(
+        AuditEvent(
+            tenant_id=_current_tenant_id(),
+            event_type=f"response.action.{status}"[:64],
+            actor=actor[:128],
+            resource_type="response_action",
+            resource_id=str(action.id) if action.id is not None else None,
+            payload={
+                "response_action_id": action.id,
+                "action_type": action.action_type,
+                "target": action.target,
+                "status": status,
+                "dry_run": action.dry_run,
+                "gate": _response_gate(),
+                "reason": reason,
+                **(extra or {}),
+            },
+            ip_address=action.target if validate_ip(str(action.target or "")) else None,
+        )
+    )
+    if commit:
+        db.session.commit()
+
+
+def _response_json_ok(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("ok"))
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(parsed, dict) and bool(parsed.get("ok"))
+    return False
+
+
+def _response_env_whitelist_valid_count(raw: str) -> int:
+    count = 0
+    for part in (raw or "").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            if "/" in item:
+                net = ipaddress.ip_network(item, strict=False)
+                if net.version == 4:
+                    count += 1
+            else:
+                addr = ipaddress.ip_address(item)
+                if addr.version == 4:
+                    count += 1
+        except ValueError:
+            continue
+    return count
+
+
+def _real_response_provider_available(
+    provider: Optional[ResponseProviderConfig],
+    *,
+    require_validated: bool = True,
+) -> Optional[str]:
+    if provider is None:
+        return "provider_required"
+    if provider.tenant_id != _current_tenant_id():
+        return "provider_not_found"
+    if provider.status != "active":
+        return "provider_not_active"
+    if provider.provider_type in {"cloud_security_group", "edr"}:
+        return "provider_not_implemented"
+    if provider.provider_type != "iptables":
+        return "provider_not_supported"
+    if require_validated and (
+        provider.last_validated_at is None
+        or not _response_json_ok(provider.last_validation_result)
+    ):
+        return "provider_validation_required"
+    return None
+
+
+def _real_response_business_whitelist_issue() -> Optional[Dict[str, Any]]:
+    raw = os.environ.get("RESPONSE_BUSINESS_IP_WHITELIST", "")
+    if raw.strip():
+        valid_count = _response_env_whitelist_valid_count(raw)
+        if valid_count > 0:
+            return None
+        return {
+            "code": "business_whitelist_invalid",
+            "name": "RESPONSE_BUSINESS_IP_WHITELIST",
+            "message": (
+                "env RESPONSE_BUSINESS_IP_WHITELIST is set but contains no "
+                "valid IPv4/CIDR entry"
+            ),
+        }
+    count = (
+        db.session.query(ResponseWhitelistEntry)
+        .filter(
+            ResponseWhitelistEntry.tenant_id == _current_tenant_id(),
+            ResponseWhitelistEntry.status == "active",
+            ResponseWhitelistEntry.scope.in_(tuple(WHITELIST_SCOPES)),
+            ResponseWhitelistEntry.value_type.in_(("ip", "cidr")),
+        )
+        .count()
+    )
+    if count > 0:
+        return None
+    return {
+        "code": "business_whitelist_required",
+        "name": "response_whitelist_entries",
+        "message": (
+            "missing business whitelist evidence: set RESPONSE_BUSINESS_IP_WHITELIST "
+            "to valid IPv4/CIDR entries or add an active DB row in "
+            "response_whitelist_entries before DRY_RUN=false"
+        ),
+    }
+
+
+def _real_response_recovery_drill_issue() -> Optional[Dict[str, Any]]:
+    count = (
+        db.session.query(ResponseDrill)
+        .filter(
+            ResponseDrill.tenant_id == _current_tenant_id(),
+            ResponseDrill.status == "passed",
+            ResponseDrill.drill_type.in_(
+                ("real_ban_unblock", "provider_rollback", "misblock_recovery")
+            ),
+            ResponseDrill.ended_at.isnot(None),
+        )
+        .count()
+    )
+    if count > 0:
+        return None
+    return {
+        "code": "recovery_drill_required",
+        "name": "response_drills",
+        "message": (
+            "missing recovery drill DB record: response_drills needs a passed "
+            "real_ban_unblock/provider_rollback/misblock_recovery row with ended_at "
+            "before DRY_RUN=false"
+        ),
+    }
+
+
+def _real_response_admission_failures(provider: Optional[ResponseProviderConfig]) -> List[Dict[str, Any]]:
+    failures = real_enforcement_env_failures(gate_value=_response_gate(), include_gate=True)
+    whitelist_issue = _real_response_business_whitelist_issue()
+    if whitelist_issue is not None:
+        failures.append(whitelist_issue)
+    provider_issue = _real_response_provider_available(provider, require_validated=True)
+    if provider_issue:
+        failures.append(
+            {
+                "code": provider_issue,
+                "name": "response_provider_configs",
+                "message": (
+                    "missing provider validation DB evidence: active iptables provider "
+                    "config must have last_validated_at and last_validation_result.ok=true"
+                    if provider_issue == "provider_validation_required"
+                    else "missing active supported provider config for real response"
+                ),
+            }
+        )
+    drill_issue = _real_response_recovery_drill_issue()
+    if drill_issue is not None:
+        failures.append(drill_issue)
+    return failures
+
+
+def _create_response_schedule(action: ResponseAction, approval: ResponseApproval) -> None:
+    if not action.scheduled_unblock_at:
+        return
+    payload = {
+        "tenant_id": _current_tenant_id(),
+        "ip": action.target,
+        "dry_run": action.dry_run,
+        "provider": approval.provider,
+        "provider_config_id": approval.provider_config_id,
+        "approval_id": approval.id,
+        "gate_id": approval.gate_id,
+    }
+    db.session.add(
+        ResponseScheduleTask(
+            tenant_id=_current_tenant_id(),
+            task_type="scheduled_unblock",
+            alert_id=action.alert_id,
+            payload=payload,
+            run_at=action.scheduled_unblock_at,
+            status="pending",
+            related_response_action_id=action.id,
+        )
+    )
+
+
 def _delete_banned_ip_persistent(ip: str) -> bool:
-    row = db.session.get(BannedIp, ip)
+    row = (
+        tenant_query(db.session.query(BannedIp), BannedIp)
+        .filter(BannedIp.ip == ip)
+        .one_or_none()
+    )
     if row is None:
         return False
     db.session.delete(row)
@@ -1142,6 +1811,7 @@ def _delete_banned_ip_persistent(ip: str) -> bool:
 def _rule_row_to_api_dict(row: Rule) -> Dict[str, Any]:
     return {
         "id": row.id,
+        "tenant_id": row.tenant_id,
         "name": row.name,
         "type": row.rule_type,
         "pattern": row.pattern,
@@ -1162,7 +1832,7 @@ def _list_rules_from_db(
     enabled: Optional[bool],
     q: Optional[str],
 ) -> List[Dict[str, Any]]:
-    query = db.session.query(Rule)
+    query = tenant_query(db.session.query(Rule), Rule)
     if type_:
         query = query.filter(Rule.rule_type == type_)
     if enabled is not None:
@@ -1178,14 +1848,8 @@ def _list_rules_from_db(
                 Rule.action.ilike(like),
             )
         )
-    rows = query.all()
+    rows = query.order_by(Rule.priority.asc(), Rule.updated_at.desc()).all()
     items = [_rule_row_to_api_dict(r) for r in rows]
-
-    def _ts_key(r: Dict[str, Any]) -> float:
-        ts = _parse_iso(r.get("updated_at"))
-        return -ts.timestamp() if ts else 0.0
-
-    items.sort(key=lambda r: (int(r.get("priority", 100)), _ts_key(r)))
     return items
 
 
@@ -1194,6 +1858,7 @@ def _insert_rule_from_normalized(norm: Dict[str, Any]) -> Rule:
     now = datetime.now(timezone.utc)
     row = Rule(
         id=rid,
+        tenant_id=_current_tenant_id(),
         name=norm["name"],
         rule_type=norm["type"],
         pattern=norm["pattern"],
@@ -1233,7 +1898,7 @@ def _apply_partial_to_rule_row(row: Rule, partial: Dict[str, Any]) -> None:
 
 
 def _incr_rule_hits_db(rule_id: str, delta: int = 1) -> None:
-    row = db.session.get(Rule, rule_id)
+    row = tenant_get(db.session, Rule, rule_id)
     if row:
         row.hits = int(row.hits or 0) + delta
         db.session.commit()
@@ -1243,7 +1908,10 @@ def _active_ioc_count() -> int:
     now = datetime.now(timezone.utc)
     return (
         db.session.query(func.count(IOC.id))
-        .filter((IOC.expires_at.is_(None)) | (IOC.expires_at > now))
+        .filter(
+            IOC.tenant_id == _current_tenant_id(),
+            (IOC.expires_at.is_(None)) | (IOC.expires_at > now),
+        )
         .scalar()
         or 0
     )
@@ -1251,38 +1919,50 @@ def _active_ioc_count() -> int:
 
 def _rules_enabled_count() -> int:
     return (
-        db.session.query(func.count(Rule.id)).filter(Rule.enabled.is_(True)).scalar() or 0
+        db.session.query(func.count(Rule.id))
+        .filter(Rule.tenant_id == _current_tenant_id(), Rule.enabled.is_(True))
+        .scalar()
+        or 0
     )
 
 
 def _rules_total_count() -> int:
-    return db.session.query(func.count(Rule.id)).scalar() or 0
+    return (
+        db.session.query(func.count(Rule.id))
+        .filter(Rule.tenant_id == _current_tenant_id())
+        .scalar()
+        or 0
+    )
 
 
 def _compute_security_score_db() -> int:
     """基于数据库告警分布的启发式安全分（与仪表盘一致）。"""
-    critical = (
-        db.session.query(func.count(Alert.id))
-        .filter(Alert.level == "critical")
-        .scalar()
-        or 0
+    critical = high = open_n = 0
+    rows = (
+        db.session.query(Alert.level, Alert.status, func.count(Alert.id))
+        .filter(Alert.tenant_id == _current_tenant_id())
+        .group_by(Alert.level, Alert.status)
+        .all()
     )
-    high = (
-        db.session.query(func.count(Alert.id)).filter(Alert.level == "high").scalar() or 0
-    )
-    open_n = (
-        db.session.query(func.count(Alert.id))
-        .filter(Alert.status == "open")
-        .scalar()
-        or 0
-    )
+    for level, status, count in rows:
+        n = int(count or 0)
+        if level == "critical":
+            critical += n
+        elif level == "high":
+            high += n
+        if status == "open":
+            open_n += n
     return max(0, min(100, 100 - min(60, critical * 8 + high * 3 + open_n * 2)))
 
 
 def _incr_ioc_hit_db(ioc_type: str, canon_value: str) -> None:
     row = (
         db.session.query(IOC)
-        .filter(IOC.ioc_type == ioc_type, IOC.value == canon_value)
+        .filter(
+            IOC.tenant_id == _current_tenant_id(),
+            IOC.ioc_type == ioc_type,
+            IOC.value == canon_value,
+        )
         .one_or_none()
     )
     if row:
@@ -1301,6 +1981,7 @@ _PAGE_WHITELIST: Dict[str, str] = {
     "rules": "rules.html",
     "reports": "reports.html",
     "command": "command.html",
+    "saas_admin": "saas_admin.html",
     "settings": "settings.html",
 }
 
@@ -1392,8 +2073,9 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                 401,
             )
 
-        role = _login_role(username)
-        claims = {"role": role}
+        requested_tenant_id = str(data.get("tenant_id") or "").strip()
+        tenant_id, role = _resolve_login_context(username, requested_tenant_id)
+        claims = {"role": role, "tenant_id": tenant_id}
         access_token = create_access_token(identity=username, additional_claims=claims)
         refresh_token = create_refresh_token(identity=username, additional_claims=claims)
         _record_audit_event(
@@ -1401,7 +2083,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             actor=username,
             resource_type="auth",
             resource_id=username,
-            payload={"role": role},
+            payload={"role": role, "tenant_id": tenant_id},
         )
         return (
             jsonify(
@@ -1411,6 +2093,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                     "token_type": "bearer",
                     "username": username,
                     "role": role,
+                    "tenant_id": tenant_id,
                 }
             ),
             200,
@@ -1421,12 +2104,23 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
     def auth_refresh():  # type: ignore[unused-function]
         identity = get_jwt_identity()
         role = _current_role()
+        tenant_id = _current_tenant_id()
+        _record_audit_event(
+            event_type="auth.refresh_success",
+            actor=str(identity or "operator"),
+            resource_type="auth",
+            resource_id=str(identity or ""),
+            payload={"role": role, "tenant_id": tenant_id},
+        )
         return (
             jsonify(
                 {
                     "access_token": create_access_token(
                         identity=identity,
-                        additional_claims={"role": role},
+                        additional_claims={
+                            "role": role,
+                            "tenant_id": tenant_id,
+                        },
                     )
                 }
             ),
@@ -1434,27 +2128,534 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/auth/me")
-    @jwt_required()
+    @_auth_required()
     def auth_me():  # type: ignore[unused-function]
-        return jsonify({"username": get_jwt_identity(), "role": _current_role()}), 200
+        return (
+            jsonify(
+                {
+                    "username": _current_actor(),
+                    "role": _current_role(),
+                    "tenant_id": _current_tenant_id(),
+                    "auth_method": _current_auth_method(),
+                }
+            ),
+            200,
+        )
+
+    # ---- SaaS 平台控制面 --------------------------------------------
+    @app.route("/api/admin/saas/tenants", methods=["GET", "POST"])
+    @_require_platform_admin()
+    def saas_tenants():  # type: ignore[unused-function]
+        if request.method == "GET":
+            status = str(request.args.get("status") or "").strip().lower()
+            q = str(request.args.get("q") or "").strip()
+            query = db.session.query(Tenant)
+            if status:
+                if status not in TENANT_STATUSES:
+                    return jsonify(_error_payload(code="bad_request", message="status 非法")), 400
+                query = query.filter(Tenant.status == status)
+            if q:
+                like = f"%{q}%"
+                query = query.filter(or_(Tenant.id.like(like), Tenant.name.like(like), Tenant.slug.like(like)))
+            rows = query.order_by(Tenant.created_at.desc()).all()
+            return jsonify({"items": [_tenant_admin_summary(row) for row in rows]}), 200
+
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("name") or "").strip()
+        slug = str(payload.get("slug") or "").strip().lower()
+        tenant_id = str(payload.get("id") or f"tenant_{uuid.uuid4().hex[:12]}").strip()
+        status = str(payload.get("status") or "active").strip().lower()
+        plan_code = str(payload.get("plan_code") or payload.get("plan") or "").strip()
+        if not name or not slug:
+            return jsonify(_error_payload(code="bad_request", message="name 与 slug 必填")), 400
+        if status not in TENANT_STATUSES:
+            return jsonify(_error_payload(code="bad_request", message="status 必须是 active、suspended、expired")), 400
+        row = Tenant(id=tenant_id[:64], name=name[:160], slug=slug[:80], status=status, plan=plan_code[:64] or None)
+        db.session.add(row)
+        db.session.flush()
+        db.session.add(
+            Organization(
+                id=f"org_{uuid.uuid4().hex[:12]}",
+                tenant_id=row.id,
+                name=f"{row.name} Organization",
+                slug="default",
+                status="active",
+            )
+        )
+        if plan_code:
+            plan = db.session.query(Plan).filter(Plan.code == plan_code).one_or_none()
+            if plan is None:
+                db.session.rollback()
+                return jsonify(_error_payload(code="bad_request", message="plan_code 不存在")), 400
+            db.session.add(
+                Subscription(
+                    id=f"sub_{uuid.uuid4().hex}",
+                    tenant_id=row.id,
+                    plan_id=plan.id,
+                    status="active",
+                )
+            )
+            sync_quota_rows(db.session, row.id)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify(_error_payload(code="conflict", message="租户 id 或 slug 已存在")), 409
+        _record_audit_event(
+            event_type="saas.tenant.created",
+            actor=_current_actor(),
+            resource_type="tenant",
+            resource_id=row.id,
+            payload={"name": row.name, "slug": row.slug, "status": row.status, "plan": row.plan},
+        )
+        return jsonify(_tenant_admin_detail(row)), 201
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>", methods=["GET", "PATCH"])
+    @_require_platform_admin()
+    def saas_tenant_detail(tenant_id: str):  # type: ignore[unused-function]
+        row = db.session.get(Tenant, tenant_id)
+        if row is None:
+            return jsonify(_error_payload(code="not_found", message="租户不存在")), 404
+        if request.method == "GET":
+            return jsonify(_tenant_admin_detail(row)), 200
+
+        payload = request.get_json(silent=True) or {}
+        changed: Dict[str, Any] = {}
+        for field, max_len in (("name", 160), ("slug", 80)):
+            if field in payload:
+                value = str(payload.get(field) or "").strip()
+                if not value:
+                    return jsonify(_error_payload(code="bad_request", message=f"{field} 不能为空")), 400
+                setattr(row, field, value[:max_len])
+                changed[field] = getattr(row, field)
+        if "status" in payload:
+            status = str(payload.get("status") or "").strip().lower()
+            if status not in TENANT_STATUSES:
+                return jsonify(_error_payload(code="bad_request", message="status 必须是 active、suspended、expired")), 400
+            row.status = status
+            changed["status"] = status
+        row.updated_at = datetime.now(timezone.utc)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify(_error_payload(code="conflict", message="租户 slug 已存在")), 409
+        _record_audit_event(
+            event_type="saas.tenant.updated",
+            actor=_current_actor(),
+            resource_type="tenant",
+            resource_id=row.id,
+            payload=changed,
+        )
+        return jsonify(_tenant_admin_detail(row)), 200
+
+    @app.route("/api/admin/saas/plans", methods=["GET", "POST"])
+    @_require_platform_admin()
+    def saas_plans():  # type: ignore[unused-function]
+        if request.method == "GET":
+            rows = db.session.query(Plan).order_by(Plan.created_at.asc()).all()
+            return jsonify({"items": [_plan_to_api_dict(row) for row in rows]}), 200
+        payload = request.get_json(silent=True) or {}
+        code = str(payload.get("code") or "").strip()
+        name = str(payload.get("name") or "").strip()
+        limits, err = _normalize_limits(payload.get("limits") or {})
+        status = str(payload.get("status") or "active").strip().lower()
+        if not code or not name:
+            return jsonify(_error_payload(code="bad_request", message="code 与 name 必填")), 400
+        if err:
+            return jsonify(_error_payload(code="bad_request", message=err)), 400
+        if status not in ("active", "disabled"):
+            return jsonify(_error_payload(code="bad_request", message="status 必须是 active 或 disabled")), 400
+        row = Plan(id=f"plan_{uuid.uuid4().hex}", code=code[:64], name=name[:160], status=status, limits=limits)
+        db.session.add(row)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify(_error_payload(code="conflict", message="套餐 code 已存在")), 409
+        _record_audit_event(
+            event_type="saas.plan.created",
+            actor=_current_actor(),
+            resource_type="plan",
+            resource_id=row.id,
+            payload={"code": row.code, "limits": limits},
+        )
+        return jsonify(_plan_to_api_dict(row)), 201
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>/subscription", methods=["PUT"])
+    @_require_platform_admin()
+    def saas_bind_subscription(tenant_id: str):  # type: ignore[unused-function]
+        tenant = db.session.get(Tenant, tenant_id)
+        if tenant is None:
+            return jsonify(_error_payload(code="not_found", message="租户不存在")), 404
+        payload = request.get_json(silent=True) or {}
+        plan_id = str(payload.get("plan_id") or "").strip()
+        plan_code = str(payload.get("plan_code") or "").strip()
+        license_key_id = str(payload.get("license_key_id") or "").strip() or None
+        status = str(payload.get("status") or "active").strip().lower()
+        if status not in ("active", "disabled", "expired"):
+            return jsonify(_error_payload(code="bad_request", message="订阅 status 非法")), 400
+        plan = None
+        if plan_id:
+            plan = db.session.get(Plan, plan_id)
+        elif plan_code:
+            plan = db.session.query(Plan).filter(Plan.code == plan_code).one_or_none()
+        if plan is None and not license_key_id:
+            return jsonify(_error_payload(code="bad_request", message="plan_id/plan_code 或 license_key_id 必填")), 400
+        # tenant-scan: allow platform admin binds a tenant-scoped license after route tenant check.
+        if license_key_id and db.session.get(LicenseKey, license_key_id) is None:
+            return jsonify(_error_payload(code="bad_request", message="license_key_id 不存在")), 400
+        now = datetime.now(timezone.utc)
+        db.session.query(Subscription).filter(
+            Subscription.tenant_id == tenant_id,
+            Subscription.status == "active",
+        ).update({"status": "disabled", "updated_at": now})
+        sub = Subscription(
+            id=f"sub_{uuid.uuid4().hex}",
+            tenant_id=tenant_id,
+            plan_id=plan.id if plan is not None else None,
+            license_key_id=license_key_id,
+            status=status,
+            ends_at=_aware_utc(_parse_iso(str(payload.get("ends_at") or "").strip())),
+        )
+        tenant.plan = plan.code if plan is not None else tenant.plan
+        tenant.updated_at = now
+        db.session.add(sub)
+        sync_quota_rows(db.session, tenant_id)
+        db.session.commit()
+        _record_audit_event(
+            event_type="saas.subscription.bound",
+            actor=_current_actor(),
+            resource_type="subscription",
+            resource_id=sub.id,
+            payload={"tenant_id": tenant_id, "plan_id": sub.plan_id, "license_key_id": sub.license_key_id, "status": sub.status},
+        )
+        return jsonify(_subscription_to_api_dict(sub)), 200
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>/licenses", methods=["POST"])
+    @_require_platform_admin()
+    def saas_create_license(tenant_id: str):  # type: ignore[unused-function]
+        if db.session.get(Tenant, tenant_id) is None:
+            return jsonify(_error_payload(code="not_found", message="租户不存在")), 404
+        payload = request.get_json(silent=True) or {}
+        limits, err = _normalize_limits(payload.get("limits") or {})
+        if err:
+            return jsonify(_error_payload(code="bad_request", message=err)), 400
+        status = str(payload.get("status") or "active").strip().lower()
+        if status not in ("active", "disabled"):
+            return jsonify(_error_payload(code="bad_request", message="License status 必须是 active 或 disabled")), 400
+        secret = f"lic_{secrets.token_urlsafe(24)}"
+        row = LicenseKey(
+            id=f"lic_{uuid.uuid4().hex}",
+            tenant_id=tenant_id,
+            key_prefix=secret[:16],
+            key_hash=hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            status=status,
+            limits=limits or None,
+            issued_to=str(payload.get("issued_to") or "").strip()[:160] or None,
+            expires_at=_aware_utc(_parse_iso(str(payload.get("expires_at") or "").strip())),
+        )
+        db.session.add(row)
+        db.session.commit()
+        _record_audit_event(
+            event_type="saas.license.created",
+            actor=_current_actor(),
+            resource_type="license",
+            resource_id=row.id,
+            payload={"tenant_id": tenant_id, "status": row.status, "limits": limits},
+        )
+        data = _license_to_api_dict(row)
+        data["license_key"] = secret
+        return jsonify(data), 201
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>/licenses/<license_id>/status", methods=["PATCH"])
+    @_require_platform_admin()
+    def saas_update_license_status(tenant_id: str, license_id: str):  # type: ignore[unused-function]
+        # tenant-scan: allow followed immediately by row.tenant_id == route tenant_id check.
+        row = db.session.get(LicenseKey, license_id)
+        if row is None or row.tenant_id != tenant_id:
+            return jsonify(_error_payload(code="not_found", message="License 不存在")), 404
+        payload = request.get_json(silent=True) or {}
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in ("active", "disabled"):
+            return jsonify(_error_payload(code="bad_request", message="status 必须是 active 或 disabled")), 400
+        row.status = status
+        row.updated_at = datetime.now(timezone.utc)
+        sync_quota_rows(db.session, tenant_id)
+        db.session.commit()
+        _record_audit_event(
+            event_type="saas.license.status_updated",
+            actor=_current_actor(),
+            resource_type="license",
+            resource_id=row.id,
+            payload={"tenant_id": tenant_id, "status": status},
+        )
+        return jsonify(_license_to_api_dict(row)), 200
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>/licenses/<license_id>", methods=["PATCH"])
+    @_require_platform_admin()
+    def saas_update_license(tenant_id: str, license_id: str):  # type: ignore[unused-function]
+        # tenant-scan: allow followed immediately by row.tenant_id == route tenant_id check.
+        row = db.session.get(LicenseKey, license_id)
+        if row is None or row.tenant_id != tenant_id:
+            return jsonify(_error_payload(code="not_found", message="License 不存在")), 404
+        payload = request.get_json(silent=True) or {}
+        changed: Dict[str, Any] = {}
+        if "status" in payload:
+            status = str(payload.get("status") or "").strip().lower()
+            if status not in ("active", "disabled"):
+                return jsonify(_error_payload(code="bad_request", message="status 必须是 active 或 disabled")), 400
+            row.status = status
+            changed["status"] = status
+        if "expires_at" in payload:
+            raw_expires = str(payload.get("expires_at") or "").strip()
+            if raw_expires:
+                parsed = _parse_iso(raw_expires)
+                if parsed is None:
+                    return jsonify(_error_payload(code="bad_request", message="expires_at 必须是 ISO 时间")), 400
+                row.expires_at = _aware_utc(parsed)
+            else:
+                row.expires_at = None
+            changed["expires_at"] = _dt_iso(row.expires_at)
+        if "issued_to" in payload:
+            row.issued_to = str(payload.get("issued_to") or "").strip()[:160] or None
+            changed["issued_to"] = row.issued_to
+        if "limits" in payload:
+            limits, err = _normalize_limits(payload.get("limits") or {})
+            if err:
+                return jsonify(_error_payload(code="bad_request", message=err)), 400
+            row.limits = limits or None
+            changed["limits"] = limits
+        if not changed:
+            return jsonify(_error_payload(code="bad_request", message="没有可更新字段")), 400
+        row.updated_at = datetime.now(timezone.utc)
+        sync_quota_rows(db.session, tenant_id)
+        db.session.commit()
+        _record_audit_event(
+            event_type="saas.license.updated",
+            actor=_current_actor(),
+            resource_type="license",
+            resource_id=row.id,
+            payload={"tenant_id": tenant_id, **changed},
+        )
+        return jsonify(_license_to_api_dict(row)), 200
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>/usage", methods=["GET"])
+    @_require_platform_admin()
+    def saas_tenant_usage(tenant_id: str):  # type: ignore[unused-function]
+        if db.session.get(Tenant, tenant_id) is None:
+            return jsonify(_error_payload(code="not_found", message="租户不存在")), 404
+        sync_quota_rows(db.session, tenant_id)
+        db.session.commit()
+        metric = str(request.args.get("metric") or "").strip()
+        if metric and metric not in METERED_METRICS:
+            return jsonify(_error_payload(code="bad_request", message="未知配额指标")), 400
+        period = str(request.args.get("period") or "").strip()
+        if period and not re.fullmatch(r"\d{4}-\d{2}|current", period):
+            return jsonify(_error_payload(code="bad_request", message="period 必须是 YYYY-MM 或 current")), 400
+        metrics = [metric] if metric else sorted(METERED_METRICS)
+        items = [_quota_usage_to_api_dict(tenant_id, item) for item in metrics]
+        buckets = [_usage_bucket_to_api_dict(row) for row in usage_buckets(
+            db.session,
+            tenant_id,
+            metric=metric or None,
+            period=period or None,
+        )]
+        return jsonify(
+            {
+                "tenant_id": tenant_id,
+                "period": period or usage_period(),
+                "items": items,
+                "buckets": buckets,
+            }
+        ), 200
+
+    @app.route("/api/admin/saas/tenants/<tenant_id>/quotas/<metric>", methods=["PUT"])
+    @_require_platform_admin()
+    def saas_update_quota(tenant_id: str, metric: str):  # type: ignore[unused-function]
+        if db.session.get(Tenant, tenant_id) is None:
+            return jsonify(_error_payload(code="not_found", message="租户不存在")), 404
+        if metric not in METERED_METRICS:
+            return jsonify(_error_payload(code="bad_request", message="未知配额指标")), 400
+        payload = request.get_json(silent=True) or {}
+        raw_limit = payload.get("limit")
+        limit: Optional[int]
+        if raw_limit is None or raw_limit == "":
+            limit = None
+        else:
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                return jsonify(_error_payload(code="bad_request", message="limit 必须是整数或 null")), 400
+            if limit < 0:
+                return jsonify(_error_payload(code="bad_request", message="limit 不能为负数")), 400
+        row = (
+            db.session.query(Quota)
+            .filter(Quota.tenant_id == tenant_id, Quota.metric == metric)
+            .one_or_none()
+        )
+        if row is None:
+            row = Quota(tenant_id=tenant_id, metric=metric, limit=limit, source="manual")
+            db.session.add(row)
+        else:
+            row.limit = limit
+            row.source = "manual"
+            row.updated_at = datetime.now(timezone.utc)
+        thresholds = payload.get("warning_thresholds")
+        if thresholds is not None:
+            normalized_thresholds, threshold_err = _normalize_warning_thresholds_payload(thresholds)
+            if threshold_err:
+                return jsonify(_error_payload(code="bad_request", message=threshold_err)), 400
+            row.warning_thresholds = normalized_thresholds
+        policy = str(payload.get("overage_policy") or "").strip()
+        if policy:
+            if policy not in OVERAGE_POLICIES:
+                return jsonify(_error_payload(code="bad_request", message="未知超额策略")), 400
+            row.overage_policy = policy
+        db.session.commit()
+        _record_audit_event(
+            event_type="saas.quota.updated",
+            actor=_current_actor(),
+            resource_type="quota",
+            resource_id=f"{tenant_id}:{metric}",
+            payload={
+                "tenant_id": tenant_id,
+                "metric": metric,
+                "limit": limit,
+                "warning_thresholds": row.warning_thresholds,
+                "overage_policy": row.overage_policy,
+            },
+        )
+        return jsonify(_quota_usage_to_api_dict(tenant_id, metric)), 200
+
+    @app.route("/api/tenant/commercial/status", methods=["GET"])
+    @_require_role("admin")
+    def tenant_commercial_status():  # type: ignore[unused-function]
+        tenant = db.session.get(Tenant, _current_tenant_id())
+        if tenant is None:
+            return jsonify(_error_payload(code="not_found", message="租户不存在")), 404
+        sync_quota_rows(db.session, tenant.id)
+        db.session.commit()
+        return jsonify(_tenant_commercial_status(tenant)), 200
+
+    @app.route("/api/auth/api_keys", methods=["GET", "POST"])
+    @_require_role("admin")
+    def api_keys():  # type: ignore[unused-function]
+        if request.method == "GET":
+            rows = (
+                tenant_query(db.session.query(APIKey), APIKey)
+                .order_by(APIKey.created_at.desc())
+                .all()
+            )
+            return jsonify({"items": [_api_key_to_api_dict(row) for row in rows]}), 200
+
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("name") or "").strip()
+        role = str(payload.get("role") or "viewer").strip().lower()
+        expires_at = _aware_utc(_parse_iso(str(payload.get("expires_at") or "").strip()))
+        if not name:
+            return jsonify(_error_payload(code="bad_request", message="name 必填")), 400
+        if role not in RBAC_ROLES:
+            return jsonify({"error": f"role 必须是 {list(RBAC_ROLES)}"}), 400
+        if expires_at is None:
+            return jsonify(_error_payload(code="bad_request", message="expires_at 必填且必须为 ISO 时间")), 400
+        if expires_at <= datetime.now(timezone.utc):
+            return jsonify(_error_payload(code="bad_request", message="expires_at 必须是未来时间")), 400
+
+        try:
+            ensure_quota(db.session, _current_tenant_id(), METRIC_USERS, requested=0)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
+
+        secret = f"gk_{secrets.token_urlsafe(32)}"
+        row = APIKey(
+            id=uuid.uuid4().hex,
+            tenant_id=_current_tenant_id(),
+            name=name[:160],
+            key_prefix=secret[:16],
+            key_hash=_hash_api_key(secret),
+            role=role,
+            scopes=list(payload.get("scopes") or []),
+            status="active",
+            expires_at=expires_at,
+        )
+        db.session.add(row)
+        db.session.commit()
+        _record_audit_event(
+            event_type="api_key.created",
+            actor=_current_actor(),
+            resource_type="api_key",
+            resource_id=row.id,
+            payload={"name": row.name, "role": row.role, "expires_at": row.expires_at.isoformat()},
+        )
+        return jsonify(_api_key_to_api_dict(row, include_secret=secret)), 201
+
+    @app.route("/api/auth/api_keys/<key_id>/status", methods=["PATCH"])
+    @_require_role("admin")
+    def api_update_key_status(key_id: str):  # type: ignore[unused-function]
+        row = tenant_get(db.session, APIKey, key_id)
+        if not row:
+            return jsonify({"error": "API Key 不存在"}), 404
+        payload = request.get_json(silent=True) or {}
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in ("active", "disabled"):
+            return jsonify({"error": "status 必须是 active 或 disabled"}), 400
+        row.status = status
+        row.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
+        _record_audit_event(
+            event_type="api_key.status_updated",
+            actor=_current_actor(),
+            resource_type="api_key",
+            resource_id=row.id,
+            payload={"status": status},
+        )
+        return jsonify(_api_key_to_api_dict(row)), 200
 
     # ---- 态势统计 ----------------------------------------------------
     @app.route("/api/stats")
-    @jwt_required()
+    @_auth_required()
     def api_stats():  # type: ignore[unused-function]
-        state.stats["total_threats"] = (
-            db.session.query(func.count(Alert.id)).scalar() or 0
+        cache_key = _api_cache_key("stats")
+        cached = _api_cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached), 200
+
+        total_threats = 0
+        critical = high = open_n = 0
+        alert_rows = (
+            db.session.query(Alert.level, Alert.status, func.count(Alert.id))
+            .filter(Alert.tenant_id == _current_tenant_id())
+            .group_by(Alert.level, Alert.status)
+            .all()
         )
+        for level, status, count in alert_rows:
+            n = int(count or 0)
+            total_threats += n
+            if level == "critical":
+                critical += n
+            elif level == "high":
+                high += n
+            if status == "open":
+                open_n += n
+        state.stats["total_threats"] = total_threats
         state.stats["banned_ips"] = (
-            db.session.query(func.count(BannedIp.ip)).scalar() or 0
+            db.session.query(func.count(BannedIp.ip))
+            .filter(BannedIp.tenant_id == _current_tenant_id())
+            .scalar()
+            or 0
         )
-        state.stats["security_score"] = _compute_security_score_db()
+        state.stats["security_score"] = max(
+            0, min(100, 100 - min(60, critical * 8 + high * 3 + open_n * 2))
+        )
         state.stats["updated_at"] = _now_iso()
-        return jsonify(state.stats), 200
+        payload = dict(state.stats)
+        _api_cache_set(cache_key, payload)
+        return jsonify(payload), 200
 
     # ---- 告警列表 / 详情 / 状态流转 / 类型聚合 -----------------------
     @app.route("/api/alerts")
-    @jwt_required()
+    @_auth_required()
     def api_alerts():  # type: ignore[unused-function]
         limit = _safe_int(request.args.get("limit"), default=100, max_value=500)
         offset = _safe_int(request.args.get("offset"), default=0, max_value=10_000, allow_zero=True)
@@ -1510,16 +2711,31 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return resp, 200
 
     @app.route("/api/alerts/types")
-    @jwt_required()
+    @_auth_required()
     def api_alert_types():  # type: ignore[unused-function]
-        rows = db.session.query(Alert.threat_type).distinct().all()
-        types = sorted([str(r[0] or "unknown") for r in rows if r[0] is not None])
+        cache_key = _api_cache_key("alert_types")
+        cached = _api_cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached), 200
+
+        rows = (
+            db.session.query(Alert.threat_type)
+            .filter(
+                Alert.tenant_id == _current_tenant_id(),
+                Alert.threat_type.isnot(None),
+            )
+            .distinct()
+            .order_by(Alert.threat_type.asc())
+            .all()
+        )
+        types = [str(r[0] or "unknown") for r in rows]
+        _api_cache_set(cache_key, types)
         return jsonify(types), 200
 
     @app.route("/api/alerts/<alert_id>")
-    @jwt_required()
+    @_auth_required()
     def api_alert_detail(alert_id: str):  # type: ignore[unused-function]
-        alert = db.session.get(Alert, alert_id)
+        alert = tenant_get(db.session, Alert, alert_id)
         if not alert:
             return (
                 jsonify(
@@ -1533,7 +2749,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(_alert_to_api_dict(alert)), 200
 
     @app.route("/api/alerts/<alert_id>/status", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("analyst")
     def api_alert_update_status(alert_id: str):  # type: ignore[unused-function]
         payload = request.get_json(silent=True) or {}
@@ -1552,14 +2768,14 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         updated = _update_alert_status_in_db(
             alert_id=alert_id,
             new_status=new_status,
-            operator=str(get_jwt_identity() or "operator"),
+            operator=_current_actor(),
             note=note,
         )
         if not updated:
             return jsonify({"error": "告警不存在"}), 404
         _record_audit_event(
             event_type="alert.status_updated",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="alert",
             resource_id=alert_id,
             payload={"status": new_status, "note": note},
@@ -1580,7 +2796,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
     # ---- 仅调试用：生成演示告警 --------------------------------------
     @app.route("/api/alerts/_seed", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_alerts_seed():  # type: ignore[unused-function]
         """仅在 DEBUG 或 ALLOW_DEV_SEED=true 时启用，便于 UI review。
@@ -1606,9 +2822,14 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
     # ---- 指标：流量趋势 / 攻击类型分布 / Top10 攻击来源 --------------
     @app.route("/api/metrics/traffic")
-    @jwt_required()
+    @_auth_required()
     def api_metrics_traffic():  # type: ignore[unused-function]
         range_key = (request.args.get("range") or "24h").strip().lower()
+        cache_key = _api_cache_key("traffic", range_key)
+        cached = _api_cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached), 200
+
         window_map: Dict[str, Tuple[timedelta, int, str]] = {
             "24h": (timedelta(hours=24), 60, "hour"),
             "7d": (timedelta(days=7), 60 * 24, "day"),
@@ -1636,12 +2857,16 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             bucket_start = start + timedelta(minutes=bucket_size_min * idx)
             points.append({"start": bucket_start, "count": 0})
 
-        q = db.session.query(Alert).filter(
-            Alert.timestamp >= start.astimezone(timezone.utc),
-            Alert.timestamp <= now.astimezone(timezone.utc),
+        rows = (
+            db.session.query(Alert.timestamp)
+            .filter(
+                Alert.tenant_id == _current_tenant_id(),
+                Alert.timestamp >= start.astimezone(timezone.utc),
+                Alert.timestamp <= now.astimezone(timezone.utc),
+            )
+            .all()
         )
-        for row in q.all():
-            ts = row.timestamp
+        for (ts,) in rows:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             ts_local = ts.astimezone()
@@ -1658,23 +2883,21 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         else:
             xaxis = [p["start"].strftime("%m-%d") for p in points]
         series = [int(p["count"]) for p in points]
-        return (
-            jsonify(
-                {
-                    "range": range_key,
-                    "bucket": bucket_label,
-                    "xaxis": xaxis,
-                    "series": series,
-                }
-            ),
-            200,
-        )
+        payload = {
+            "range": range_key,
+            "bucket": bucket_label,
+            "xaxis": xaxis,
+            "series": series,
+        }
+        _api_cache_set(cache_key, payload)
+        return jsonify(payload), 200
 
     @app.route("/api/metrics/attack_types")
-    @jwt_required()
+    @_auth_required()
     def api_metrics_attack_types():  # type: ignore[unused-function]
         rows = (
             db.session.query(Alert.threat_type, func.count(Alert.id))
+            .filter(Alert.tenant_id == _current_tenant_id())
             .group_by(Alert.threat_type)
             .all()
         )
@@ -1685,11 +2908,11 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/metrics/top_attackers")
-    @jwt_required()
+    @_auth_required()
     def api_metrics_top_attackers():  # type: ignore[unused-function]
         rows = (
             db.session.query(Alert.source_ip, func.count(Alert.id))
-            .filter(Alert.source_ip != "")
+            .filter(Alert.tenant_id == _current_tenant_id(), Alert.source_ip != "")
             .group_by(Alert.source_ip)
             .order_by(func.count(Alert.id).desc())
             .limit(10)
@@ -1699,10 +2922,14 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
     # ---- 封禁 IP 管理 ------------------------------------------------
     @app.route("/api/banned_ips", methods=["GET", "POST"])
-    @jwt_required()
+    @_auth_required()
     def api_banned_ips():  # type: ignore[unused-function]
         if request.method == "GET":
-            rows = db.session.query(BannedIp).order_by(BannedIp.created_at.desc()).all()
+            rows = (
+                tenant_query(db.session.query(BannedIp), BannedIp)
+                .order_by(BannedIp.created_at.desc())
+                .all()
+            )
             return (
                 jsonify(
                     [
@@ -1726,12 +2953,12 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         approval_id = _record_ban_approval_request(
             ip,
             reason,
-            operator=str(get_jwt_identity() or "operator"),
+            operator=_current_actor(),
             source="api_banned_ips",
         )
         _record_audit_event(
             event_type="response.ban_ip.pending_approval",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="response_action",
             resource_id=ip,
             payload={"reason": reason, "response_action_id": approval_id},
@@ -1740,6 +2967,8 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             jsonify(
                 {
                     "status": STATUS_PENDING_APPROVAL,
+                    "dry_run": True,
+                    "gate": _response_gate(),
                     "ip": ip,
                     "reason": reason,
                     "response_action_id": approval_id,
@@ -1749,49 +2978,713 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/banned_ips/<ip>", methods=["DELETE"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_banned_ip_delete(ip: str):  # type: ignore[unused-function]
         if not validate_ip(ip):
             return jsonify({"error": "无效的 IP 地址"}), 400
+        try:
+            ensure_quota(db.session, _current_tenant_id(), METRIC_RESPONSE_ACTIONS, requested=1)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
         removed = _delete_banned_ip_persistent(ip)
         if not removed:
             return jsonify({"error": "IP 不在封禁列表"}), 404
         db.session.add(
             ResponseAction(
+                tenant_id=_current_tenant_id(),
                 action_type="unban_ip",
                 target=ip,
                 status=STATUS_MANUAL_UNBLOCKED,
                 dry_run=True,
                 meta={
-                    "operator": str(get_jwt_identity() or "operator"),
+                    "operator": _current_actor(),
                     "trigger_source": "api_banned_ips",
                     "reason": "manual_unban",
                 },
             )
         )
+        record_usage(
+            db.session,
+            _current_tenant_id(),
+            METRIC_RESPONSE_ACTIONS,
+            actor=_current_actor(),
+            resource_type="response_action",
+            resource_id=ip,
+        )
         db.session.commit()
         _sync_banned_cache_from_db(state)
         _record_audit_event(
             event_type="banned_ip.deleted",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="banned_ip",
             resource_id=ip,
         )
         return jsonify({"status": "ok", "ip": ip}), 200
 
+    # ---- Phase C6: 真实响应受控开放 API -------------------------------
+    @app.route("/api/response/actions", methods=["GET", "POST"])
+    @_auth_required()
+    def api_response_actions():  # type: ignore[unused-function]
+        if request.method == "GET":
+            limit = _safe_int(request.args.get("limit"), 50, 200)
+            offset = _safe_int(request.args.get("offset"), 0, 100000, allow_zero=True)
+            status = str(request.args.get("status") or "").strip()
+            query = db.session.query(ResponseAction).filter(
+                ResponseAction.tenant_id == _current_tenant_id()
+            )
+            if status:
+                query = query.filter(ResponseAction.status == status)
+            total = query.count()
+            rows = (
+                query.order_by(ResponseAction.created_at.desc(), ResponseAction.id.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            return (
+                jsonify(
+                    {
+                        "items": [_response_action_to_api_dict(r) for r in rows],
+                        "total": total,
+                        "limit": limit,
+                        "offset": offset,
+                        "dry_run": _response_dry_run(),
+                        "gate": _response_gate(),
+                    }
+                ),
+                200,
+            )
+
+        if RBAC_ROLE_LEVEL.get(_current_role(), -1) < RBAC_ROLE_LEVEL["admin"]:
+            return jsonify(_error_payload(code="forbidden", message="需要 admin 或更高角色")), 403
+
+        data = request.get_json(silent=True) or {}
+        action_type = str(data.get("action_type") or "ban_ip").strip()
+        target_type = str(data.get("target_type") or "ip").strip()
+        target = str(data.get("target") or data.get("ip") or "").strip()
+        reason = str(data.get("reason") or "approval_required").strip()[:2000]
+        ttl_seconds = int(data.get("ttl_seconds") or 3600)
+        provider_config_id = data.get("provider_config_id")
+        if action_type not in _REAL_RESPONSE_ACTION_TYPES:
+            return jsonify(_response_runtime_payload(status="rejected", reason="invalid_action_type")), 400
+        if target_type not in _REAL_RESPONSE_TARGET_TYPES:
+            return jsonify(_response_runtime_payload(status="rejected", reason="invalid_target_type")), 400
+        target_error = _validate_response_target(target_type, target)
+        if target_error:
+            return jsonify(_response_runtime_payload(status="rejected", reason=target_error)), 400
+        if ttl_seconds <= 0:
+            return jsonify(_response_runtime_payload(status="rejected", reason="ttl_seconds_required")), 400
+
+        provider = None
+        if provider_config_id not in (None, ""):
+            provider = tenant_get(db.session, ResponseProviderConfig, int(provider_config_id))
+            if provider is None:
+                return jsonify(_response_runtime_payload(status="rejected", reason="provider_not_found")), 404
+
+        try:
+            ensure_quota(db.session, _current_tenant_id(), METRIC_RESPONSE_ACTIONS, requested=1)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
+
+        now = datetime.now(timezone.utc)
+        scheduled_unblock_at = now + timedelta(seconds=ttl_seconds)
+        action = ResponseAction(
+            tenant_id=_current_tenant_id(),
+            alert_id=(str(data.get("alert_id")).strip() if data.get("alert_id") else None),
+            action_type=action_type,
+            target=target,
+            status=STATUS_PENDING_APPROVAL,
+            dry_run=True,
+            scheduled_unblock_at=scheduled_unblock_at,
+            meta={
+                "reason": reason,
+                "operator": _current_actor(),
+                "trigger_source": "api_response_actions",
+                "approved": False,
+                "gate": _response_gate(),
+                "ttl_seconds": ttl_seconds,
+                "provider": provider.provider_type if provider else data.get("provider"),
+                "provider_config_id": provider.id if provider else None,
+                "rollback_plan": data.get("rollback_plan") or {},
+                "evidence": data.get("evidence") or {},
+            },
+        )
+        db.session.add(action)
+        db.session.flush()
+        approval = ResponseApproval(
+            tenant_id=_current_tenant_id(),
+            alert_id=action.alert_id,
+            response_action_id=action.id,
+            provider_config_id=provider.id if provider else None,
+            gate_id=_response_gate() or None,
+            action_type=action_type,
+            target_type=target_type,
+            target=target,
+            provider=provider.provider_type if provider else str(data.get("provider") or "iptables"),
+            ttl_seconds=ttl_seconds,
+            status="pending",
+            reason=reason,
+            requested_by=_current_actor(),
+            expires_at=scheduled_unblock_at,
+            evidence=data.get("evidence") or {},
+            rollback_plan=data.get("rollback_plan") or {},
+        )
+        db.session.add(approval)
+        db.session.flush()
+        meta = dict(action.meta or {})
+        meta["approval_id"] = approval.id
+        action.meta = meta
+        _append_response_action_event(
+            action,
+            status=STATUS_PENDING_APPROVAL,
+            reason=reason,
+            actor=_current_actor(),
+            extra={"approval_id": approval.id},
+        )
+        record_usage(
+            db.session,
+            _current_tenant_id(),
+            METRIC_RESPONSE_ACTIONS,
+            actor=_current_actor(),
+            resource_type="response_action",
+            resource_id=str(action.id),
+        )
+        db.session.commit()
+        return (
+            jsonify(
+                _response_runtime_payload(
+                    status=STATUS_PENDING_APPROVAL,
+                    reason=reason,
+                    response_action_id=action.id,
+                    approval_id=approval.id,
+                    extra={
+                        "action": _response_action_to_api_dict(action),
+                        "approval": _response_approval_to_api_dict(approval),
+                    },
+                )
+            ),
+            202,
+        )
+
+    @app.route("/api/response/actions/<int:action_id>", methods=["GET"])
+    @_auth_required()
+    def api_response_action_detail(action_id: int):  # type: ignore[unused-function]
+        action = tenant_get(db.session, ResponseAction, action_id)
+        if action is None:
+            return jsonify(_error_payload(code="not_found", message="response action not found")), 404
+        approval = (
+            db.session.query(ResponseApproval)
+            .filter(
+                ResponseApproval.tenant_id == _current_tenant_id(),
+                ResponseApproval.response_action_id == action.id,
+            )
+            .order_by(ResponseApproval.id.desc())
+            .first()
+        )
+        return (
+            jsonify(
+                {
+                    "action": _response_action_to_api_dict(action),
+                    "approval": _response_approval_to_api_dict(approval) if approval else None,
+                    "dry_run": _response_dry_run(),
+                    "gate": _response_gate(),
+                }
+            ),
+            200,
+        )
+
+    def _load_response_action_pair(action_id: int) -> Tuple[Optional[ResponseAction], Optional[ResponseApproval], Optional[Any]]:
+        action = tenant_get(db.session, ResponseAction, action_id)
+        if action is None:
+            return None, None, (jsonify(_error_payload(code="not_found", message="response action not found")), 404)
+        approval = (
+            db.session.query(ResponseApproval)
+            .filter(
+                ResponseApproval.tenant_id == _current_tenant_id(),
+                ResponseApproval.response_action_id == action.id,
+            )
+            .order_by(ResponseApproval.id.desc())
+            .first()
+        )
+        if approval is None:
+            return action, None, (jsonify(_response_runtime_payload(status="rejected", reason="approval_required", response_action_id=action.id)), 409)
+        return action, approval, None
+
+    @app.route("/api/response/actions/<int:action_id>/approve", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_action_approve(action_id: int):  # type: ignore[unused-function]
+        action, approval, error = _load_response_action_pair(action_id)
+        if error:
+            return error
+        assert action is not None and approval is not None
+        if approval.status != "pending":
+            return jsonify(_response_runtime_payload(status="rejected", reason="approval_not_pending", response_action_id=action.id, approval_id=approval.id)), 409
+        data = request.get_json(silent=True) or {}
+        reason = _required_body_text(data, "reason")
+        if not reason:
+            return jsonify(_response_runtime_payload(status="rejected", reason="approval_reason_required", response_action_id=action.id, approval_id=approval.id)), 400
+        approval.status = "approved"
+        approval.approved_by = _current_actor()
+        approval.approved_at = datetime.now(timezone.utc)
+        approval.gate_id = _response_gate() or approval.gate_id
+        action.dry_run = _response_dry_run()
+        _append_response_action_event(
+            action,
+            status=STATUS_APPROVED,
+            reason=reason,
+            actor=_current_actor(),
+            extra={
+                "approval_id": approval.id,
+                "gate": approval.gate_id,
+                "approval_only": True,
+            },
+        )
+        db.session.commit()
+        return jsonify(_response_runtime_payload(status=STATUS_APPROVED, reason=reason, response_action_id=action.id, approval_id=approval.id)), 200
+
+    @app.route("/api/response/actions/<int:action_id>/reject", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_action_reject(action_id: int):  # type: ignore[unused-function]
+        action, approval, error = _load_response_action_pair(action_id)
+        if error:
+            return error
+        assert action is not None and approval is not None
+        data = request.get_json(silent=True) or {}
+        reason = str(data.get("reason") or "rejected_by_admin").strip()[:2000]
+        approval.status = "rejected"
+        approval.rejected_by = _current_actor()
+        approval.rejected_at = datetime.now(timezone.utc)
+        approval.rejection_reason = reason
+        _append_response_action_event(
+            action,
+            status="rejected",
+            reason=reason,
+            actor=_current_actor(),
+            extra={"approval_id": approval.id},
+        )
+        db.session.commit()
+        return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id)), 200
+
+    @app.route("/api/response/actions/<int:action_id>/execute", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_action_execute(action_id: int):  # type: ignore[unused-function]
+        action, approval, error = _load_response_action_pair(action_id)
+        if error:
+            return error
+        assert action is not None and approval is not None
+        dry_run = _response_dry_run()
+        gate = _response_gate()
+        data = request.get_json(silent=True) or {}
+        execution_reason = _required_body_text(data, "reason")
+        if not execution_reason:
+            return jsonify(_response_runtime_payload(status="rejected", reason="execution_reason_required", response_action_id=action.id, approval_id=approval.id)), 400
+
+        if approval.status != "approved":
+            reason = "approval_not_approved"
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id)), 409
+        if action.action_type not in {"ban_ip", "cloud_security_group_block"}:
+            reason = "execute_action_not_supported"
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id)), 409
+        if not action.scheduled_unblock_at:
+            reason = "scheduled_unblock_at_required"
+            _append_response_action_event(action, status="rejected", reason=reason, actor=_current_actor(), extra={"approval_id": approval.id}, commit=True)
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id)), 409
+
+        whitelist = _response_whitelist_match(approval.target_type, approval.target)
+        if whitelist is not None:
+            reason = "whitelist_matched"
+            _append_response_action_event(
+                action,
+                status="skipped",
+                reason=reason,
+                actor=_current_actor(),
+                extra={"approval_id": approval.id, "whitelist_id": whitelist.id},
+                commit=True,
+            )
+            return jsonify(_response_runtime_payload(status="skipped", reason=reason, response_action_id=action.id, approval_id=approval.id, extra={"whitelist_id": whitelist.id})), 409
+
+        if dry_run:
+            action.dry_run = True
+            approval.status = "executed"
+            approval.executed_by = _current_actor()
+            approval.executed_at = datetime.now(timezone.utc)
+            _append_response_action_event(
+                action,
+                status="dry_run_simulated",
+                reason=execution_reason,
+                actor=_current_actor(),
+                extra={
+                    "approval_id": approval.id,
+                    "provider_called": False,
+                    "dry_run_only": True,
+                    "execution_reason": execution_reason,
+                },
+            )
+            _create_response_schedule(action, approval)
+            db.session.commit()
+            return jsonify(_response_runtime_payload(status="dry_run_simulated", reason=execution_reason, response_action_id=action.id, approval_id=approval.id, extra={"provider_called": False})), 200
+
+        if gate != _REAL_RESPONSE_GATE_VALUE:
+            reason = "real_enforcement_gate_required"
+            failures = real_enforcement_env_failures(gate_value=gate, include_gate=True)
+            _append_response_action_event(
+                action,
+                status="rejected",
+                reason=reason,
+                actor=_current_actor(),
+                extra={"approval_id": approval.id, "missing_prerequisites": failures},
+                commit=True,
+            )
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id, extra={"missing_prerequisites": failures})), 403
+        if approval.gate_id != _REAL_RESPONSE_GATE_VALUE:
+            reason = "approval_gate_mismatch"
+            _append_response_action_event(action, status="rejected", reason=reason, actor=_current_actor(), extra={"approval_id": approval.id, "approval_gate": approval.gate_id}, commit=True)
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id)), 409
+        if approval.target_type != "ip" or not validate_ip(approval.target):
+            reason = "valid_ip_target_required"
+            _append_response_action_event(action, status="rejected", reason=reason, actor=_current_actor(), extra={"approval_id": approval.id}, commit=True)
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id)), 400
+
+        from src.response.firewall import approved_response_execution, firewall_manager_from_env
+        from src.response.ip_policy import check_real_ban_eligibility
+
+        eligibility = check_real_ban_eligibility(approval.target)
+        if not eligibility.allowed:
+            reason = eligibility.rejection_reason
+            _append_response_action_event(action, status="skipped", reason=reason, actor=_current_actor(), extra={"approval_id": approval.id}, commit=True)
+            return jsonify(_response_runtime_payload(status="skipped", reason=reason, response_action_id=action.id, approval_id=approval.id)), 409
+
+        provider = tenant_get(db.session, ResponseProviderConfig, approval.provider_config_id) if approval.provider_config_id else None
+        admission_failures = _real_response_admission_failures(provider)
+        if admission_failures:
+            reason = first_failure_code(
+                admission_failures,
+                "real_enforcement_admission_required",
+            )
+            _append_response_action_event(
+                action,
+                status="rejected",
+                reason=reason,
+                actor=_current_actor(),
+                extra={"approval_id": approval.id, "missing_prerequisites": admission_failures},
+                commit=True,
+            )
+            return jsonify(_response_runtime_payload(status="rejected", reason=reason, response_action_id=action.id, approval_id=approval.id, extra={"missing_prerequisites": admission_failures})), 409
+
+        action.dry_run = False
+        approval.status = "executing"
+        _append_response_action_event(action, status="executing", reason=execution_reason, actor=_current_actor(), extra={"approval_id": approval.id, "provider_config_id": provider.id})
+        db.session.flush()
+        with approved_response_execution():
+            result = firewall_manager_from_env().ban_input_drop(approval.target, dry_run=False)
+        final_status = STATUS_EXECUTED if result.ok else "failed"
+        final_reason = execution_reason if result.ok else result.message
+        approval.status = "executed" if result.ok else "failed"
+        approval.executed_by = _current_actor()
+        approval.executed_at = datetime.now(timezone.utc)
+        _append_response_action_event(
+            action,
+            status=final_status,
+            reason=final_reason,
+            actor=_current_actor(),
+            extra={
+                "approval_id": approval.id,
+                "provider_config_id": provider.id,
+                "execution_reason": execution_reason,
+                "executed_by": _current_actor(),
+                "provider_result": {
+                    "ok": result.ok,
+                    "message": result.message,
+                    "command": result.command,
+                },
+            },
+        )
+        if result.ok:
+            _persist_banned_ip(approval.target, action.meta.get("reason", approval.reason), operator=_current_actor())
+            _create_response_schedule(action, approval)
+        db.session.commit()
+        return jsonify(_response_runtime_payload(status=final_status, reason=final_reason, response_action_id=action.id, approval_id=approval.id)), (200 if result.ok else 502)
+
+    @app.route("/api/response/actions/<int:action_id>/rollback", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_action_rollback(action_id: int):  # type: ignore[unused-function]
+        action, approval, error = _load_response_action_pair(action_id)
+        if error:
+            return error
+        assert action is not None and approval is not None
+        if action.status not in {STATUS_EXECUTED, "dry_run_simulated", STATUS_REVIEWED}:
+            return jsonify(_response_runtime_payload(status="rejected", reason="rollback_requires_executed", response_action_id=action.id, approval_id=approval.id)), 409
+        data = request.get_json(silent=True) or {}
+        reason = _required_body_text(data, "reason")
+        if not reason:
+            return jsonify(_response_runtime_payload(status="rejected", reason="rollback_reason_required", response_action_id=action.id, approval_id=approval.id)), 400
+        dry_run = _response_dry_run() or action.status == "dry_run_simulated" or bool(action.dry_run)
+        provider_called = False
+        provider_result: Dict[str, Any] = {"ok": True, "message": "dry_run_no_provider_call"}
+        if not dry_run:
+            if _response_gate() != _REAL_RESPONSE_GATE_VALUE:
+                return jsonify(_response_runtime_payload(status="rejected", reason="real_enforcement_gate_required", response_action_id=action.id, approval_id=approval.id)), 403
+            provider = tenant_get(db.session, ResponseProviderConfig, approval.provider_config_id) if approval.provider_config_id else None
+            provider_error = _real_response_provider_available(provider)
+            if provider_error:
+                return jsonify(_response_runtime_payload(status="rejected", reason=provider_error, response_action_id=action.id, approval_id=approval.id)), 409
+            from src.response.firewall import approved_response_execution, firewall_manager_from_env
+
+            with approved_response_execution():
+                result = firewall_manager_from_env().unban_input_drop(str(action.target or ""), dry_run=False)
+            provider_called = True
+            provider_result = {"ok": result.ok, "message": result.message, "command": result.command}
+            if not result.ok:
+                _append_response_action_event(action, status="failed", reason=result.message, actor=_current_actor(), extra={"rollback": True, "provider_result": provider_result}, commit=True)
+                return jsonify(_response_runtime_payload(status="failed", reason=result.message, response_action_id=action.id, approval_id=approval.id, extra={"provider_called": provider_called})), 502
+        _delete_banned_ip_persistent(str(action.target or ""))
+        _append_response_action_event(
+            action,
+            status=STATUS_MANUAL_UNBLOCKED,
+            reason=f"rollback:{reason}",
+            actor=_current_actor(),
+            extra={"approval_id": approval.id, "provider_called": provider_called, "provider_result": provider_result},
+        )
+        db.session.commit()
+        return jsonify(_response_runtime_payload(status=STATUS_MANUAL_UNBLOCKED, reason=f"rollback:{reason}", response_action_id=action.id, approval_id=approval.id, extra={"provider_called": provider_called})), 200
+
+    @app.route("/api/response/actions/<int:action_id>/review", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_action_review(action_id: int):  # type: ignore[unused-function]
+        action, approval, error = _load_response_action_pair(action_id)
+        if error:
+            return error
+        assert action is not None and approval is not None
+        data = request.get_json(silent=True) or {}
+        reason = str(data.get("reason") or "post_execution_review").strip()[:2000]
+        if action.status not in {STATUS_EXECUTED, "dry_run_simulated", STATUS_MANUAL_UNBLOCKED, STATUS_SCHEDULED_UNBLOCKED}:
+            return jsonify(_response_runtime_payload(status="rejected", reason="review_requires_executed", response_action_id=action.id, approval_id=approval.id)), 409
+        approval.status = "reviewed"
+        approval.reviewed_by = _current_actor()
+        approval.reviewed_at = datetime.now(timezone.utc)
+        _append_response_action_event(
+            action,
+            status=STATUS_REVIEWED,
+            reason=reason,
+            actor=_current_actor(),
+            extra={"approval_id": approval.id, "review": data.get("review") or {}},
+        )
+        db.session.commit()
+        return jsonify(_response_runtime_payload(status=STATUS_REVIEWED, reason=reason, response_action_id=action.id, approval_id=approval.id)), 200
+
+    @app.route("/api/response/whitelists/check", methods=["POST"])
+    @_auth_required()
+    def api_response_whitelists_check():  # type: ignore[unused-function]
+        data = request.get_json(silent=True) or {}
+        target = str(data.get("target") or data.get("ip") or "").strip()
+        if not validate_ip(target):
+            return jsonify(_response_runtime_payload(status="rejected", reason="invalid_ip")), 400
+        return jsonify(_response_whitelist_check_payload(target)), 200
+
+    @app.route("/api/response/whitelist", methods=["GET", "POST"])
+    @app.route("/api/response/whitelists", methods=["GET", "POST"])
+    @app.route("/api/response/whitelist/<int:entry_id>", methods=["PUT", "PATCH", "DELETE"])
+    @app.route("/api/response/whitelists/<int:entry_id>", methods=["GET", "PUT", "PATCH", "DELETE"])
+    @_auth_required()
+    def api_response_whitelist(entry_id: Optional[int] = None):  # type: ignore[unused-function]
+        if request.method == "GET" and entry_id is None:
+            rows = (
+                db.session.query(ResponseWhitelistEntry)
+                .filter(ResponseWhitelistEntry.tenant_id == _current_tenant_id())
+                .order_by(ResponseWhitelistEntry.created_at.desc(), ResponseWhitelistEntry.id.desc())
+                .all()
+            )
+            return jsonify({"items": [_response_whitelist_to_api_dict(r) for r in rows], "dry_run": _response_dry_run(), "gate": _response_gate()}), 200
+        if request.method == "GET" and entry_id is not None:
+            row = tenant_get(db.session, ResponseWhitelistEntry, entry_id)
+            if row is None:
+                return jsonify(_error_payload(code="not_found", message="whitelist entry not found")), 404
+            return jsonify({"entry": _response_whitelist_to_api_dict(row), "dry_run": _response_dry_run(), "gate": _response_gate()}), 200
+        if RBAC_ROLE_LEVEL.get(_current_role(), -1) < RBAC_ROLE_LEVEL["admin"]:
+            return jsonify(_error_payload(code="forbidden", message="需要 admin 或更高角色")), 403
+        data = request.get_json(silent=True) or {}
+        if request.method == "POST":
+            value_type = str(data.get("value_type") or "ip").strip()
+            value = str(data.get("value") or "").strip()
+            scope = str(data.get("scope") or "business").strip()
+            status = str(data.get("status") or "active").strip()
+            if scope not in WHITELIST_SCOPES:
+                return jsonify(_response_runtime_payload(status="rejected", reason="invalid_scope")), 400
+            if status not in {"pending", "active", "disabled", "expired"}:
+                return jsonify(_response_runtime_payload(status="rejected", reason="invalid_status")), 400
+            if value_type not in {"ip", "cidr"}:
+                return jsonify(_response_runtime_payload(status="rejected", reason="invalid_value_type")), 400
+            normalized_value, err = _normalize_response_whitelist_value(value_type, value)
+            if err:
+                return jsonify(_response_runtime_payload(status="rejected", reason=err)), 400
+            try:
+                expires_at = _parse_whitelist_expires_at(data.get("expires_at"))
+            except ValueError as exc:
+                return jsonify(_response_runtime_payload(status="rejected", reason=str(exc))), 400
+            row = ResponseWhitelistEntry(
+                tenant_id=_current_tenant_id(),
+                scope=scope,
+                value_type=value_type,
+                value=normalized_value or value,
+                environment=str(data.get("environment") or "production").strip()[:64],
+                status=status,
+                reason=str(data.get("reason") or "protected_asset").strip()[:2000],
+                owner=(str(data.get("owner")).strip()[:128] if data.get("owner") else None),
+                created_by=str(data.get("created_by") or _current_actor()).strip()[:128],
+                approved_by=_current_actor() if status == "active" else None,
+                approved_at=datetime.now(timezone.utc) if status == "active" else None,
+                expires_at=expires_at,
+                evidence=data.get("evidence") or {},
+            )
+            db.session.add(row)
+            db.session.flush()
+            db.session.add(AuditEvent(tenant_id=_current_tenant_id(), event_type="response.whitelist.created", actor=_current_actor(), resource_type="response_whitelist", resource_id=str(row.id), payload=_response_whitelist_to_api_dict(row), ip_address=row.value if validate_ip(row.value) else None))
+            db.session.commit()
+            return jsonify({"status": row.status, "dry_run": _response_dry_run(), "gate": _response_gate(), "reason": row.reason, "response_action_id": None, "entry": _response_whitelist_to_api_dict(row)}), 201
+        row = tenant_get(db.session, ResponseWhitelistEntry, entry_id)
+        if row is None:
+            return jsonify(_error_payload(code="not_found", message="whitelist entry not found")), 404
+        if request.method == "DELETE":
+            row.status = "disabled"
+            db.session.add(AuditEvent(tenant_id=_current_tenant_id(), event_type="response.whitelist.disabled", actor=_current_actor(), resource_type="response_whitelist", resource_id=str(row.id), payload={"value": row.value}, ip_address=row.value if validate_ip(row.value) else None))
+            db.session.commit()
+            return jsonify({"status": "disabled", "dry_run": _response_dry_run(), "gate": _response_gate(), "reason": "whitelist_disabled", "response_action_id": None}), 200
+        old_payload = _response_whitelist_to_api_dict(row)
+        if "scope" in data and str(data.get("scope") or "").strip() not in WHITELIST_SCOPES:
+            return jsonify(_response_runtime_payload(status="rejected", reason="invalid_scope")), 400
+        if "status" in data and str(data.get("status") or "").strip() not in {"pending", "active", "disabled", "expired"}:
+            return jsonify(_response_runtime_payload(status="rejected", reason="invalid_status")), 400
+        if "value_type" in data or "value" in data:
+            value_type = str(data.get("value_type") or row.value_type).strip()
+            if value_type not in {"ip", "cidr"}:
+                return jsonify(_response_runtime_payload(status="rejected", reason="invalid_value_type")), 400
+            normalized_value, err = _normalize_response_whitelist_value(
+                value_type, str(data.get("value") if "value" in data else row.value)
+            )
+            if err:
+                return jsonify(_response_runtime_payload(status="rejected", reason=err)), 400
+            row.value_type = value_type
+            row.value = normalized_value or row.value
+        for key in ("scope", "status", "reason", "owner", "environment"):
+            if key in data:
+                setattr(row, key, str(data.get(key) or "").strip())
+        if "expires_at" in data:
+            try:
+                row.expires_at = _parse_whitelist_expires_at(data.get("expires_at"))
+            except ValueError as exc:
+                return jsonify(_response_runtime_payload(status="rejected", reason=str(exc))), 400
+        if "evidence" in data:
+            row.evidence = data.get("evidence") or {}
+        if row.status == "active" and not row.approved_by:
+            row.approved_by = _current_actor()
+            row.approved_at = datetime.now(timezone.utc)
+        db.session.add(AuditEvent(tenant_id=_current_tenant_id(), event_type="response.whitelist.updated", actor=_current_actor(), resource_type="response_whitelist", resource_id=str(row.id), payload={"before": old_payload, "after": _response_whitelist_to_api_dict(row)}, ip_address=row.value if validate_ip(row.value) else None))
+        db.session.commit()
+        return jsonify({"status": row.status, "dry_run": _response_dry_run(), "gate": _response_gate(), "reason": "whitelist_updated", "response_action_id": None, "entry": _response_whitelist_to_api_dict(row)}), 200
+
+    @app.route("/api/response/providers", methods=["GET"])
+    @_auth_required()
+    def api_response_providers():  # type: ignore[unused-function]
+        rows = (
+            db.session.query(ResponseProviderConfig)
+            .filter(ResponseProviderConfig.tenant_id == _current_tenant_id())
+            .order_by(ResponseProviderConfig.created_at.desc(), ResponseProviderConfig.id.desc())
+            .all()
+        )
+        return jsonify({"items": [_response_provider_to_api_dict(r) for r in rows], "dry_run": _response_dry_run(), "gate": _response_gate()}), 200
+
+    @app.route("/api/response/providers/<int:provider_id>/test", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_provider_test(provider_id: int):  # type: ignore[unused-function]
+        provider = tenant_get(db.session, ResponseProviderConfig, provider_id)
+        if provider is None:
+            return jsonify(_response_runtime_payload(status="rejected", reason="provider_not_found")), 404
+        reason = _real_response_provider_available(provider, require_validated=False)
+        result = {"ok": reason is None, "reason": reason or "provider_available"}
+        provider.last_validated_at = datetime.now(timezone.utc)
+        provider.last_validation_result = result
+        db.session.add(AuditEvent(tenant_id=_current_tenant_id(), event_type="response.provider.tested", actor=_current_actor(), resource_type="response_provider", resource_id=str(provider.id), payload=result))
+        db.session.commit()
+        return jsonify(_response_runtime_payload(status="ok" if result["ok"] else "rejected", reason=result["reason"], extra={"provider": _response_provider_to_api_dict(provider)})), (200 if result["ok"] else 409)
+
+    @app.route("/api/response/schedules", methods=["GET"])
+    @_auth_required()
+    def api_response_schedules():  # type: ignore[unused-function]
+        rows = (
+            db.session.query(ResponseScheduleTask)
+            .filter(ResponseScheduleTask.tenant_id == _current_tenant_id())
+            .order_by(ResponseScheduleTask.run_at.asc(), ResponseScheduleTask.id.asc())
+            .limit(200)
+            .all()
+        )
+        return jsonify({"items": [_response_schedule_to_api_dict(r) for r in rows], "dry_run": _response_dry_run(), "gate": _response_gate()}), 200
+
+    @app.route("/api/response/drills", methods=["POST"])
+    @_auth_required()
+    @_require_role("admin")
+    def api_response_drills():  # type: ignore[unused-function]
+        data = request.get_json(silent=True) or {}
+        target_type = str(data.get("target_type") or "ip").strip()
+        target = str(data.get("target") or "").strip()
+        err = _validate_response_target(target_type, target)
+        if err:
+            return jsonify(_response_runtime_payload(status="rejected", reason=err)), 400
+        drill_type = str(data.get("drill_type") or "dry_run_ban_unblock").strip()
+        status = str(data.get("status") or "planned").strip()
+        ended_at = _parse_iso(str(data.get("ended_at"))) if data.get("ended_at") else None
+        if (
+            status == "passed"
+            and drill_type in {"real_ban_unblock", "provider_rollback", "misblock_recovery"}
+            and ended_at is None
+        ):
+            return jsonify(_response_runtime_payload(status="rejected", reason="ended_at_required_for_passed_recovery_drill")), 400
+        row = ResponseDrill(
+            tenant_id=_current_tenant_id(),
+            provider_config_id=int(data["provider_config_id"]) if data.get("provider_config_id") else None,
+            response_action_id=int(data["response_action_id"]) if data.get("response_action_id") else None,
+            approval_id=int(data["approval_id"]) if data.get("approval_id") else None,
+            environment=str(data.get("environment") or "preprod").strip()[:64],
+            drill_type=drill_type,
+            target_type=target_type,
+            target=target,
+            status=status,
+            started_at=_parse_iso(str(data.get("started_at"))) if data.get("started_at") else None,
+            ended_at=ended_at,
+            rto_seconds=int(data["rto_seconds"]) if data.get("rto_seconds") is not None else None,
+            result=str(data.get("result")) if data.get("result") is not None else None,
+            participants=data.get("participants") or [],
+            evidence=data.get("evidence") or {},
+            created_by=_current_actor(),
+            approved_by=str(data.get("approved_by")).strip()[:128] if data.get("approved_by") else None,
+        )
+        db.session.add(row)
+        db.session.flush()
+        db.session.add(AuditEvent(tenant_id=_current_tenant_id(), event_type="response.drill.created", actor=_current_actor(), resource_type="response_drill", resource_id=str(row.id), payload=_response_drill_to_api_dict(row), ip_address=target if validate_ip(target) else None))
+        db.session.commit()
+        return jsonify({"status": row.status, "dry_run": _response_dry_run(), "gate": _response_gate(), "reason": "drill_created", "response_action_id": row.response_action_id, "drill": _response_drill_to_api_dict(row)}), 201
+
     # ---- 命令面板 ----------------------------------------------------
     @app.route("/api/command", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     @limiter.limit("30 per minute")
     def api_command():  # type: ignore[unused-function]
         data = request.get_json(silent=True) or {}
         raw = str(data.get("command", "")).strip()
-        result = _execute_safe_command(raw, state)
+        try:
+            result = _execute_safe_command(raw, state)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
         _record_audit_event(
             event_type="command.executed",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="command",
             resource_id=raw.split(" ", 1)[0] if raw else None,
             payload={"command": raw, "ok": bool(result.get("ok", True))},
@@ -1800,7 +3693,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
     # ---- 规则 CRUD + 测试 + seed -----------------------------------
     @app.route("/api/rules", methods=["GET", "POST"])
-    @jwt_required()
+    @_auth_required()
     def api_rules():  # type: ignore[unused-function]
         if request.method == "GET":
             type_ = request.args.get("type") or None
@@ -1816,7 +3709,15 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                     return jsonify({"error": "enabled 取值非法（true/false）"}), 400
             if type_ and type_ not in RULE_TYPES:
                 return jsonify({"error": f"type 必须是 {list(RULE_TYPES)}"}), 400
+            cache_key = _api_cache_key("rules", type_ or "", enabled if enabled is not None else "", q or "")
+            cached = _api_cache_get(cache_key)
+            if cached is not None:
+                resp = jsonify(cached)
+                resp.headers["X-Total-Count"] = str(len(cached))
+                resp.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+                return resp, 200
             items = _list_rules_from_db(type_=type_, enabled=enabled, q=q)
+            _api_cache_set(cache_key, items)
             resp = jsonify(items)
             resp.headers["X-Total-Count"] = str(len(items))
             resp.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
@@ -1831,10 +3732,24 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         normalized, err = _validate_rule_payload(payload)
         if err or not normalized:
             return jsonify({"error": err or "规则校验失败"}), 400
+        try:
+            ensure_quota(db.session, _current_tenant_id(), METRIC_RULES, requested=1)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
         row = _insert_rule_from_normalized(normalized)
+        _api_cache_invalidate("rules")
+        record_usage(
+            db.session,
+            _current_tenant_id(),
+            METRIC_RULES,
+            actor=_current_actor(),
+            resource_type="rule",
+            resource_id=row.id,
+        )
+        db.session.commit()
         _record_audit_event(
             event_type="rule.created",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="rule",
             resource_id=row.id,
             payload={"name": row.name, "type": row.rule_type},
@@ -1842,10 +3757,10 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(_rule_row_to_api_dict(row)), 201
 
     @app.route("/api/rules/<rule_id>", methods=["GET", "PUT", "DELETE"])
-    @jwt_required()
+    @_auth_required()
     def api_rule_detail(rule_id: str):  # type: ignore[unused-function]
         if request.method == "GET":
-            row = db.session.get(Rule, rule_id)
+            row = tenant_get(db.session, Rule, rule_id)
             if not row:
                 return jsonify({"error": "规则不存在"}), 404
             return jsonify(_rule_row_to_api_dict(row)), 200
@@ -1856,7 +3771,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                     jsonify(_error_payload(code="forbidden", message="需要 admin 或更高角色")),
                     403,
                 )
-            row = db.session.get(Rule, rule_id)
+            row = tenant_get(db.session, Rule, rule_id)
             if not row:
                 return jsonify({"error": "规则不存在"}), 404
             payload = request.get_json(silent=True) or {}
@@ -1874,9 +3789,10 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             _apply_partial_to_rule_row(row, normalized)
             db.session.commit()
             db.session.refresh(row)
+            _api_cache_invalidate("rules")
             _record_audit_event(
                 event_type="rule.updated",
-                actor=str(get_jwt_identity() or "operator"),
+                actor=_current_actor(),
                 resource_type="rule",
                 resource_id=rule_id,
                 payload={"updated_keys": list(normalized.keys())},
@@ -1889,24 +3805,34 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                 jsonify(_error_payload(code="forbidden", message="需要 admin 或更高角色")),
                 403,
             )
-        row = db.session.get(Rule, rule_id)
+        row = tenant_get(db.session, Rule, rule_id)
         if not row:
             return jsonify({"error": "规则不存在"}), 404
         db.session.delete(row)
+        record_usage(
+            db.session,
+            _current_tenant_id(),
+            METRIC_RULES,
+            delta=-1,
+            actor=_current_actor(),
+            resource_type="rule",
+            resource_id=rule_id,
+        )
         db.session.commit()
+        _api_cache_invalidate("rules")
         _record_audit_event(
             event_type="rule.deleted",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="rule",
             resource_id=rule_id,
         )
         return jsonify({"status": "ok", "id": rule_id}), 200
 
     @app.route("/api/rules/<rule_id>/toggle", methods=["PATCH"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_rule_toggle(rule_id: str):  # type: ignore[unused-function]
-        row = db.session.get(Rule, rule_id)
+        row = tenant_get(db.session, Rule, rule_id)
         if not row:
             return jsonify({"error": "规则不存在"}), 404
         payload = request.get_json(silent=True) or {}
@@ -1917,9 +3843,10 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         row.updated_at = datetime.now(timezone.utc)
         db.session.commit()
         db.session.refresh(row)
+        _api_cache_invalidate("rules")
         _record_audit_event(
             event_type="rule.toggled",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="rule",
             resource_id=rule_id,
             payload={"enabled": bool(row.enabled)},
@@ -1927,7 +3854,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(_rule_row_to_api_dict(row)), 200
 
     @app.route("/api/rules/test", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @limiter.limit("60 per minute")
     def api_rule_test():  # type: ignore[unused-function]
         """根据请求体校验规则命中。两种用法：
@@ -1943,7 +3870,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         rule_id = payload.get("rule_id")
         rule: Optional[Dict[str, Any]] = None
         if rule_id:
-            db_row = db.session.get(Rule, str(rule_id))
+            db_row = tenant_get(db.session, Rule, str(rule_id))
             if not db_row:
                 return jsonify({"error": "规则不存在"}), 404
             rule = _rule_row_to_api_dict(db_row)
@@ -1958,7 +3885,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
         result = _evaluate_rule(rule, sample)
         # 命中 且 规则来自已保存：累加 hits 以便表格能显示真实数据
-        if result.get("matched") and rule_id and db.session.get(Rule, str(rule_id)):
+        if result.get("matched") and rule_id:
             _incr_rule_hits_db(str(rule_id))
         # 附加一份结果快照，便于前端直接回显
         result["rule"] = {
@@ -1972,7 +3899,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(result), 200
 
     @app.route("/api/rules/_seed", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_rules_seed():  # type: ignore[unused-function]
         """DEBUG 或 ALLOW_DEV_SEED 下可用，便于 UI review。"""
@@ -1986,7 +3913,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify({"status": "ok", "created": created}), 201
 
     @app.route("/api/threat_intel", methods=["GET"])
-    @jwt_required()
+    @_auth_required()
     def api_threat_intel():  # type: ignore[unused-function]
         type_ = request.args.get("type") or None
         source = request.args.get("source") or None
@@ -2033,7 +3960,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return resp, 200
 
     @app.route("/api/threat_intel/providers", methods=["GET"])
-    @jwt_required()
+    @_auth_required()
     def api_threat_intel_providers():  # type: ignore[unused-function]
         ti: ThreatIntelCollector = app.extensions["guardian_threat_intel"]
         mock = _threat_intel_mock_enabled()
@@ -2076,7 +4003,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/threat_intel/iocs", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     @limiter.limit("60 per minute")
     def api_threat_intel_add_ioc():  # type: ignore[unused-function]
@@ -2089,7 +4016,14 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         from web.database import db
 
         ti: ThreatIntelCollector = app.extensions["guardian_threat_intel"]
-        row = IOCRepository(db.session).upsert_merge(
+        repo = IOCRepository(db.session)
+        existing = repo.find_active_dict(normalized["type"], normalized["value"])
+        if existing is None:
+            try:
+                ensure_quota(db.session, _current_tenant_id(), METRIC_IOCS, requested=1)
+            except QuotaExceededError as exc:
+                return quota_error_response(exc)
+        row = repo.upsert_merge(
             ioc_type=normalized["type"],
             value=normalized["value"],
             source=normalized.get("source", "manual"),
@@ -2099,11 +4033,20 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             note=normalized.get("note"),
             metadata=normalized.get("metadata"),
         )
+        if existing is None:
+            record_usage(
+                db.session,
+                _current_tenant_id(),
+                METRIC_IOCS,
+                actor=_current_actor(),
+                resource_type="ioc",
+                resource_id=f"{normalized['type']}:{normalized['value']}",
+            )
         db.session.commit()
         ti.add_ioc_to_blacklist(normalized["type"], normalized["value"])
         _record_audit_event(
             event_type="ioc.created",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="ioc",
             resource_id=f"{normalized['type']}:{normalized['value']}",
             payload={"source": normalized.get("source", "manual")},
@@ -2113,7 +4056,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
     @app.route(
         "/api/threat_intel/iocs/<ioc_type>/<path:value>", methods=["DELETE"]
     )
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_threat_intel_remove_ioc(ioc_type: str, value: str):  # type: ignore[unused-function]
         if ioc_type not in IOC_TYPES:
@@ -2135,6 +4078,16 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
         repo = IOCRepository(db.session)
         removed_db = repo.delete(ioc_type, canon)
+        if removed_db:
+            record_usage(
+                db.session,
+                _current_tenant_id(),
+                METRIC_IOCS,
+                delta=-1,
+                actor=_current_actor(),
+                resource_type="ioc",
+                resource_id=f"{ioc_type}:{canon}",
+            )
         db.session.commit()
         ti: ThreatIntelCollector = app.extensions["guardian_threat_intel"]
         if ioc_type == "ip":
@@ -2147,14 +4100,14 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             return jsonify({"error": "IOC 不存在"}), 404
         _record_audit_event(
             event_type="ioc.deleted",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="ioc",
             resource_id=f"{ioc_type}:{canon}",
         )
         return jsonify({"status": "ok", "type": ioc_type, "value": canon}), 200
 
     @app.route("/api/threat_intel/query", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @limiter.limit("30 per minute")
     def api_threat_intel_query():  # type: ignore[unused-function]
         payload = request.get_json(silent=True) or {}
@@ -2221,7 +4174,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/threat_intel/_seed", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_threat_intel_seed():  # type: ignore[unused-function]
         cfg = get_config()
@@ -2234,7 +4187,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify({"status": "ok", "created": created}), 201
 
     @app.route("/api/audit/events", methods=["GET"])
-    @jwt_required()
+    @_auth_required()
     @_require_role("admin")
     def api_audit_events():  # type: ignore[unused-function]
         limit = _safe_int(request.args.get("limit"), default=100, max_value=500)
@@ -2252,7 +4205,9 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         since = _parse_iso(request.args.get("since"))
         until = _parse_iso(request.args.get("until"))
 
-        query = db.session.query(AuditEvent)
+        query = db.session.query(AuditEvent).filter(
+            AuditEvent.tenant_id == _current_tenant_id()
+        )
         if event_type:
             query = query.filter(AuditEvent.event_type == event_type)
         if actor:
@@ -2288,7 +4243,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/reports", methods=["GET"])
-    @jwt_required()
+    @_auth_required()
     def api_reports():  # type: ignore[unused-function]
         """返回可选的报告周期列表。Phase 7 先列出固定 period。"""
         return (
@@ -2302,7 +4257,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         )
 
     @app.route("/api/reports/summary", methods=["GET"])
-    @jwt_required()
+    @_auth_required()
     def api_reports_summary():  # type: ignore[unused-function]
         period = request.args.get("period", "day").lower()
         if period not in REPORT_PERIODS:
@@ -2318,7 +4273,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(summary), 200
 
     @app.route("/api/reports/export", methods=["GET"])
-    @jwt_required()
+    @_auth_required()
     def api_reports_export():  # type: ignore[unused-function]
         """同 summary 数据源；``format=html`` 返回可打印/另存为 PDF 的 HTML。"""
         period = request.args.get("period", "day").lower()
@@ -2352,10 +4307,16 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(summary), 200
 
     @app.route("/api/settings", methods=["GET", "PUT"])
-    @jwt_required()
+    @_auth_required()
     def api_settings():  # type: ignore[unused-function]
         if request.method == "GET":
-            return jsonify(_build_settings_snapshot(app)), 200
+            cache_key = _api_cache_key("settings")
+            cached = _api_cache_get(cache_key)
+            if cached is not None:
+                return jsonify(cached), 200
+            snapshot = _build_settings_snapshot(app)
+            _api_cache_set(cache_key, snapshot)
+            return jsonify(snapshot), 200
 
         if RBAC_ROLE_LEVEL.get(_current_role(), -1) < RBAC_ROLE_LEVEL["admin"]:
             return (
@@ -2382,12 +4343,13 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
 
         state.update_settings(normalized)
         _persist_settings_to_db(normalized)
+        _api_cache_invalidate("settings")
         logger.info(
             "[Settings] 运行时配置更新: %s", list(normalized.keys())
         )
         _record_audit_event(
             event_type="settings.updated",
-            actor=str(get_jwt_identity() or "operator"),
+            actor=_current_actor(),
             resource_type="settings",
             payload={"updated_keys": list(normalized.keys())},
         )
@@ -2397,7 +4359,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         return jsonify(snapshot), 200
 
     @app.route("/api/settings/test_webhook", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @limiter.limit("5 per minute")
     def api_settings_test_webhook():  # type: ignore[unused-function]
         payload = request.get_json(silent=True) or {}
@@ -2405,6 +4367,10 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
         err = _validate_webhook_url(url)
         if err:
             return jsonify({"ok": False, "reason": err}), 400
+        try:
+            ensure_quota(db.session, _current_tenant_id(), METRIC_NOTIFICATIONS, requested=1)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
 
         import requests as _requests
 
@@ -2420,6 +4386,15 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
                 timeout=5,
                 headers={"User-Agent": "AI-Security-Guardian/Phase7"},
             )
+            record_usage(
+                db.session,
+                _current_tenant_id(),
+                METRIC_NOTIFICATIONS,
+                actor=_current_actor(),
+                resource_type="notification",
+                resource_id="webhook_test",
+            )
+            db.session.commit()
             return (
                 jsonify(
                     {
@@ -2446,7 +4421,7 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             )
 
     @app.route("/api/settings/test_email", methods=["POST"])
-    @jwt_required()
+    @_auth_required()
     @limiter.limit("5 per minute")
     def api_settings_test_email():  # type: ignore[unused-function]
         """Phase 7 阶段仅校验邮箱格式；Phase 8 接入 SMTP 后改为真实投递。"""
@@ -2458,6 +4433,19 @@ def _register_api_routes(app: Flask, limiter: Limiter, state: _ServerState) -> N
             return jsonify({"ok": False, "reason": "empty"}), 400
         if not _EMAIL_RE.match(email):
             return jsonify({"ok": False, "reason": "invalid_email_format"}), 400
+        try:
+            ensure_quota(db.session, _current_tenant_id(), METRIC_NOTIFICATIONS, requested=1)
+        except QuotaExceededError as exc:
+            return quota_error_response(exc)
+        record_usage(
+            db.session,
+            _current_tenant_id(),
+            METRIC_NOTIFICATIONS,
+            actor=_current_actor(),
+            resource_type="notification",
+            resource_id="email_test",
+        )
+        db.session.commit()
         return (
             jsonify(
                 {
@@ -2495,9 +4483,9 @@ def _execute_safe_command(raw: str, state: _ServerState) -> Dict[str, Any]:
     if action == "status":
         _sync_banned_cache_from_db(state)
         b_count = (
-            db.session.query(func.count(BannedIp.ip)).scalar() or 0
+            tenant_query(db.session.query(func.count(BannedIp.ip)), BannedIp).scalar() or 0
         )
-        t_count = db.session.query(func.count(Alert.id)).scalar() or 0
+        t_count = tenant_query(db.session.query(func.count(Alert.id)), Alert).scalar() or 0
         return {
             "ok": True,
             "command": raw,
@@ -2526,7 +4514,18 @@ def _execute_safe_command(raw: str, state: _ServerState) -> Dict[str, Any]:
             "response_action_id": approval_id,
         }
     if action == "unblock":
+        ensure_quota(db.session, _current_tenant_id(), METRIC_RESPONSE_ACTIONS, requested=1)
         removed = _delete_banned_ip_persistent(arg)
+        if removed:
+            record_usage(
+                db.session,
+                _current_tenant_id(),
+                METRIC_RESPONSE_ACTIONS,
+                actor="command_panel",
+                resource_type="response_action",
+                resource_id=arg,
+            )
+            db.session.commit()
         _sync_banned_cache_from_db(state)
         return {
             "ok": removed,
@@ -2632,6 +4631,9 @@ def push_alert(app: Flask, alert: Dict[str, Any]) -> Dict[str, Any]:
                 api_dict = None
             else:
                 api_dict = _alert_to_api_dict(row)
+    except QuotaExceededError as exc:
+        logger.warning("[Alert] 告警配额超限: %s", exc)
+        return {}
     except Exception:  # noqa: BLE001
         logger.exception("[Alert] 告警入库失败，跳过 Socket 广播")
         return {}
@@ -2719,6 +4721,643 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _api_cache_key(namespace: str, *parts: Any) -> str:
+    tenant = _current_tenant_id()
+    suffix = "|".join(str(p) for p in parts)
+    return f"{namespace}:{tenant}:{suffix}"
+
+
+def _api_cache_get(key: str) -> Optional[Any]:
+    cache = current_app.extensions.setdefault("guardian_core_api_cache", {})
+    item = cache.get(key)
+    if not item:
+        return None
+    expires_at, value = item
+    if expires_at <= time.monotonic():
+        cache.pop(key, None)
+        return None
+    return copy.deepcopy(value)
+
+
+def _api_cache_set(key: str, value: Any, *, ttl: float = 5.0) -> Any:
+    cache = current_app.extensions.setdefault("guardian_core_api_cache", {})
+    cache[key] = (time.monotonic() + ttl, copy.deepcopy(value))
+    return value
+
+
+def _api_cache_invalidate(namespace: str) -> None:
+    cache = current_app.extensions.setdefault("guardian_core_api_cache", {})
+    prefix = f"{namespace}:"
+    for key in [k for k in cache if k.startswith(prefix)]:
+        cache.pop(key, None)
+
+
+def _register_api_auth_gate(app: Flask) -> None:
+    """Authenticate all API calls through either JWT or tenant-bound API keys."""
+
+    exempt_paths = {"/api/health", "/api/auth/login", "/api/auth/refresh"}
+
+    @app.before_request
+    def _guardian_api_auth_gate():  # type: ignore[unused-function]
+        if request.method == "OPTIONS":
+            return None
+        if not request.path.startswith("/api/") or request.path in exempt_paths:
+            return None
+        return _authenticate_api_request()
+
+
+def _authenticate_api_request():
+    raw_key = _extract_api_key()
+    if raw_key:
+        ok, response = _authenticate_api_key(raw_key)
+        if not ok:
+            return response
+        return None
+
+    try:
+        verify_jwt_in_request()
+    except Exception:
+        raise
+
+    identity = str(get_jwt_identity() or "").strip()
+    claims = get_jwt() or {}
+    tenant_id = str(claims.get("tenant_id") or "").strip()
+    if not tenant_id:
+        _record_audit_event(
+            event_type="auth.jwt_failed",
+            actor=identity or "anonymous",
+            resource_type="auth",
+            resource_id=identity or None,
+            payload={"reason": "missing_tenant"},
+        )
+        return jsonify(_error_payload(code="forbidden", message="JWT 缺少租户上下文")), 403
+
+    role = _resolve_jwt_role(identity, tenant_id)
+    if role is None:
+        _record_audit_event(
+            event_type="auth.jwt_failed",
+            actor=identity or "anonymous",
+            resource_type="auth",
+            resource_id=identity or None,
+            payload={"reason": "tenant_membership_denied", "tenant_id": tenant_id},
+        )
+        return jsonify(_error_payload(code="forbidden", message="无权访问该租户")), 403
+
+    request.guardian_auth_method = "jwt"
+    request.guardian_actor = identity
+    request.guardian_tenant_id = tenant_id
+    request.guardian_role = role
+    if not _is_tenant_status_self_service_path():
+        denied = _tenant_access_denied_response(tenant_id)
+        if denied is not None:
+            return denied
+    if os.environ.get("AUTH_SUCCESS_AUDIT_ENABLED", "false").lower() == "true":
+        _record_audit_event(
+            event_type="auth.jwt_authenticated",
+            actor=identity,
+            resource_type="auth",
+            resource_id=identity,
+            payload={"role": role, "tenant_id": tenant_id, "path": request.path},
+        )
+    try:
+        _meter_api_call()
+    except QuotaExceededError as exc:
+        return quota_error_response(exc)
+    return None
+
+
+def _extract_api_key() -> str:
+    key = str(request.headers.get("X-API-Key") or "").strip()
+    if key:
+        return key
+    auth = str(request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("apikey "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
+
+
+def _authenticate_api_key(raw_key: str):
+    prefix = raw_key[:16]
+    # tenant-scan: allow API key prefix is globally unique; resolved row sets request tenant.
+    row = db.session.query(APIKey).filter(APIKey.key_prefix == prefix).one_or_none()
+    now = datetime.now(timezone.utc)
+    if row is None or not secrets.compare_digest(row.key_hash, _hash_api_key(raw_key)):
+        _record_audit_event(
+            event_type="auth.api_key_failed",
+            actor=f"api_key:{prefix or 'unknown'}",
+            resource_type="api_key",
+            resource_id=prefix or None,
+            payload={"reason": "not_found_or_mismatch"},
+        )
+        return False, (jsonify(_error_payload(code="auth_failed", message="API Key 无效")), 401)
+    if row.status != "active":
+        request.guardian_tenant_id = row.tenant_id
+        _record_audit_event(
+            event_type="auth.api_key_failed",
+            actor=f"api_key:{row.key_prefix}",
+            resource_type="api_key",
+            resource_id=row.id,
+            payload={"reason": "disabled", "tenant_id": row.tenant_id},
+        )
+        return False, (jsonify(_error_payload(code="auth_failed", message="API Key 已停用")), 401)
+    expires_at = _aware_utc(row.expires_at)
+    if expires_at is not None and expires_at <= now:
+        request.guardian_tenant_id = row.tenant_id
+        _record_audit_event(
+            event_type="auth.api_key_failed",
+            actor=f"api_key:{row.key_prefix}",
+            resource_type="api_key",
+            resource_id=row.id,
+            payload={"reason": "expired", "tenant_id": row.tenant_id},
+        )
+        return False, (jsonify(_error_payload(code="auth_failed", message="API Key 已过期")), 401)
+
+    request.guardian_auth_method = "api_key"
+    request.guardian_actor = f"api_key:{row.key_prefix}"
+    request.guardian_tenant_id = row.tenant_id
+    request.guardian_role = row.role if row.role in RBAC_ROLES else "viewer"
+    request.guardian_api_key_id = row.id
+    if not _is_tenant_status_self_service_path():
+        denied = _tenant_access_denied_response(row.tenant_id)
+        if denied is not None:
+            return False, denied
+    row.last_used_at = now
+    db.session.commit()
+    if os.environ.get("AUTH_SUCCESS_AUDIT_ENABLED", "false").lower() == "true":
+        _record_audit_event(
+            event_type="auth.api_key_authenticated",
+            actor=request.guardian_actor,
+            resource_type="api_key",
+            resource_id=row.id,
+            payload={"role": request.guardian_role, "tenant_id": row.tenant_id, "path": request.path},
+        )
+    try:
+        _meter_api_call()
+    except QuotaExceededError as exc:
+        return False, quota_error_response(exc)
+    return True, None
+
+
+def _meter_api_call() -> None:
+    tenant_id = _current_tenant_id()
+    operation = "read" if request.method in {"GET", "HEAD", "OPTIONS"} else "write"
+    if not _api_call_metering_sync_enabled():
+        _meter_api_call_buffered(tenant_id, operation)
+        return
+
+    used = _current_api_call_usage(tenant_id)
+    quota_cfg = _api_call_quota_config(tenant_id)
+    limit = quota_cfg.get("limit")
+    if limit is not None and used + 1 > int(limit):
+        ensure_quota(
+            db.session,
+            tenant_id,
+            METRIC_API_CALLS,
+            requested=1,
+            current=used,
+            operation=operation,
+            actor=_current_actor(),
+        )
+    _increment_api_call_usage_fast(tenant_id)
+    db.session.commit()
+
+
+def _api_call_metering_sync_enabled() -> bool:
+    raw = os.environ.get("API_CALL_METERING_SYNC")
+    if raw is not None:
+        return raw.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(current_app.config.get("TESTING", False))
+
+
+def _meter_api_call_buffered(tenant_id: str, operation: str) -> None:
+    buffered = _api_call_buffered_delta(tenant_id)
+    used = _current_api_call_usage(tenant_id) + buffered
+    quota_cfg = _api_call_quota_config(tenant_id)
+    limit = quota_cfg.get("limit")
+    overage_checked = False
+    if limit is not None and used + 1 > int(limit):
+        ensure_quota(
+            db.session,
+            tenant_id,
+            METRIC_API_CALLS,
+            requested=1,
+            current=used,
+            operation=operation,
+            actor=_current_actor(),
+        )
+        overage_checked = True
+
+    pending = _buffer_api_call_delta(tenant_id, 1)
+    if pending >= 100 or overage_checked:
+        _flush_api_call_usage_buffer(tenant_id)
+        db.session.commit()
+
+
+def _api_call_metering_lock() -> threading.Lock:
+    lock = current_app.extensions.get("guardian_api_call_metering_lock")
+    if lock is None:
+        lock = threading.Lock()
+        current_app.extensions["guardian_api_call_metering_lock"] = lock
+    return lock
+
+
+def _api_call_buffered_delta(tenant_id: str) -> int:
+    with _api_call_metering_lock():
+        buffer = current_app.extensions.setdefault("guardian_api_call_metering_buffer", {})
+        return int(buffer.get(tenant_id, 0) or 0)
+
+
+def _buffer_api_call_delta(tenant_id: str, delta: int) -> int:
+    with _api_call_metering_lock():
+        buffer = current_app.extensions.setdefault("guardian_api_call_metering_buffer", {})
+        pending = int(buffer.get(tenant_id, 0) or 0) + int(delta)
+        buffer[tenant_id] = pending
+        return pending
+
+
+def _flush_api_call_usage_buffer(tenant_id: str) -> None:
+    with _api_call_metering_lock():
+        buffer = current_app.extensions.setdefault("guardian_api_call_metering_buffer", {})
+        delta = int(buffer.pop(tenant_id, 0) or 0)
+    if delta > 0:
+        _increment_api_call_usage_fast(tenant_id, delta=delta)
+
+
+def _api_call_quota_config(tenant_id: str) -> Dict[str, Any]:
+    now = time.monotonic()
+    cache = current_app.extensions.setdefault("guardian_api_call_quota_cache", {})
+    cached = cache.get(tenant_id)
+    if cached and cached.get("expires_at", 0.0) > now:
+        return cached["value"]
+    snapshot = quota_snapshot(db.session, tenant_id, METRIC_API_CALLS, used=0)
+    value = {
+        "limit": snapshot.limit,
+        "overage_policy": snapshot.overage_policy,
+        "warning_thresholds": tuple(snapshot.warning_thresholds),
+    }
+    cache[tenant_id] = {"expires_at": now + 10.0, "value": value}
+    return value
+
+
+def _current_api_call_usage(tenant_id: str) -> int:
+    used = (
+        db.session.query(UsageMeter.used)
+        .filter(
+            UsageMeter.tenant_id == tenant_id,
+            UsageMeter.metric == METRIC_API_CALLS,
+            UsageMeter.period == "current",
+        )
+        .scalar()
+    )
+    return int(used or 0)
+
+
+def _increment_api_call_usage_fast(tenant_id: str, *, delta: int = 1) -> None:
+    """Increment API call counters without per-request audit rows."""
+    now = datetime.now(timezone.utc)
+    periods = ("current",)
+    for period in periods:
+        db.session.execute(
+            text(
+                """
+                INSERT INTO usage_meters
+                    (tenant_id, metric, period, period_start, period_end, used, created_at, updated_at)
+                VALUES
+                    (:tenant_id, :metric, :period, NULL, NULL, 0, :now, :now)
+                ON CONFLICT(tenant_id, metric, period) DO NOTHING
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "metric": METRIC_API_CALLS,
+                "period": period,
+                "now": now,
+            },
+        )
+        db.session.execute(
+            text(
+                """
+                UPDATE usage_meters
+                SET used = used + :delta, updated_at = :now
+                WHERE tenant_id = :tenant_id AND metric = :metric AND period = :period
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "metric": METRIC_API_CALLS,
+                "period": period,
+                "delta": int(delta),
+                "now": now,
+            },
+        )
+
+
+def _is_tenant_status_self_service_path() -> bool:
+    return request.path in {"/api/tenant/commercial/status"}
+
+
+def _hash_api_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def _api_key_to_api_dict(row: APIKey, *, include_secret: Optional[str] = None) -> Dict[str, Any]:
+    data = {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "name": row.name,
+        "key_prefix": row.key_prefix,
+        "role": row.role,
+        "status": row.status,
+        "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+        "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+    if include_secret:
+        data["api_key"] = include_secret
+    return data
+
+
+def _tenant_admin_summary(row: Tenant) -> Dict[str, Any]:
+    alert_count = (
+        db.session.query(func.count(Alert.id))
+        .filter(Alert.tenant_id == row.id)
+        .scalar()
+        or 0
+    )
+    active_sub = (
+        db.session.query(Subscription)
+        .filter(Subscription.tenant_id == row.id, Subscription.status == "active")
+        .order_by(Subscription.created_at.desc())
+        .first()
+    )
+    return {
+        "id": row.id,
+        "name": row.name,
+        "slug": row.slug,
+        "status": row.status,
+        "plan": row.plan,
+        "active_subscription": _subscription_to_api_dict(active_sub) if active_sub else None,
+        "usage_summary": {"alerts": int(alert_count)},
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _tenant_admin_detail(row: Tenant) -> Dict[str, Any]:
+    subscriptions = (
+        db.session.query(Subscription)
+        .filter(Subscription.tenant_id == row.id)
+        .order_by(Subscription.created_at.desc())
+        .all()
+    )
+    licenses = (
+        db.session.query(LicenseKey)
+        .filter(LicenseKey.tenant_id == row.id)
+        .order_by(LicenseKey.created_at.desc())
+        .all()
+    )
+    quotas = [_quota_usage_to_api_dict(row.id, metric) for metric in sorted(METERED_METRICS)]
+    return {
+        **_tenant_admin_summary(row),
+        "subscriptions": [_subscription_to_api_dict(sub) for sub in subscriptions],
+        "licenses": [_license_to_api_dict(lic) for lic in licenses],
+        "quotas": quotas,
+    }
+
+
+def _tenant_commercial_status(row: Tenant) -> Dict[str, Any]:
+    licenses = (
+        db.session.query(LicenseKey)
+        .filter(LicenseKey.tenant_id == row.id)
+        .order_by(LicenseKey.created_at.desc())
+        .all()
+    )
+    quotas = [_quota_usage_to_api_dict(row.id, metric) for metric in sorted(METERED_METRICS)]
+    overages = [item for item in quotas if item.get("exceeded")]
+    active_sub = (
+        db.session.query(Subscription)
+        .filter(Subscription.tenant_id == row.id, Subscription.status == "active")
+        .order_by(Subscription.created_at.desc())
+        .first()
+    )
+    return {
+        "tenant": {
+            "id": row.id,
+            "name": row.name,
+            "slug": row.slug,
+            "status": row.status,
+            "plan": row.plan,
+        },
+        "current_plan": _plan_to_api_dict(active_sub.plan) if active_sub and active_sub.plan else None,
+        "subscription": _subscription_to_api_dict(active_sub) if active_sub else None,
+        "licenses": [_license_to_api_dict(lic) for lic in licenses],
+        "quotas": quotas,
+        "overages": overages,
+        "has_overage": bool(overages),
+    }
+
+
+def _plan_to_api_dict(row: Plan) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "code": row.code,
+        "name": row.name,
+        "status": row.status,
+        "limits": dict(row.limits or {}),
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _license_to_api_dict(row: LicenseKey) -> Dict[str, Any]:
+    expires_at = _aware_utc(row.expires_at)
+    is_expired = expires_at is not None and expires_at <= datetime.now(timezone.utc)
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "key_prefix": row.key_prefix,
+        "status": row.status,
+        "effective_status": "expired" if is_expired else row.status,
+        "limits": dict(row.limits or {}),
+        "issued_to": row.issued_to,
+        "expires_at": _dt_iso(row.expires_at),
+        "is_expired": is_expired,
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _subscription_to_api_dict(row: Optional[Subscription]) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    ends_at = _aware_utc(row.ends_at)
+    is_expired = ends_at is not None and ends_at <= datetime.now(timezone.utc)
+    return {
+        "id": row.id,
+        "tenant_id": row.tenant_id,
+        "plan_id": row.plan_id,
+        "plan_code": row.plan.code if row.plan else None,
+        "license_key_id": row.license_key_id,
+        "status": row.status,
+        "effective_status": "expired" if is_expired else row.status,
+        "starts_at": _dt_iso(row.starts_at),
+        "ends_at": _dt_iso(row.ends_at),
+        "is_expired": is_expired,
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _quota_usage_to_api_dict(tenant_id: str, metric: str) -> Dict[str, Any]:
+    snap = quota_snapshot(db.session, tenant_id, metric)
+    row = (
+        db.session.query(Quota)
+        .filter(Quota.tenant_id == tenant_id, Quota.metric == metric)
+        .one_or_none()
+    )
+    data = snap.to_dict()
+    data["source"] = row.source if row is not None else "effective"
+    if snap.limit is None:
+        data["usage_ratio"] = None
+    elif snap.limit <= 0:
+        data["usage_ratio"] = 1.0 if snap.used > 0 else 0.0
+    else:
+        data["usage_ratio"] = round(snap.used / snap.limit, 4)
+    return data
+
+
+def _usage_bucket_to_api_dict(row: UsageMeter) -> Dict[str, Any]:
+    return {
+        "tenant_id": row.tenant_id,
+        "metric": row.metric,
+        "period": row.period,
+        "period_start": _dt_iso(row.period_start),
+        "period_end": _dt_iso(row.period_end),
+        "used": int(row.used or 0),
+        "created_at": _dt_iso(row.created_at),
+        "updated_at": _dt_iso(row.updated_at),
+    }
+
+
+def _normalize_warning_thresholds_payload(raw: Any) -> Tuple[List[float], Optional[str]]:
+    if not isinstance(raw, list):
+        return [], "warning_thresholds 必须是数组"
+    out: List[float] = []
+    for value in raw:
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            return [], "warning_thresholds 只能包含 0 到 1 之间的数字"
+        if threshold <= 0 or threshold > 1:
+            return [], "warning_thresholds 只能包含 0 到 1 之间的数字"
+        out.append(round(threshold, 4))
+    return sorted(set(out)), None
+
+
+def _normalize_limits(raw: Any) -> Tuple[Dict[str, Optional[int]], Optional[str]]:
+    if not isinstance(raw, dict):
+        return {}, "limits 必须是对象"
+    out: Dict[str, Optional[int]] = {}
+    for key, value in raw.items():
+        metric = str(key).strip()
+        if metric not in METERED_METRICS:
+            return {}, f"未知配额指标: {metric}"
+        if value is None or value == "":
+            out[metric] = None
+            continue
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return {}, f"{metric} 必须是整数或 null"
+        if limit < 0:
+            return {}, f"{metric} 不能为负数"
+        out[metric] = limit
+    return out, None
+
+
+def _aware_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _resolve_jwt_role(identity: str, tenant_id: str) -> Optional[str]:
+    from web.models import Membership, Role, User
+
+    user = (
+        db.session.query(User)
+        .filter((User.username == identity) | (User.email == identity))
+        .one_or_none()
+    )
+    if user is None:
+        if tenant_id != login_tenant_id(identity):
+            return None
+        return _login_role(identity)
+    membership = (
+        db.session.query(Membership)
+        .join(Role, Membership.role_id == Role.id)
+        .filter(
+            Membership.user_id == user.id,
+            Membership.tenant_id == tenant_id,
+            Membership.status == "active",
+            Role.name.in_(RBAC_ROLES),
+        )
+        .one_or_none()
+    )
+    if membership is None:
+        return None
+    return membership.role.name
+
+
+def _resolve_login_context(username: str, requested_tenant_id: str = "") -> Tuple[str, str]:
+    from web.models import Membership, Role, User
+
+    user = (
+        db.session.query(User)
+        .filter((User.username == username) | (User.email == username))
+        .one_or_none()
+    )
+    if user is None:
+        return login_tenant_id(username), _login_role(username)
+
+    query = (
+        db.session.query(Membership)
+        .join(Role, Membership.role_id == Role.id)
+        .filter(
+            Membership.user_id == user.id,
+            Membership.status == "active",
+            Role.name.in_(RBAC_ROLES),
+        )
+    )
+    if requested_tenant_id:
+        query = query.filter(Membership.tenant_id == requested_tenant_id)
+    membership = query.order_by(Membership.created_at.asc()).first()
+    if membership is None:
+        return login_tenant_id(username), _login_role(username)
+    return membership.tenant_id, membership.role.name
+
+
+def _current_actor() -> str:
+    if has_request_context():
+        actor = getattr(request, "guardian_actor", "")
+        if actor:
+            return str(actor)
+    try:
+        return str(get_jwt_identity() or "operator")
+    except Exception:  # noqa: BLE001
+        return "operator"
+
+
+def _current_auth_method() -> str:
+    if has_request_context():
+        method = getattr(request, "guardian_auth_method", "")
+        if method:
+            return str(method)
+    return "jwt"
+
+
 def _login_role(username: str) -> str:
     """解析当前单账号的角色；为后续多用户表预留 JWT claim 形状。"""
     configured = (
@@ -2731,11 +5370,28 @@ def _login_role(username: str) -> str:
 
 
 def _current_role() -> str:
+    if has_request_context():
+        request_role = str(getattr(request, "guardian_role", "") or "").strip().lower()
+        if request_role in RBAC_ROLES:
+            return request_role
     try:
         role = str((get_jwt() or {}).get("role") or "admin").strip().lower()
     except Exception:  # noqa: BLE001
         role = "admin"
     return role if role in RBAC_ROLES else "admin"
+
+
+def _auth_required():
+    """Marker decorator; request authentication is enforced by before_request."""
+
+    def _decorator(fn):
+        @wraps(fn)
+        def _wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    return _decorator
 
 
 def _require_role(min_role: str):
@@ -2760,6 +5416,59 @@ def _require_role(min_role: str):
         return _wrapped
 
     return _decorator
+
+
+def _is_platform_admin() -> bool:
+    if _current_role() != "admin":
+        return False
+    return _current_tenant_id() == configured_default_tenant_id()
+
+
+def _require_platform_admin():
+    """SaaS 控制面只允许平台租户上的 admin 操作。"""
+
+    def _decorator(fn):
+        @wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if not _is_platform_admin():
+                return (
+                    jsonify(
+                        _error_payload(
+                            code="forbidden",
+                            message="需要平台管理员权限",
+                        )
+                    ),
+                    403,
+                )
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    return _decorator
+
+
+def _tenant_access_denied_response(tenant_id: str):
+    row = db.session.get(Tenant, tenant_id)
+    if row is None:
+        return jsonify(_error_payload(code="forbidden", message="租户不存在或不可用")), 403
+    if row.status == "active":
+        return None
+    _record_audit_event(
+        event_type="tenant.access_denied",
+        actor=_current_actor(),
+        resource_type="tenant",
+        resource_id=tenant_id,
+        payload={"status": row.status, "path": request.path if has_request_context() else None},
+    )
+    return (
+        jsonify(
+            _error_payload(
+                code="tenant_inactive",
+                message=f"租户状态为 {row.status}，访问受限",
+            )
+        ),
+        403,
+    )
 
 
 def _error_payload(
@@ -3846,7 +6555,9 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
     start_u = start.astimezone(timezone.utc)
     end_u = end.astimezone(timezone.utc)
 
+    tenant_id = _current_tenant_id()
     base = db.session.query(Alert).filter(
+        Alert.tenant_id == tenant_id,
         Alert.timestamp >= start_u,
         Alert.timestamp <= end_u,
     )
@@ -3854,7 +6565,11 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
 
     level_rows = (
         db.session.query(Alert.level, func.count(Alert.id))
-        .filter(Alert.timestamp >= start_u, Alert.timestamp <= end_u)
+        .filter(
+            Alert.tenant_id == tenant_id,
+            Alert.timestamp >= start_u,
+            Alert.timestamp <= end_u,
+        )
         .group_by(Alert.level)
         .all()
     )
@@ -3866,7 +6581,11 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
 
     status_rows = (
         db.session.query(Alert.status, func.count(Alert.id))
-        .filter(Alert.timestamp >= start_u, Alert.timestamp <= end_u)
+        .filter(
+            Alert.tenant_id == tenant_id,
+            Alert.timestamp >= start_u,
+            Alert.timestamp <= end_u,
+        )
         .group_by(Alert.status)
         .all()
     )
@@ -3878,7 +6597,11 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
 
     type_rows = (
         db.session.query(Alert.threat_type, func.count(Alert.id))
-        .filter(Alert.timestamp >= start_u, Alert.timestamp <= end_u)
+        .filter(
+            Alert.tenant_id == tenant_id,
+            Alert.timestamp >= start_u,
+            Alert.timestamp <= end_u,
+        )
         .group_by(Alert.threat_type)
         .order_by(func.count(Alert.id).desc())
         .limit(10)
@@ -3889,6 +6612,7 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
     top_rows = (
         db.session.query(Alert.source_ip, func.count(Alert.id))
         .filter(
+            Alert.tenant_id == tenant_id,
             Alert.timestamp >= start_u,
             Alert.timestamp <= end_u,
             Alert.source_ip != "",
@@ -3903,6 +6627,7 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
     avg_conf_raw = (
         db.session.query(func.avg(Alert.confidence))
         .filter(
+            Alert.tenant_id == tenant_id,
             Alert.timestamp >= start_u,
             Alert.timestamp <= end_u,
             Alert.confidence.isnot(None),
@@ -3934,6 +6659,7 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
 
     mv = (
         db.session.query(ModelVersion)
+        .filter(ModelVersion.tenant_id == tenant_id)
         .order_by(
             ModelVersion.deployed_at.desc().nulls_last(),
             ModelVersion.id.desc(),
@@ -3983,7 +6709,12 @@ def _build_report_summary(app: Flask, *, period: str = "day") -> Dict[str, Any]:
         avg_confidence=avg_conf,
     )
 
-    banned_total = db.session.query(func.count(BannedIp.ip)).scalar() or 0
+    banned_total = (
+        db.session.query(func.count(BannedIp.ip))
+        .filter(BannedIp.tenant_id == tenant_id)
+        .scalar()
+        or 0
+    )
 
     overview = {
         "total_alerts": total_alerts,
@@ -4045,7 +6776,11 @@ def _bucket_timeline_from_db(
         b_end_u = b_end.astimezone(timezone.utc)
         n = (
             db.session.query(func.count(Alert.id))
-            .filter(Alert.timestamp >= b_start_u, Alert.timestamp < b_end_u)
+            .filter(
+                Alert.tenant_id == _current_tenant_id(),
+                Alert.timestamp >= b_start_u,
+                Alert.timestamp < b_end_u,
+            )
             .scalar()
             or 0
         )
@@ -4067,6 +6802,7 @@ def _collect_report_responses(
     for ra in (
         db.session.query(ResponseAction)
         .filter(
+            ResponseAction.tenant_id == _current_tenant_id(),
             ResponseAction.created_at >= start_u,
             ResponseAction.created_at <= end_u,
         )
@@ -4090,6 +6826,7 @@ def _collect_report_responses(
     for b in (
         db.session.query(BannedIp)
         .filter(
+            BannedIp.tenant_id == _current_tenant_id(),
             BannedIp.created_at >= start_u,
             BannedIp.created_at <= end_u,
         )
@@ -4109,6 +6846,8 @@ def _collect_report_responses(
         db.session.query(AlertHistory, Alert)
         .join(Alert, AlertHistory.alert_id == Alert.id)
         .filter(
+            AlertHistory.tenant_id == _current_tenant_id(),
+            Alert.tenant_id == _current_tenant_id(),
             AlertHistory.created_at >= start_u,
             AlertHistory.created_at <= end_u,
             AlertHistory.to_status.in_(("acknowledged", "resolved", "ignored")),
@@ -4147,6 +6886,7 @@ def _mean_resolution_latency_db(start_u: datetime, end_u: datetime) -> int:
         db.session.query(AlertHistory)
         .join(Alert, AlertHistory.alert_id == Alert.id)
         .filter(
+            AlertHistory.tenant_id == _current_tenant_id(),
             AlertHistory.to_status == "resolved",
             AlertHistory.created_at >= start_u,
             AlertHistory.created_at <= end_u,
@@ -4292,3 +7032,4 @@ if __name__ == "__main__":
         use_reloader=use_reloader,
         allow_unsafe_werkzeug=True,
     )
+
