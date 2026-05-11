@@ -22,14 +22,17 @@ cd C:\Users\yyl\.codex\worktrees\89f2\ai安全\ai-security-guardian
 
 ## 内部任务项与验收
 
+> 当前状态只按已有测试/报告记录填写。命令存在、脚本可运行或 readiness 单项 PASS，不等于生产验收已完成；若真实结果出现 schema 缺失、429/500、Redis memory fallback 或 env 口径混用，本清单必须记录为失败或待修复。
+
 ### 1. 配置基线
 
-| 任务项 | 验收命令 | 通过标准 | 责任边界 |
-|---|---|---|---|
-| 检查本地依赖环境配置不引用客户资料 | `Select-String -Path .env.host-nondegraded.example,.env.prod-drill.example -Pattern "customer|客户|example.com|REPLACE_ME|127.0.0.1|guardian.localtest|postgres|redis"` | 输出只允许出现本地地址、`guardian.localtest`、Compose 服务名或注释说明；不得出现客户域名、客户 IP、客户库名、客户密钥 | 内部可完成 |
-| 渲染本地生产演练 Compose | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml config > tmp\internal-prod-drill-compose.yml` | 命令退出码为 `0`；`tmp\internal-prod-drill-compose.yml` 存在；容器内 `DATABASE_URL` 使用 `postgres`，`REDIS_HOST` 使用 `redis`；`app` 端口只绑定 `127.0.0.1:5000:5000` | 内部可完成 |
-| 校验生产式配置 gate | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml run --rm app python scripts/check_production_readiness.py --skip-env-file` | 输出 `Result: PASS` 或 `Result: PASS with WARN`；不得出现 `[FAIL]`；不得打印明文密码、密钥、管理员哈希 | 内部可完成 |
-| 客户正式配置准入 | 不作为内部完成项 | 客户提供正式域名、生产 PostgreSQL、Redis 密码、管理员哈希后，另行执行 `python scripts/check_production_readiness.py --env-file <客户环境文件>` 且无 `[FAIL]` | 需要客户资料 |
+| 任务项 | 验收命令 | 真实验收口径 | 当前状态 | 责任边界 |
+|---|---|---|---|---|
+| 检查本地依赖环境配置不引用客户资料 | `Select-String -Path .env.host-nondegraded.example,.env.prod-drill.example -Pattern "customer|客户|example.com|REPLACE_ME|127.0.0.1|guardian.localtest|postgres|redis"` | 输出只允许出现本地地址、`guardian.localtest`、Compose 服务名或注释说明；不得出现客户域名、客户 IP、客户库名、客户密钥 | 待复核 | 内部可完成 |
+| 渲染本地生产演练 Compose | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml config > tmp\internal-prod-drill-compose.yml` | 命令退出码为 `0`；`tmp\internal-prod-drill-compose.yml` 存在；容器内 `DATABASE_URL` 使用 `postgres`，`REDIS_HOST` 使用 `redis`；`app` 端口只绑定 `127.0.0.1:5000:5000` | 待复核 | 内部可完成 |
+| 校验生产式配置 gate | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml run --rm app python scripts/check_production_readiness.py --skip-env-file` | readiness 输出无 `[FAIL]` 只代表配置/依赖探针通过；不得打印明文密码、密钥、管理员哈希；不得把该项单独写成 schema 验收通过 | 待复核 | 内部可完成 |
+| 数据库 schema readiness | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml exec -T app python web/init_db.py --check`；必要时补充 `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml run --rm app flask --app web.migration_app:create_migration_app db current` | 必须证明业务表/列和 Alembic revision 已存在且在 head；若 `/readyz` 或 readiness PASS 但该命令发现 schema 缺失，数据库 schema 验收仍为失败 | 失败/待修复：已有测试结论指出 readiness PASS 不能覆盖 schema 缺失 | 内部可完成 |
+| 客户正式配置准入 | 不作为内部完成项 | 客户提供正式域名、生产 PostgreSQL、Redis 密码、管理员哈希后，另行执行 `python scripts/check_production_readiness.py --env-file <客户环境文件>` 且无 `[FAIL]`，并单独完成 schema readiness | 待客户资料 | 需要客户资料 |
 
 ### 2. 模型制品
 
@@ -42,12 +45,14 @@ cd C:\Users\yyl\.codex\worktrees\89f2\ai安全\ai-security-guardian
 
 ### 3. 数据库
 
-| 任务项 | 验收命令 | 通过标准 | 责任边界 |
-|---|---|---|---|
-| 启动本地 PostgreSQL/Redis 依赖栈 | `python scripts\start_local_deps.py --env-file .env.host-nondegraded.example` | 端口空闲时启动并等待 healthy；端口已被健康依赖占用时明确复用；端口冲突且不可复用时明确失败并清理本项目 Created 容器 | 内部可完成 |
-| 校验应用连接真实 PostgreSQL 和真实 Redis | `python scripts\verify_local_deps.py .env.host-nondegraded.example` | 输出包含 `PostgreSQL connected`、`Redis AUTH PING: PONG`、`Application DATABASE_URL backend: postgresql`、`RedisClient mode: redis`，退出码为 `0`；若使用 `--port-strategy alternate`，必须改用 `tmp\local-deps.env`；若误用 `.env.prod-drill.example`，脚本必须提示需要 `127.0.0.1` | 内部可完成 |
-| 校验迁移可重复执行 | `$env:DATABASE_URL="postgresql+psycopg2://guardian:guardian-local-postgres-pass@127.0.0.1:55432/guardian_local_test"; python -m pytest tests\test_database_migrations.py -q` | pytest 退出码为 `0`；测试证明 `flask db upgrade` 可重复执行且不破坏探针数据 | 内部可完成 |
-| 客户生产库初始化/迁移 | 不作为内部完成项 | 需客户提供 PostgreSQL 地址、账号、网络访问和变更窗口后执行迁移；内部只提供命令模板 | 需要客户资料 |
+| 任务项 | 验收命令 | 真实验收口径 | 当前状态 | 责任边界 |
+|---|---|---|---|---|
+| 启动本地 PostgreSQL/Redis 依赖栈 | `python scripts\start_local_deps.py --env-file .env.host-nondegraded.example` | 端口空闲时启动并等待 healthy；端口已被健康依赖占用时明确复用；端口冲突且不可复用时明确失败并清理本项目 Created 容器 | 待复核 | 内部可完成 |
+| 校验应用连接真实 PostgreSQL 和真实 Redis | `python scripts\verify_local_deps.py .env.host-nondegraded.example` | 输出包含 `PostgreSQL connected`、`Redis AUTH PING: PONG`、`Application DATABASE_URL backend: postgresql`、`RedisClient mode: redis`，退出码为 `0`；若使用 `--port-strategy alternate`，必须改用 `tmp\local-deps.env`；若误用 `.env.prod-drill.example`，脚本必须提示需要 `127.0.0.1` | 待复核 | 内部可完成 |
+| 宿主机 env 与 Compose env 隔离 | `python scripts\verify_local_deps.py .env.host-nondegraded.example`；`docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml config` | 宿主机测试只用 `127.0.0.1` 端口；Compose prod-drill 只用服务名 `postgres`/`redis`；不得交叉复用 env 文件或把一种口径的 PASS 写成另一种口径通过 | 待复核 | 内部可完成 |
+| 校验迁移可重复执行 | `$env:DATABASE_URL="postgresql+psycopg2://guardian:guardian-local-postgres-pass@127.0.0.1:55432/guardian_local_test"; python -m pytest tests\test_database_migrations.py -q` | pytest 退出码为 `0`；测试证明 `flask db upgrade` 可重复执行且不破坏探针数据 | 待复核 | 内部可完成 |
+| PostgreSQL 非降级测试无 Redis fallback 残留 | `python scripts\run_non_degraded_tests.py` | 测试必须同时使用真实 PostgreSQL 和真实 Redis；`RedisClient mode` 必须为 `redis`；不得设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`；不得出现 Redis memory fallback 或 skip 后仍记为通过 | 失败/待修复：已有结论指出 PostgreSQL 测试仍有 Redis 降级残留，不能列为通过 | 内部可完成 |
+| 客户生产库初始化/迁移 | 不作为内部完成项 | 需客户提供 PostgreSQL 地址、账号、网络访问和变更窗口后执行迁移；内部只提供命令模板 | 待客户资料 | 需要客户资料 |
 
 ### 4. Redis 与告警流
 
@@ -60,23 +65,25 @@ cd C:\Users\yyl\.codex\worktrees\89f2\ai安全\ai-security-guardian
 
 ### 5. 测试
 
-| 任务项 | 验收命令 | 通过标准 | 责任边界 |
-|---|---|---|---|
-| 默认离线回归 | `python -m pytest -q` | pytest 退出码为 `0`；该项只证明离线逻辑回归，不作为数据库/Redis/模型真实依赖通过标准 | 内部可完成 |
-| 关键安全硬化 | `python -m pytest tests\test_production_hardening.py tests\test_responder.py tests\test_response_r4.py -q` | pytest 退出码为 `0` | 内部可完成 |
-| E2E 非降级生产验收 | `python -m pytest -m production_e2e -q` | pytest 退出码为 `0`；模型制品完整；不得设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`；不得使用 Redis memory fallback | 内部可完成 |
-| E2E 降级容灾验证 | `python -m pytest -m degradation_e2e -q` | pytest 退出码为 `0`；只证明模型缺失、Redis 中断等容灾路径有效，不作为生产通过标准 | 内部说明 |
-| 现有降级脚本使用边界 | `python scripts\verify_v1.py` | 该命令包含模型缺失和 Redis memory fallback 场景，只能作为研发补充回归证据，不能作为本清单通过标准 | 内部说明 |
-| 客户现场 E2E | 不作为内部完成项 | 需客户环境、域名、账号、TLS/WSS、真实数据库/Redis 后执行 | 需要客户资料 |
+| 任务项 | 验收命令 | 真实验收口径 | 当前状态 | 责任边界 |
+|---|---|---|---|---|
+| 默认离线回归 | `python -m pytest -q` | pytest 退出码为 `0`；该项只证明离线逻辑回归，不作为数据库/Redis/模型真实依赖通过标准 | 待复核 | 内部可完成 |
+| 关键安全硬化 | `python -m pytest tests\test_production_hardening.py tests\test_responder.py tests\test_response_r4.py -q` | pytest 退出码为 `0` | 待复核 | 内部可完成 |
+| E2E 非降级生产验收 | `python -m pytest -m production_e2e -q` | pytest 退出码为 `0`；模型制品完整；不得设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`；不得使用 Redis memory fallback；不得包含模型缺失或 Redis 中断降级场景 | 待复核 | 内部可完成 |
+| E2E 降级容灾验证 | `python -m pytest -m degradation_e2e -q` | pytest 退出码为 `0` 只证明模型缺失、Redis 中断等容灾路径有效；不得列入生产验收通过标准 | 待复核，不计入生产通过 | 内部说明 |
+| 现有降级脚本使用边界 | `python scripts\verify_v1.py` | 该命令包含模型缺失和 Redis memory fallback 场景；即使整体 PASS，也不能作为本清单生产验收通过标准 | 不作为生产验收 | 内部说明 |
+| 客户现场 E2E | 不作为内部完成项 | 需客户环境、域名、账号、TLS/WSS、真实数据库/Redis 后执行 | 待客户资料 | 需要客户资料 |
 
 ### 6. 压测
 
-| 任务项 | 验收命令 | 通过标准 | 责任边界 |
-|---|---|---|---|
-| 检测段进程内 P95 | `python scripts\benchmark_p95.py --detect-iters 400 --requests 1 --workers 1` | 输出检测段 `P95 < 100 ms`；HTTP 部分如服务未启动可不作为本项通过标准 | 内部可完成 |
-| HTTP/API 压测准备 | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml up -d --wait` | `db-migrate` 已成功退出；`app`、`redis`、`postgres` 健康检查通过；`docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml exec -T app python web/init_db.py --check` 退出码为 `0` | 内部可完成 |
-| HTTP/API P95 | `$jwt = docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml exec -T app python -c "from web.app import create_app; from flask_jwt_extended import create_access_token; app,_=create_app(); ctx=app.app_context(); ctx.push(); print(create_access_token(identity='benchmark', additional_claims={'role':'admin'})); ctx.pop()"; python scripts\benchmark_http.py --base-url http://127.0.0.1:5000 --jwt-token $jwt --requests 1000 --workers 32 --warmup-requests 100` | 命令退出码为 `0`；输出 `Production target: core_api_p95<300ms PASS`；`reports/benchmarks/` 生成 JSON 与 Markdown 报告 | 内部可完成 |
-| 客户真实流量容量基线 | 不作为内部完成项 | 需客户流量模型、并发量、部署规格和压测窗口后执行 | 需要客户资料 |
+| 任务项 | 验收命令 | 真实验收口径 | 当前状态 | 责任边界 |
+|---|---|---|---|---|
+| 检测段进程内 P95 | `python scripts\benchmark_p95.py --detect-iters 400 --requests 1 --workers 1` | 输出检测段 `P95 < 100 ms`；HTTP 部分如服务未启动可不作为本项通过标准 | 通过：既有报告显示 detection segment P95 < 100ms | 内部可完成 |
+| HTTP/API 压测准备 | `docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml up -d --wait` | `db-migrate` 已成功退出；`app`、`redis`、`postgres` 健康检查通过；`docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml exec -T app python web/init_db.py --check` 退出码为 `0`；不得只用 `/readyz` PASS 代替 schema 检查 | 失败/待修复：schema 缺失问题未关闭 | 内部可完成 |
+| HTTP/API P95，1000 请求/32 workers | `$jwt = docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml exec -T app python -c "from web.app import create_app; from flask_jwt_extended import create_access_token; app,_=create_app(); ctx=app.app_context(); ctx.push(); print(create_access_token(identity='benchmark', additional_claims={'role':'admin'})); ctx.pop()"; python scripts\benchmark_http.py --base-url http://127.0.0.1:5000 --jwt-token $jwt --requests 1000 --workers 32 --warmup-requests 100` | 必须无 429/5xx，错误率 0，核心 API P95 < 300ms，且生成 JSON/Markdown 报告 | 失败：`reports/benchmarks/http-benchmark-20260508-210101.md` 记录 `429=78`、`500=631`、错误率 70.90%，不能写成已通过 |
+| HTTP/API 受限样本，200 请求/8 workers/8 RPS | `BENCHMARK_USERNAME=<USER> BENCHMARK_PASSWORD='<PASSWORD>' python scripts\benchmark_http.py --scenario performance --base-url http://127.0.0.1:5000 --requests 200 --workers 8 --target-rps 8 --warmup-requests 0 --report-prefix http-benchmark-performance` | 只证明该受限负载样本无 429/5xx 且 P95 达标；不得外推为 1000/32 或客户容量通过 | 通过：`reports/benchmarks/http-benchmark-performance-20260508-224357.md` 显示 200 全部 200、无 429/5xx、P95 达标 |
+| 限流验证 | `BENCHMARK_USERNAME=<USER> BENCHMARK_PASSWORD='<PASSWORD>' python scripts\benchmark_http.py --scenario rate-limit --base-url http://127.0.0.1:5000 --endpoints /api/stats --requests 6 --workers 3 --warmup-requests 0 --report-prefix http-benchmark-ratelimit` | 429 出现只证明限流生效；不得作为性能压测通过条件 | 通过但不计入性能验收：`reports/benchmarks/http-benchmark-ratelimit-20260508-224534.md` 记录 `429=4` |
+| 客户真实流量容量基线 | 不作为内部完成项 | 需客户流量模型、并发量、部署规格和压测窗口后执行 | 待客户资料 | 需要客户资料 |
 
 ### 7. Docker
 
@@ -110,6 +117,11 @@ cd C:\Users\yyl\.codex\worktrees\89f2\ai安全\ai-security-guardian
 | 阻塞项 | 阻塞范围 | 解除条件 | 内部可先完成的证据 |
 |---|---|---|---|
 | 本任务未执行完整验收命令 | 仅阻塞“已验收通过”结论，不阻塞清单交付 | 后续按本文命令逐项执行并保存输出 | 本文档本身、命令清单、边界说明 |
+| readiness PASS 但 schema 缺失 | 阻塞数据库 schema、Docker 启动和 HTTP/API 压测通过结论 | `web/init_db.py --check` 和 Alembic revision 检查均通过后，才能把 schema readiness 写为通过 | readiness 输出、schema 检查命令和失败记录 |
+| 1000/32 HTTP 压测出现 429/500 | 阻塞容量与性能验收通过结论 | 压测报告必须无 429/5xx、错误率 0 且 P95 达标 | `reports/benchmarks/http-benchmark-20260508-210101.md` 失败证据 |
+| E2E 与降级场景边界需保持分离 | 阻塞把 `verify_v1.py` 或 `degradation_e2e` 写成生产验收通过 | 生产验收只引用 `production_e2e`；降级场景单列为容灾验证 | `tests/e2e/test_v1_acceptance.py` marker 分组 |
+| 宿主机 env 与 Compose env 不得混用 | 阻塞本地真实依赖和 Compose prod-drill 交叉验收结论 | 宿主机命令使用 `.env.host-nondegraded.example` 或 `tmp/local-deps.env`；Compose 命令使用 `.env.prod-drill.example` | `docs/local-real-dependencies.md`、本文命令 |
+| PostgreSQL 测试仍有 Redis 降级残留 | 阻塞非降级数据库/Redis 集成验收通过结论 | `python scripts\run_non_degraded_tests.py` 证明 Redis 为真实连接、无 memory fallback、无 skip | 非降级测试输出 |
 | 客户正式域名和证书未提供 | 阻塞客户 `ALLOWED_ORIGINS`、TLS/WSS、Nginx 证据 | 客户提供正式 HTTPS Origin、证书和入口策略 | `.env.prod-drill.example` 与本地 `guardian.localtest` 配置证据 |
 | 客户 PostgreSQL/Redis 信息未提供 | 阻塞客户数据库/Redis 联通与生产 readiness | 客户提供连接串、账号、密码/ACL、网络放通 | `docker-compose.local-deps.yml`、`.env.host-nondegraded.example` 和 `.env.prod-drill.example` 本地真实依赖证据 |
 | 客户抓包授权和网卡范围未提供 | 阻塞 `guardian` full-chain 真实流量检测验收 | 客户提供授权、网卡、主机权限、流量镜像方案 | 本地 Docker profile 和代码路径静态证据 |

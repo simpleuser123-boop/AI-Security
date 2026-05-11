@@ -2,6 +2,16 @@
 
 与 `docs/AI安全守卫-v1.0-交付验收与路线图.md` §4、§7、§8 及 `docs/AI安全守卫-v1.0-工程实施方案.md` §12 对照使用。生产验收命令：`python -m pytest -m production_e2e -q`；降级容灾验证命令：`python -m pytest -m degradation_e2e -q`，不计入生产通过标准。
 
+## 当前验收口径修正
+
+| 修正项 | 真实验收命令 | 当前状态 |
+|---|---|---|
+| readiness PASS 但 schema 缺失 | `python scripts/check_production_readiness.py --gate private-beta` 只能验配置/依赖探针；数据库 schema 需另跑 `python web/init_db.py --check` 和 Alembic revision 检查 | 失败/待修复：schema 缺失时不得因 readiness PASS 写成上线通过 |
+| HTTP/API 压测 1000 请求/32 workers | `python scripts/benchmark_http.py --base-url http://127.0.0.1:5000 --requests 1000 --workers 32 --warmup-requests 100` | 失败：既有报告 `reports/benchmarks/http-benchmark-20260508-210101.md` 出现 `429=78`、`500=631` |
+| E2E 与降级场景分离 | `python -m pytest -m production_e2e -q`；降级另跑 `python -m pytest -m degradation_e2e -q` | 待复核：`scripts/verify_v1.py` 混有降级场景，不作为生产验收通过标准 |
+| 宿主机 env 与 Compose env 分离 | 宿主机：`python scripts/verify_local_deps.py .env.host-nondegraded.example`；Compose：`docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml config` | 待复核：不得把两类 env 的结果混用 |
+| PostgreSQL 测试无 Redis 降级残留 | `python scripts/run_non_degraded_tests.py` | 失败/待修复：Redis memory fallback 残留时不能写成 PostgreSQL/Redis 非降级通过 |
+
 ## 功能验收（F-01～F-10）
 
 | 编号 | 验收项 | 通过标准 | 验证方式 / 证据 |
@@ -37,7 +47,7 @@
 | 指标 | 目标 | 采集方式 |
 |------|------|----------|
 | 端到端检测延迟 | P95 < 100 ms | `scripts/benchmark_p95.py`（进程内 detect）；全链路用 Guardian metrics |
-| Web API | P95 < 300 ms | 同脚本 HTTP 段；或 `hey`/`wrk` 对 `/api/alerts` |
+| Web API | P95 < 300 ms，错误率 0，且不得出现 429/5xx | `scripts/benchmark_http.py --scenario performance`；1000 请求/32 workers 既有报告已失败，不能写成已通过 |
 | Redis Stream 堆积 | 无持续增长 | `redis-cli XLEN guardian:alerts`、`XPENDING`；见 `benchmark_p95.py` 尾部说明 |
 | 模型推理失败率 | < 1% | 运行时指标 / 日志抽样（路线图增强） |
 | 采集丢包率 | 可观测 | 抓包环境 `tcpdump`/Guardian 日志（路线图增强） |
@@ -48,18 +58,19 @@
 |------|------|------|
 | Accuracy / Precision / Recall / F1 / FPR / FNR | 文档阈值 | 以各 `models/train/*.py` 评估与离线报告为准 |
 | 模型版本与 manifest | 每个上线模型有 manifest | `tests/test_schema_manifest.py`、`ModelRegistry` |
-| schema 一致性 | 训练与推理列一致 | manifest + schema 测试 |
+| schema 一致性 | 训练与推理列一致 | manifest + schema 测试；readiness PASS 不等于 schema 通过，schema 缺失或不一致时状态为失败/待修复 |
 
 ## 上线准入（§7 摘要）
 
 > 私有化 Beta readiness 与真实封禁 readiness 分开判断。默认 `python scripts/check_production_readiness.py` 是 `private-beta` gate，允许 `DRY_RUN=true`；真实封禁上线必须额外通过 `python scripts/check_production_readiness.py --gate real-enforcement`。
 
 - [ ] `.env` 生产配置完成；无默认密钥/默认密码  
-- [ ] 数据库迁移/初始化完成；备份策略可用  
+- [ ] 数据库迁移/初始化完成；`python web/init_db.py --check` 和 Alembic revision 检查通过；备份策略可用
 - [ ] Redis `requirepass`；Compose 绑定策略符合 `deployment.md`  
-- [ ] `/readyz`、健康检查通过  
+- [ ] `/readyz`、健康检查通过；不得用 readiness PASS 替代 schema readiness
 - [ ] `python -m pytest -q` 全绿  
 - [ ] `python -m pytest -m production_e2e -q` 通过；模型缺失和 Redis memory fallback 仅由 `python -m pytest -m degradation_e2e -q` 验证，不计入生产通过标准
+- [ ] HTTP/API 性能验收报告无 429/5xx、错误率为 0、P95 达标；`rate-limit` 场景出现 429 只证明限流生效，不计入性能通过
 - [ ] 私有化 Beta 保持或允许 `DRY_RUN=true`，dry-run 响应记录可审计  
 - [ ] 真实封禁仅在 `--gate real-enforcement` 无 `[FAIL]` 后启用，且审批、审计、回滚、解封、复盘证据齐备  
 - [ ] 审计完整性抽检通过  

@@ -1,6 +1,15 @@
 # CI/CD 与测试分组
 
-本项目使用 GitHub Actions 作为基础 CI。默认质量门禁在每次 `push` / `pull_request` 上运行，目标是快速发现单元、核心安全、schema/manifest 和 production-e2e 验收问题；慢测与降级 E2E 不放进默认必跑链路，避免 CI 被外部等待或容灾流程拖慢。
+本项目使用 GitHub Actions 作为基础 CI。默认质量门禁在每次 `push` / `pull_request` 上运行，目标是快速发现单元、核心安全、schema/manifest 和 production-e2e 验收问题；慢测、`scripts/verify_v1.py` 和降级 E2E 不放进默认生产放行口径，避免把模型缺失、Redis memory fallback 等降级场景误写成生产验收通过。
+
+## 当前口径修正
+
+| 项目 | 真实验收命令 | 当前状态 |
+|---|---|---|
+| production-e2e 非降级验收 | `python -m pytest -m production_e2e -q` | 待复核；只覆盖非降级场景 |
+| degradation-e2e 容灾验证 | `python -m pytest -m degradation_e2e -q` | 不计入生产通过 |
+| 旧 v1 脚本 | `python scripts/verify_v1.py` | 不作为生产验收；该脚本混有模型缺失和 Redis fallback 场景 |
+| PostgreSQL/Redis 非降级依赖 | `python scripts/run_non_degraded_tests.py` | 失败/待修复：若仍出现 Redis memory fallback，不得写为非降级通过 |
 
 ## 默认质量门禁
 
@@ -31,14 +40,12 @@ CI 使用 Python 3.10，和 `Dockerfile` 中的 `python:3.10-slim` 运行基线�
    - `python -m pytest tests/test_schema_manifest.py tests/test_model_registry.py -q --tb=short --maxfail=1`
    - 覆盖特征 schema、模型 manifest、模型治理字段、版本切换和上线策略。
 
-6. **v1 验收脚本**
-   - `python scripts/verify_v1.py`
-   - 覆盖 v1 场景 1 到 9。场景 10 由 E2E 分组覆盖。
-
-7. **production-e2e 非降级生产验收**
+6. **production-e2e 非降级生产验收**
    - `python -m pytest -m production_e2e -q`
    - 覆盖场景 1～6、9、10：正常 Web、SQLi、双层 XSS、命令注入、IOC、SYN/异常、审计篡改、Web 重启后历史告警可查。
    - 该分组要求模型制品完整，且不得设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`；模型缺失和 Redis memory fallback 不计入生产通过标准。
+
+`scripts/verify_v1.py` 仍可作为研发补充回归手工运行，但它混有降级场景，不属于默认生产质量门禁，也不得作为生产验收通过证据。
 
 ## 可选分组
 

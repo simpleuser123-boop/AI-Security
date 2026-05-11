@@ -130,6 +130,16 @@ python -m tests._smoke_phase7
 python -m tests._phase8_smoke
 ```
 
+当前验收口径修正：
+
+| 项目 | 真实验收命令 | 当前状态 |
+|---|---|---|
+| readiness 与 schema | `python scripts/check_production_readiness.py` 只能作为配置/依赖 gate；schema 需另跑 `python web/init_db.py --check` 和 Alembic revision 检查 | 失败/待修复：readiness PASS 但 schema 缺失时不能写成通过 |
+| HTTP/API 1000 请求/32 workers | `python scripts/benchmark_http.py --base-url http://127.0.0.1:5000 --requests 1000 --workers 32 --warmup-requests 100` | 失败：既有报告出现 429/500 |
+| production-e2e | `python -m pytest -m production_e2e -q` | 待复核；只允许非降级场景 |
+| degradation-e2e | `python -m pytest -m degradation_e2e -q` | 不计入生产通过 |
+| 宿主机非降级依赖 | `python scripts/run_non_degraded_tests.py` | 失败/待修复：Redis memory fallback 残留时不得写成 PostgreSQL/Redis 非降级通过 |
+
 - **默认 pytest 入口**：`python -m pytest -q`。默认排除 `slow`、`integration`、`e2e`；若存在 `.env.host-nondegraded.example`，pytest 入口会加载宿主机 PostgreSQL/Redis 配置，避免数据库持久化测试缺少 `DATABASE_URL`。
 - **宿主机非降级测试入口**：`python scripts/run_non_degraded_tests.py`。运行前先按 [docs/local-real-dependencies.md](docs/local-real-dependencies.md) 使用 `python scripts/start_local_deps.py --env-file .env.host-nondegraded.example` 启动本机 PostgreSQL 和 Redis；入口会加载 `.env.host-nondegraded.example`，要求 DB/Redis 均通过 `127.0.0.1` 端口访问，禁止 SQLite、Compose 服务名、Redis memory fallback、`GUARDIAN_REDIS_DISABLE_CONNECT=true`、关闭 `REQUIRE_REDIS_AVAILABLE`/`REQUIRE_MODELS_READY`，且 pytest skip 会判失败。若默认端口被占用并显式使用 `--port-strategy alternate`，后续验证/测试需传入脚本生成的 `tmp/local-deps.env`。
 - **Compose prod-drill 配置入口**：`docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml config`。该 env 只用于 Compose prod-drill，DB/Redis 分别使用 `postgres` / `redis` 服务名，不用于宿主机直接测试。
@@ -149,7 +159,7 @@ python -m tests._phase8_smoke
 - **degradation-e2e 容灾/降级验证**：`python -m pytest -m degradation_e2e -q`。覆盖模型缺失后其他引擎继续工作、Redis 中断后 memory fallback；不计入生产通过标准。
 - **端到端脚本边界**：`scripts/verify_v1.py` 仍是研发补充回归脚本，包含降级场景，不作为生产验收通过标准。  
 - **压测与 P95**：`scripts/benchmark_p95.py`（检测链路与 HTTP 粗测；Redis Stream 观测命令见脚本输出）。  
-- **HTTP/API 生产口径压测**：`scripts/benchmark_http.py --scenario performance` 会自动登录获取 JWT，覆盖核心 API，输出 avg、P50、P95、P99、错误率、状态码分布，并在 `reports/benchmarks/` 生成 JSON 与 Markdown 报告。默认目标：核心 API P95 < 300ms，检测段 P95 < 100ms；`ok-statuses` 禁止包含 429，任何 429/500 都会让性能压测失败。
+- **HTTP/API 生产口径压测**：`scripts/benchmark_http.py --scenario performance` 会自动登录获取 JWT，覆盖核心 API，输出 avg、P50、P95、P99、错误率、状态码分布，并在 `reports/benchmarks/` 生成 JSON 与 Markdown 报告。默认目标：核心 API P95 < 300ms，检测段 P95 < 100ms；`ok-statuses` 禁止包含 429，任何 429/500 都会让性能压测失败。既有 1000 请求/32 workers 报告出现 429/500，当前状态为失败；200 请求/8 workers/8 RPS 的 PASS 只代表受限负载样本通过。
 - **限流验证**：使用 `scripts/benchmark_http.py --scenario rate-limit`，在专用低阈值 `API_RATE_LIMIT` 环境下确认 429 出现。该场景只证明限流生效，429 仍计为失败请求，不作为性能压测通过条件。
 
 示例：
