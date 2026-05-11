@@ -52,6 +52,9 @@ AUTH_REQUIRED_PREFIXES: Tuple[str, ...] = (
 )
 API_P95_TARGET_MS = 300.0
 DETECTION_P95_TARGET_MS = 100.0
+SCENARIO_PERFORMANCE = "performance"
+SCENARIO_RATE_LIMIT = "rate-limit"
+SCENARIOS = (SCENARIO_PERFORMANCE, SCENARIO_RATE_LIMIT)
 
 
 @dataclass(frozen=True)
@@ -306,10 +309,12 @@ def run_fixed_requests(
     workers: int,
     timeout: float,
     ok_statuses: Sequence[int],
+    target_rps: float,
 ) -> List[Sample]:
     work = [endpoints[i % len(endpoints)] for i in range(requests_count)]
     random.shuffle(work)
     samples: List[Sample] = []
+    min_submit_interval = (1.0 / target_rps) if target_rps > 0 else 0.0
 
     def one(endpoint: Endpoint) -> Sample:
         thread_local = _thread_local()
@@ -323,7 +328,15 @@ def run_fixed_requests(
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(one, endpoint) for endpoint in work]
+        futures = []
+        next_submit_at = time.perf_counter()
+        for endpoint in work:
+            if min_submit_interval > 0:
+                now = time.perf_counter()
+                if now < next_submit_at:
+                    time.sleep(next_submit_at - now)
+                next_submit_at = max(next_submit_at + min_submit_interval, time.perf_counter())
+            futures.append(pool.submit(one, endpoint))
         for future in as_completed(futures):
             samples.append(future.result())
     return samples
@@ -347,20 +360,33 @@ def run_duration(
     workers: int,
     timeout: float,
     ok_statuses: Sequence[int],
+    target_rps: float,
 ) -> List[Sample]:
     end_at = time.monotonic() + duration
     samples: List[Sample] = []
     lock = threading.Lock()
     counter = 0
+    next_allowed_at = time.perf_counter()
+    min_submit_interval = (1.0 / target_rps) if target_rps > 0 else 0.0
 
     def worker(worker_id: int) -> List[Sample]:
-        nonlocal counter
+        nonlocal counter, next_allowed_at
         session = requests.Session()
         local_samples: List[Sample] = []
         while time.monotonic() < end_at:
             with lock:
                 endpoint = endpoints[counter % len(endpoints)]
                 counter += 1
+                if min_submit_interval > 0:
+                    now = time.perf_counter()
+                    wait_for = max(0.0, next_allowed_at - now)
+                    next_allowed_at = max(next_allowed_at + min_submit_interval, now)
+                else:
+                    wait_for = 0.0
+            if wait_for > 0:
+                time.sleep(wait_for)
+            if time.monotonic() >= end_at:
+                break
             local_samples.append(
                 _request_once(
                     session=session,
@@ -380,11 +406,22 @@ def run_duration(
     return samples
 
 
+def _has_status(summary: Dict[str, Any], status_code: int) -> bool:
+    return str(status_code) in summary["overall"]["status_codes"]
+
+
+def _has_5xx(summary: Dict[str, Any]) -> bool:
+    return any(
+        code.isdigit() and 500 <= int(code) <= 599
+        for code in summary["overall"]["status_codes"]
+    )
+
+
 def _format_ms(value: float) -> str:
     return f"{value:.2f}"
 
 
-def _judgement(summary: Dict[str, Any], detection: Dict[str, Any]) -> Dict[str, Any]:
+def _performance_judgement(summary: Dict[str, Any], detection: Dict[str, Any]) -> Dict[str, Any]:
     overall_p95 = float(summary["overall"]["p95_ms"])
     endpoint_failures = {
         name: {
@@ -400,15 +437,45 @@ def _judgement(summary: Dict[str, Any], detection: Dict[str, Any]) -> Dict[str, 
         and not endpoint_failures
     )
     result = {
+        "scenario": SCENARIO_PERFORMANCE,
         "api_target": f"core API P95 < {API_P95_TARGET_MS:.0f}ms",
         "api_pass": api_pass,
         "api_p95_ms": overall_p95,
         "api_endpoint_failures": endpoint_failures,
+        "rate_limited": _has_status(summary, 429),
+        "server_errors": _has_5xx(summary),
         "detection_target": f"detection segment P95 < {DETECTION_P95_TARGET_MS:.0f}ms",
         "detection_pass": detection.get("pass") if detection.get("enabled") else None,
         "detection_p95_ms": detection.get("p95_ms"),
     }
     return result
+
+
+def _rate_limit_judgement(summary: Dict[str, Any]) -> Dict[str, Any]:
+    observed = _has_status(summary, 429)
+    server_errors = _has_5xx(summary)
+    return {
+        "scenario": SCENARIO_RATE_LIMIT,
+        "rate_limit_target": "HTTP 429 appears under intentionally low limit",
+        "rate_limit_observed": observed,
+        "server_errors": server_errors,
+        "api_pass": observed and not server_errors,
+        "api_p95_ms": summary["overall"]["p95_ms"],
+        "api_endpoint_failures": {},
+        "detection_target": f"detection segment P95 < {DETECTION_P95_TARGET_MS:.0f}ms",
+        "detection_pass": None,
+        "detection_p95_ms": None,
+    }
+
+
+def _judgement(
+    summary: Dict[str, Any],
+    detection: Dict[str, Any],
+    scenario: str,
+) -> Dict[str, Any]:
+    if scenario == SCENARIO_RATE_LIMIT:
+        return _rate_limit_judgement(summary)
+    return _performance_judgement(summary, detection)
 
 
 def write_reports(report: Dict[str, Any], output_dir: Path, prefix: str) -> Tuple[Path, Path]:
@@ -435,14 +502,28 @@ def render_markdown(report: Dict[str, Any]) -> str:
         f"- base_url: `{report['base_url']}`",
         f"- mode: `{report['mode']}`",
         f"- workers: `{report['workers']}`",
+        f"- target_rps: `{report.get('target_rps') or 0}`",
         f"- elapsed_sec: `{report['elapsed_sec']:.3f}`",
         f"- throughput_rps: `{report['throughput_rps']:.2f}`",
         "",
         "## Judgement",
         "",
-        f"- Core API target: `{judgement['api_target']}` -> **{'PASS' if judgement['api_pass'] else 'FAIL'}**",
-        f"- Detection target: `{judgement['detection_target']}` -> **{_pass_label(judgement['detection_pass'])}**",
     ]
+    if judgement.get("scenario") == SCENARIO_RATE_LIMIT:
+        lines.append(
+            f"- Rate-limit target: `{judgement['rate_limit_target']}` -> "
+            f"**{'PASS' if judgement['api_pass'] else 'FAIL'}**"
+        )
+        lines.append(f"- Server errors present: `{'yes' if judgement['server_errors'] else 'no'}`")
+    else:
+        lines.extend(
+            [
+                f"- Core API target: `{judgement['api_target']}` -> **{'PASS' if judgement['api_pass'] else 'FAIL'}**",
+                f"- Detection target: `{judgement['detection_target']}` -> **{_pass_label(judgement['detection_pass'])}**",
+                f"- HTTP 429 present: `{'yes' if judgement['rate_limited'] else 'no'}`",
+                f"- HTTP 5xx present: `{'yes' if judgement['server_errors'] else 'no'}`",
+            ]
+        )
     if judgement.get("api_endpoint_failures"):
         lines.append(
             f"- Endpoint failures: `{json.dumps(judgement['api_endpoint_failures'], ensure_ascii=False)}`"
@@ -508,7 +589,13 @@ def _parse_ok_statuses(raw: str) -> Tuple[int, ...]:
         if not item:
             continue
         statuses.append(int(item))
-    return tuple(statuses or [200])
+    parsed = tuple(statuses or [200])
+    if 429 in parsed:
+        raise ValueError(
+            "HTTP 429 must not be included in ok-statuses; use --scenario rate-limit "
+            "to verify limiter behavior while keeping 429 counted as a failed request"
+        )
+    return parsed
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -538,6 +625,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--warmup-seconds", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument(
+        "--scenario",
+        choices=SCENARIOS,
+        default=os.environ.get("BENCHMARK_SCENARIO", SCENARIO_PERFORMANCE),
+        help="performance gates latency/error-rate; rate-limit verifies 429 under a low limit",
+    )
+    ap.add_argument(
+        "--target-rps",
+        type=float,
+        default=float(os.environ.get("BENCHMARK_TARGET_RPS", "0") or "0"),
+        help="Optional measured-request pacing. Use this for performance runs that must stay below API_RATE_LIMIT.",
+    )
+    ap.add_argument(
         "--username",
         default=_env_value("BENCHMARK_USERNAME", dotenv, _env_value("ADMIN_USERNAME", dotenv, "admin")),
     )
@@ -565,10 +664,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not endpoints:
         raise SystemExit("at least one endpoint is required")
     workers = max(1, args.workers)
-    ok_statuses = _parse_ok_statuses(args.ok_statuses)
+    try:
+        ok_statuses = _parse_ok_statuses(args.ok_statuses)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     token = args.jwt_token.strip()
     needs_auth = any(e.auth_required for e in endpoints)
+    if args.scenario == SCENARIO_PERFORMANCE and needs_auth and args.no_auth:
+        raise SystemExit("performance benchmark cannot use --no-auth for protected API endpoints")
     if needs_auth and not token and not args.no_auth:
         token = login_for_token(
             base_url=args.base_url,
@@ -599,6 +703,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             workers=workers,
             timeout=args.timeout,
             ok_statuses=ok_statuses,
+            target_rps=max(0.0, args.target_rps),
         )
         mode = f"duration:{args.duration:.3f}s"
     else:
@@ -610,18 +715,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             workers=workers,
             timeout=args.timeout,
             ok_statuses=ok_statuses,
+            target_rps=max(0.0, args.target_rps),
         )
         mode = f"requests:{max(1, args.requests)}"
     elapsed = time.perf_counter() - t0
 
     summary = _summarize(samples)
-    detection = bench_detection_latency(args.detect_iters)
+    detection = (
+        bench_detection_latency(args.detect_iters)
+        if args.scenario == SCENARIO_PERFORMANCE
+        else {"enabled": False}
+    )
     report: Dict[str, Any] = {
         "tool": "scripts/benchmark_http.py",
         "started_at": started_at,
         "base_url": args.base_url,
+        "scenario": args.scenario,
         "mode": mode,
         "workers": workers,
+        "target_rps": max(0.0, args.target_rps),
         "warmup": {
             "requests": args.warmup_requests,
             "seconds": args.warmup_seconds,
@@ -640,7 +752,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "summary": summary,
         "detection": detection,
     }
-    report["judgement"] = _judgement(summary, detection)
+    report["judgement"] = _judgement(summary, detection, args.scenario)
     json_path, md_path = write_reports(report, Path(args.output_dir), args.report_prefix)
 
     overall = summary["overall"]
@@ -658,11 +770,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"target<{DETECTION_P95_TARGET_MS:.0f}ms "
             f"{'PASS' if detection['pass'] else 'FAIL'}"
         )
-    print(
-        "Production target: "
-        f"core_api_p95<{API_P95_TARGET_MS:.0f}ms "
-        f"{'PASS' if report['judgement']['api_pass'] else 'FAIL'}"
-    )
+    if args.scenario == SCENARIO_RATE_LIMIT:
+        print(
+            "Rate-limit target: "
+            f"429_observed={'yes' if report['judgement']['rate_limit_observed'] else 'no'} "
+            f"5xx_present={'yes' if report['judgement']['server_errors'] else 'no'} "
+            f"{'PASS' if report['judgement']['api_pass'] else 'FAIL'}"
+        )
+    else:
+        print(
+            "Production target: "
+            f"core_api_p95<{API_P95_TARGET_MS:.0f}ms "
+            f"{'PASS' if report['judgement']['api_pass'] else 'FAIL'}"
+        )
     print(f"JSON report: {json_path}")
     print(f"Markdown report: {md_path}")
     return 0 if report["judgement"]["api_pass"] else 2

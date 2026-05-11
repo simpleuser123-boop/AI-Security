@@ -52,11 +52,15 @@ def classification_metrics(
     average: str = "weighted",
 ) -> Dict[str, float]:
     """生成包含 Accuracy/Precision/Recall/F1/FPR/FNR 的统一指标字典。"""
+    metric_kwargs: Dict[str, Any] = {}
+    if positive_label is not None and average == "binary":
+        metric_kwargs["pos_label"] = positive_label
     precision, recall, f1, _support = precision_recall_fscore_support(
         y_true,
         y_pred,
         average=average,
         zero_division=0,
+        **metric_kwargs,
     )
     if positive_label is not None:
         fpr, fnr = _binary_fpr_fnr(y_true, y_pred, positive_label)

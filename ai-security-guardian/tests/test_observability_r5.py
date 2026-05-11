@@ -8,22 +8,32 @@ from pathlib import Path
 
 import pytest
 
+from tests.auth_helpers import configure_test_admin
+
 
 def _make_app(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASK_ENV", "testing")
     monkeypatch.setenv("AUDIT_INTEGRITY_PATROL", "false")
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "false")
     db_file = tmp_path / "r5.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
     monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
     monkeypatch.setenv("REDIS_PORT", "63999")
 
     from web.app import create_app
+    from config.config import TestingConfig
+
+    monkeypatch.setattr(TestingConfig, "REQUIRE_REDIS_AVAILABLE", False)
+    monkeypatch.setattr(TestingConfig, "REQUIRE_MODELS_READY", False)
 
     app, _ = create_app()
     app.config["TESTING"] = True
+    from src.utils.redis_client import RedisClient
+
+    app.extensions["guardian_redis_client"] = RedisClient(host="127.0.0.1", port=0)
     return app
 
 
@@ -61,6 +71,56 @@ def test_readyz_unready_on_db_failure(monkeypatch, tmp_path):
     r = client.get("/readyz")
     assert r.status_code == 503
     assert r.get_json().get("status") == "unready"
+
+
+def test_readyz_unready_on_postgresql_schema_gap(monkeypatch, tmp_path):
+    app = _make_app(monkeypatch, tmp_path)
+    client = app.test_client()
+
+    from web import observability_routes
+    from web.schema_readiness import SchemaReadinessResult
+
+    monkeypatch.setattr(
+        observability_routes,
+        "check_schema_readiness",
+        lambda _engine: SchemaReadinessResult(
+            False,
+            "missing tables: alerts; alembic not at head: current=(none); head=20260506_0001",
+        ),
+    )
+
+    r = client.get("/readyz")
+    body = r.get_json()
+
+    assert r.status_code == 503
+    assert body["status"] == "unready"
+    assert "database" in body["fatal"]
+    assert body["checks"]["database"]["ok"] is False
+    assert "missing tables" in body["checks"]["database"]["detail"]
+
+
+def test_readyz_ok_on_postgresql_schema_head(monkeypatch, tmp_path):
+    app = _make_app(monkeypatch, tmp_path)
+    client = app.test_client()
+
+    from web import observability_routes
+    from web.schema_readiness import SchemaReadinessResult
+
+    monkeypatch.setattr(
+        observability_routes,
+        "check_schema_readiness",
+        lambda _engine: SchemaReadinessResult(
+            True,
+            "10 business table(s) present; alembic head 20260506_0001",
+        ),
+    )
+
+    r = client.get("/readyz")
+    body = r.get_json()
+
+    assert r.status_code == 200
+    assert body["checks"]["database"]["ok"] is True
+    assert "alembic head" in body["checks"]["database"]["detail"]
 
 
 def test_readyz_unready_on_model_missing(monkeypatch, tmp_path):
@@ -314,16 +374,21 @@ def test_audit_integrity_failure_creates_critical_trace(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FLASK_ENV", "testing")
     monkeypatch.setenv("AUDIT_INTEGRITY_PATROL", "false")
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "false")
     db_file = tmp_path / "r5_audit.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
 
     logd = tmp_path / "logs"
     logd.mkdir(parents=True, exist_ok=True)
 
     from web.app import create_app
+    from config.config import TestingConfig
+
+    monkeypatch.setattr(TestingConfig, "REQUIRE_REDIS_AVAILABLE", False)
+    monkeypatch.setattr(TestingConfig, "REQUIRE_MODELS_READY", False)
 
     app, _ = create_app()
     app.config["TESTING"] = True

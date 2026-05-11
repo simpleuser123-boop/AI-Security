@@ -1,6 +1,6 @@
 # v1.0 验收清单（可打印）
 
-与 `docs/AI安全守卫-v1.0-交付验收与路线图.md` §4、§7、§8 及 `docs/AI安全守卫-v1.0-工程实施方案.md` §12 对照使用。完整场景脚本：`python scripts/verify_v1.py` + `python -m pytest tests/e2e/test_v1_acceptance.py -q`。
+与 `docs/AI安全守卫-v1.0-交付验收与路线图.md` §4、§7、§8 及 `docs/AI安全守卫-v1.0-工程实施方案.md` §12 对照使用。生产验收命令：`python -m pytest -m production_e2e -q`；降级容灾验证命令：`python -m pytest -m degradation_e2e -q`，不计入生产通过标准。
 
 ## 功能验收（F-01～F-10）
 
@@ -23,7 +23,7 @@
 |------|--------|----------|----------|
 | S-01 | API 认证 | 除豁免路由外需 JWT | `tests/test_production_hardening.py`；匿名访问 `/api/*` 401 |
 | S-02 | 默认密钥 | 生产无默认 `SECRET_KEY` | 生产启动校验 |
-| S-03 | 管理员密码 | `ADMIN_PASSWORD_HASH`；无明文默认 | `verify_admin_credentials` 测试 |
+| S-03 | 管理员密码 | `ADMIN_PASSWORD_HASH`；无明文默认 | `verify_admin_credentials` 测试；非降级 E2E 使用测试哈希夹具登录 |
 | S-04 | CORS | 仅白名单 Origin | 配置审查 + 集成测试 |
 | S-05 | 命令注入防护 | IP 校验、`subprocess` 无 `shell=True` | `tests/test_responder.py` 等 |
 | S-06 | SSRF | Webhook 禁 localhost/元数据 | `tests/test_production_hardening.py` |
@@ -59,7 +59,7 @@
 - [ ] Redis `requirepass`；Compose 绑定策略符合 `deployment.md`  
 - [ ] `/readyz`、健康检查通过  
 - [ ] `python -m pytest -q` 全绿  
-- [ ] `python scripts/verify_v1.py` 通过；场景 10 pytest 通过  
+- [ ] `python -m pytest -m production_e2e -q` 通过；模型缺失和 Redis memory fallback 仅由 `python -m pytest -m degradation_e2e -q` 验证，不计入生产通过标准
 - [ ] 私有化 Beta 保持或允许 `DRY_RUN=true`，dry-run 响应记录可审计  
 - [ ] 真实封禁仅在 `--gate real-enforcement` 无 `[FAIL]` 后启用，且审批、审计、回滚、解封、复盘证据齐备  
 - [ ] 审计完整性抽检通过  
@@ -87,7 +87,8 @@
 | 命令注入 | `check_04` |
 | IOC 黑名单 | `check_05` |
 | SYN/流量异常 | `check_06`（真实模型或合成 anomaly） |
-| 模型缺失降级 | `check_07` |
-| Redis 降级 | `check_08` |
+| 模型缺失降级 | `check_07`（`degradation_e2e`，不计入生产通过标准） |
+| Redis 降级 | `check_08`（`degradation_e2e`，不计入生产通过标准） |
 | 审计篡改 | `check_09` |
 | Web 重启查告警 | `test_10_web_restart_alerts` |
+| 管理员错误密码拒绝 | `test_11_auth_rejects_bad_password` |

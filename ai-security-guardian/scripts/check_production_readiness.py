@@ -889,6 +889,42 @@ def check_database_connectivity() -> CheckResult:
     return CheckResult("DB_CONNECTIVITY", True, "database SELECT 1 succeeded")
 
 
+def check_database_schema() -> CheckResult:
+    value = _env("DATABASE_URL")
+    if not value:
+        return CheckResult("DB_SCHEMA", False, "DATABASE_URL is missing")
+    try:
+        url = make_url(value)
+    except Exception:  # noqa: BLE001
+        return CheckResult("DB_SCHEMA", False, "DATABASE_URL format is invalid")
+    if url.get_backend_name() != "postgresql":
+        return CheckResult("DB_SCHEMA", False, "production schema readiness requires PostgreSQL")
+
+    connect_args: dict[str, object] = {}
+    try:
+        connect_args["connect_timeout"] = int(float(_env("DB_CONNECT_TIMEOUT_SEC", "3")))
+    except ValueError:
+        return CheckResult("DB_SCHEMA", False, "DB_CONNECT_TIMEOUT_SEC must be numeric")
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    try:
+        from web.schema_readiness import check_schema_readiness
+
+        engine = create_engine(value, connect_args=connect_args, pool_pre_ping=True)
+        try:
+            result = check_schema_readiness(engine)
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("DB_SCHEMA", False, f"schema check failed ({_safe_exception_type(exc)})")
+
+    if not result.ok:
+        return CheckResult("DB_SCHEMA", False, result.detail)
+    return CheckResult("DB_SCHEMA", True, result.detail)
+
+
 def _checks(gate: ReadinessGate) -> Iterable[Callable[[], CheckResult]]:
     checks: list[Callable[[], CheckResult]] = [
         check_flask_env,
@@ -906,6 +942,7 @@ def _checks(gate: ReadinessGate) -> Iterable[Callable[[], CheckResult]]:
         check_audit_log_dir,
         check_redis_connectivity,
         check_database_connectivity,
+        check_database_schema,
     ]
     if gate == "real-enforcement":
         checks.extend(

@@ -263,6 +263,10 @@ def init_db_tables(app: Flask, *, force: bool = False) -> None:
     """
     env = os.environ.get("FLASK_ENV", "development")
     auto_prod = os.environ.get("AUTO_CREATE_DB_TABLES", "").lower() == "true"
+    migrations_only = os.environ.get("GUARDIAN_DB_MANAGED_BY_MIGRATIONS", "").lower() == "true"
+    if migrations_only and not force:
+        logger.info("[DB] 跳过 SQLAlchemy create_all；schema 由 Alembic 迁移管理。")
+        return
     if env == "production" and not force and not auto_prod:
         logger.info(
             "[DB] 生产环境跳过自动建表；请执行: "

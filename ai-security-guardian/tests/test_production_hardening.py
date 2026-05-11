@@ -8,6 +8,8 @@ import sys
 import pytest
 from werkzeug.security import generate_password_hash
 
+from tests.auth_helpers import TEST_ADMIN_PASSWORD, configure_test_admin
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 PRODUCTION_DB_URL = "postgresql+psycopg2://guardian:secret@db.prod.internal:5432/guardian_prod"
 
@@ -638,6 +640,173 @@ def test_readiness_database_connectivity_fails_when_database_unreachable(monkeyp
     assert "SELECT 1 failed" in result.reason
 
 
+def test_readiness_database_schema_fails_when_business_tables_missing(monkeypatch):
+    import scripts.check_production_readiness as readiness
+    import web.schema_readiness as schema_readiness
+
+    class FakeInspector:
+        def get_table_names(self):
+            return ["alembic_version"]
+
+        def get_columns(self, table_name):
+            if table_name == "alembic_version":
+                return [{"name": "version_num"}]
+            return []
+
+    class FakeScalarResult:
+        def all(self):
+            return []
+
+    class FakeExecuteResult:
+        def scalars(self):
+            return FakeScalarResult()
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement):
+            return FakeExecuteResult()
+
+    class FakeEngine:
+        class dialect:
+            name = "postgresql"
+
+        def connect(self):
+            return FakeConnection()
+
+        def dispose(self):
+            return None
+
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_DB_URL)
+    monkeypatch.setattr(readiness, "create_engine", lambda *args, **kwargs: FakeEngine())
+    monkeypatch.setattr(schema_readiness, "inspect", lambda _conn: FakeInspector())
+    monkeypatch.setattr(schema_readiness, "migration_heads", lambda: {"20260506_0001"})
+
+    result = readiness.check_database_schema()
+
+    assert result.ok is False
+    assert result.name == "DB_SCHEMA"
+    assert "missing tables" in result.reason
+    assert "alembic not at head" in result.reason
+
+
+def test_readiness_database_schema_passes_at_alembic_head(monkeypatch):
+    import scripts.check_production_readiness as readiness
+    import web.schema_readiness as schema_readiness
+
+    expected = schema_readiness.expected_business_schema()
+
+    class FakeInspector:
+        def get_table_names(self):
+            return sorted(set(expected) | {"alembic_version"})
+
+        def get_columns(self, table_name):
+            if table_name == "alembic_version":
+                return [{"name": "version_num"}]
+            return [{"name": name} for name in sorted(expected[table_name])]
+
+    class FakeScalarResult:
+        def all(self):
+            return ["20260506_0001"]
+
+    class FakeExecuteResult:
+        def scalars(self):
+            return FakeScalarResult()
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement):
+            return FakeExecuteResult()
+
+    class FakeEngine:
+        class dialect:
+            name = "postgresql"
+
+        def connect(self):
+            return FakeConnection()
+
+        def dispose(self):
+            return None
+
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_DB_URL)
+    monkeypatch.setattr(readiness, "create_engine", lambda *args, **kwargs: FakeEngine())
+    monkeypatch.setattr(schema_readiness, "inspect", lambda _conn: FakeInspector())
+    monkeypatch.setattr(schema_readiness, "migration_heads", lambda: {"20260506_0001"})
+
+    result = readiness.check_database_schema()
+
+    assert result.ok is True
+    assert result.name == "DB_SCHEMA"
+    assert "business table" in result.reason
+
+
+def test_readiness_database_schema_fails_when_required_column_missing(monkeypatch):
+    import scripts.check_production_readiness as readiness
+    import web.schema_readiness as schema_readiness
+
+    expected = schema_readiness.expected_business_schema()
+    alerts_columns = sorted(expected["alerts"])
+
+    class FakeInspector:
+        def get_table_names(self):
+            return sorted(set(expected) | {"alembic_version"})
+
+        def get_columns(self, table_name):
+            if table_name == "alembic_version":
+                return [{"name": "version_num"}]
+            columns = expected[table_name]
+            if table_name == "alerts":
+                columns = set(alerts_columns[1:])
+            return [{"name": name} for name in sorted(columns)]
+
+    class FakeScalarResult:
+        def all(self):
+            return ["20260506_0001"]
+
+    class FakeExecuteResult:
+        def scalars(self):
+            return FakeScalarResult()
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement):
+            return FakeExecuteResult()
+
+    class FakeEngine:
+        class dialect:
+            name = "postgresql"
+
+        def connect(self):
+            return FakeConnection()
+
+        def dispose(self):
+            return None
+
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_DB_URL)
+    monkeypatch.setattr(readiness, "create_engine", lambda *args, **kwargs: FakeEngine())
+    monkeypatch.setattr(schema_readiness, "inspect", lambda _conn: FakeInspector())
+    monkeypatch.setattr(schema_readiness, "migration_heads", lambda: {"20260506_0001"})
+
+    result = readiness.check_database_schema()
+
+    assert result.ok is False
+    assert "alerts missing columns" in result.reason
+
+
 def test_readiness_main_reports_warn_fail_and_never_prints_secrets(monkeypatch, tmp_path, capsys):
     import redis
     import scripts.check_production_readiness as readiness
@@ -718,23 +887,28 @@ def test_readiness_main_reports_warn_fail_and_never_prints_secrets(monkeypatch, 
 def test_verify_admin_rejects_production_without_hash(monkeypatch):
     monkeypatch.setenv("FLASK_ENV", "production")
     monkeypatch.delenv("ADMIN_PASSWORD_HASH", raising=False)
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    monkeypatch.setenv("ADMIN_PASSWORD", TEST_ADMIN_PASSWORD)
     monkeypatch.setenv("ADMIN_USERNAME", "admin")
     from src.utils.auth import verify_admin_credentials
 
-    assert verify_admin_credentials("admin", "changeme") is False
+    assert verify_admin_credentials("admin", TEST_ADMIN_PASSWORD) is False
 
 
 def test_protected_api_returns_401_without_jwt(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASK_ENV", "testing")
     monkeypatch.setenv("AUDIT_INTEGRITY_PATROL", "false")
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "false")
     db_file = tmp_path / "harden.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
 
     from web.app import create_app
+    from config.config import TestingConfig
+
+    monkeypatch.setattr(TestingConfig, "REQUIRE_REDIS_AVAILABLE", False)
+    monkeypatch.setattr(TestingConfig, "REQUIRE_MODELS_READY", False)
 
     app, _ = create_app()
     app.config["TESTING"] = True
@@ -746,14 +920,19 @@ def test_protected_api_returns_401_without_jwt(monkeypatch, tmp_path):
 def test_cors_rejects_disallowed_origin(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASK_ENV", "testing")
     monkeypatch.setenv("AUDIT_INTEGRITY_PATROL", "false")
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "false")
     monkeypatch.setenv("ALLOWED_ORIGINS", "https://trusted.example")
     db_file = tmp_path / "cors.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
 
     from web.app import create_app
+    from config.config import TestingConfig
+
+    monkeypatch.setattr(TestingConfig, "REQUIRE_REDIS_AVAILABLE", False)
+    monkeypatch.setattr(TestingConfig, "REQUIRE_MODELS_READY", False)
 
     app, _ = create_app()
     app.config["TESTING"] = True

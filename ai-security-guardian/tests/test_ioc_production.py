@@ -8,14 +8,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.auth_helpers import configure_test_admin
+
 
 def _flask_app(monkeypatch, tmp_path):
     db_file = tmp_path / "ioc_prod.db"
     monkeypatch.setenv("FLASK_ENV", "testing")
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
 
     from web.app import create_app
 

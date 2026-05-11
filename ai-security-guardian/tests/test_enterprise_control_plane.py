@@ -6,21 +6,27 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tests.auth_helpers import auth_headers, configure_test_admin
+
 
 def _build_test_app(monkeypatch, tmp_path, *, role: str = "admin"):
     db_file = tmp_path / f"guardian_{role}_{uuid.uuid4().hex}.db"
     monkeypatch.setenv("FLASK_ENV", "testing")
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "false")
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
-    monkeypatch.setenv("ADMIN_ROLE", role)
+    configure_test_admin(monkeypatch, role=role)
     monkeypatch.setenv(
         "AUDIT_LOG_DIR",
         str(tmp_path / f"audit_{role}_{uuid.uuid4().hex}"),
     )
 
     from web.app import create_app
+    from config.config import TestingConfig
+
+    monkeypatch.setattr(TestingConfig, "REQUIRE_REDIS_AVAILABLE", False)
+    monkeypatch.setattr(TestingConfig, "REQUIRE_MODELS_READY", False)
 
     app, _ = create_app()
     app.config["TESTING"] = True

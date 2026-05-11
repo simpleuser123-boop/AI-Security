@@ -8,7 +8,7 @@
 
 场景 10 请运行::
 
-    python -m pytest tests/e2e/test_v1_acceptance.py::test_10_web_restart_alerts -q
+    python -m pytest -m e2e tests/e2e/test_v1_acceptance.py::test_10_web_restart_alerts -q
 """
 from __future__ import annotations
 

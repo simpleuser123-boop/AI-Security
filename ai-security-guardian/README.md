@@ -119,40 +119,73 @@ python -c "import os,sys; d=os.getenv('MODEL_DIR','models/saved'); req=['intrusi
 ## 最小验证流程
 
 ```bash
+python scripts/run_non_degraded_tests.py
 python -m pytest -q
 python scripts/check_production_readiness.py
 python scripts/check_production_readiness.py --gate real-enforcement  # 仅真实封禁上线前执行
-python scripts/verify_v1.py
+python -m pytest -m production_e2e -q
+python -m pytest -m degradation_e2e -q  # 研发容灾回归，不计入生产通过标准
 python scripts/benchmark_p95.py
-python -m pytest tests/e2e/test_v1_acceptance.py -q
 python -m tests._smoke_phase7
 python -m tests._phase8_smoke
 ```
 
-- **默认单元/离线测试**：`python -m pytest -q`。默认排除 `slow`、`integration`、`e2e`，并禁用真实 Redis 连接，使用内存降级路径，适合本地和 CI 快速验证。
+- **默认 pytest 入口**：`python -m pytest -q`。默认排除 `slow`、`integration`、`e2e`；若存在 `.env.host-nondegraded.example`，pytest 入口会加载宿主机 PostgreSQL/Redis 配置，避免数据库持久化测试缺少 `DATABASE_URL`。
+- **宿主机非降级测试入口**：`python scripts/run_non_degraded_tests.py`。运行前先按 [docs/local-real-dependencies.md](docs/local-real-dependencies.md) 使用 `python scripts/start_local_deps.py --env-file .env.host-nondegraded.example` 启动本机 PostgreSQL 和 Redis；入口会加载 `.env.host-nondegraded.example`，要求 DB/Redis 均通过 `127.0.0.1` 端口访问，禁止 SQLite、Compose 服务名、Redis memory fallback、`GUARDIAN_REDIS_DISABLE_CONNECT=true`、关闭 `REQUIRE_REDIS_AVAILABLE`/`REQUIRE_MODELS_READY`，且 pytest skip 会判失败。若默认端口被占用并显式使用 `--port-strategy alternate`，后续验证/测试需传入脚本生成的 `tmp/local-deps.env`。
+- **Compose prod-drill 配置入口**：`docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml config`。该 env 只用于 Compose prod-drill，DB/Redis 分别使用 `postgres` / `redis` 服务名，不用于宿主机直接测试。
 - **慢测**：`python -m pytest -m slow -q`；包含有意等待外部超时/降级的测试。
-- **集成测试**：`$env:GUARDIAN_REDIS_DISABLE_CONNECT="false"; python -m pytest -m integration -q`（PowerShell）。Redis Stream 集成测试需要可用 Redis；未连上时测试会跳过。
-- **E2E 验收**：`python -m pytest -m e2e -q` 或直接运行 `python -m pytest tests/e2e/test_v1_acceptance.py -q`。
-- **端到端验收**：`scripts/verify_v1.py`（场景 1～9）；场景 10（Web 重启后仍可查库内告警）由 `tests/e2e/test_v1_acceptance.py` 覆盖。  
+- **Redis Stream 真实集成测试**：必须使用启用认证的真实 Redis，不允许内存降级。PowerShell 示例：
+  ```powershell
+  python scripts/start_local_deps.py --env-file .env.host-nondegraded.example
+  $env:REDIS_HOST="127.0.0.1"
+  $env:REDIS_PORT="56379"
+  $env:REDIS_TEST_DB="15"
+  $env:REDIS_PASSWORD="guardian-local-redis-pass"
+  $env:REQUIRE_REDIS_AVAILABLE="true"
+  $env:GUARDIAN_REDIS_DISABLE_CONNECT="false"; python -m pytest -m integration tests/test_alert_stream_redis.py -q -rA
+  ```
+- **集成测试**：`$env:GUARDIAN_REDIS_DISABLE_CONNECT="false"; python -m pytest -m integration -q`（PowerShell）。Redis 相关集成测试运行前应先按上面的 Redis Stream 真实集成测试口径配置连接参数。
+- **production-e2e 非降级生产验收**：`python -m pytest -m production_e2e -q`。覆盖场景 1～6、9、10；要求模型制品完整，且不得使用 Redis memory fallback 或 `GUARDIAN_REDIS_DISABLE_CONNECT=true`。
+- **degradation-e2e 容灾/降级验证**：`python -m pytest -m degradation_e2e -q`。覆盖模型缺失后其他引擎继续工作、Redis 中断后 memory fallback；不计入生产通过标准。
+- **端到端脚本边界**：`scripts/verify_v1.py` 仍是研发补充回归脚本，包含降级场景，不作为生产验收通过标准。  
 - **压测与 P95**：`scripts/benchmark_p95.py`（检测链路与 HTTP 粗测；Redis Stream 观测命令见脚本输出）。  
-- **HTTP/API 生产口径压测**：`scripts/benchmark_http.py` 会自动登录获取 JWT，覆盖核心 API，输出 avg、P50、P95、P99、错误率、状态码分布，并在 `reports/benchmarks/` 生成 JSON 与 Markdown 报告。默认目标：核心 API P95 < 300ms，检测段 P95 < 100ms。
+- **HTTP/API 生产口径压测**：`scripts/benchmark_http.py --scenario performance` 会自动登录获取 JWT，覆盖核心 API，输出 avg、P50、P95、P99、错误率、状态码分布，并在 `reports/benchmarks/` 生成 JSON 与 Markdown 报告。默认目标：核心 API P95 < 300ms，检测段 P95 < 100ms；`ok-statuses` 禁止包含 429，任何 429/500 都会让性能压测失败。
+- **限流验证**：使用 `scripts/benchmark_http.py --scenario rate-limit`，在专用低阈值 `API_RATE_LIMIT` 环境下确认 429 出现。该场景只证明限流生效，429 仍计为失败请求，不作为性能压测通过条件。
 
 示例：
 
 ```bash
 BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' \
 python scripts/benchmark_http.py \
+  --scenario performance \
   --base-url http://127.0.0.1:5000 \
-  --requests 1000 \
-  --workers 32 \
-  --warmup-requests 100
+  --requests 200 \
+  --workers 8 \
+  --target-rps 8 \
+  --warmup-requests 0 \
+  --report-prefix http-benchmark-performance
 
 BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' \
 python scripts/benchmark_http.py \
+  --scenario performance \
   --base-url http://127.0.0.1:5000 \
   --duration 60 \
-  --workers 32 \
-  --warmup-seconds 10
+  --workers 8 \
+  --target-rps 8 \
+  --warmup-seconds 0 \
+  --report-prefix http-benchmark-performance
+
+# 限流独立验证：先在专用 benchmark 环境中把 API_RATE_LIMIT 降低，例如 2 per minute，
+# 然后只打受保护 API，报告前缀单独区分。
+BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' \
+python scripts/benchmark_http.py \
+  --scenario rate-limit \
+  --base-url http://127.0.0.1:5000 \
+  --endpoints /api/stats \
+  --requests 6 \
+  --workers 3 \
+  --warmup-requests 0 \
+  --report-prefix http-benchmark-ratelimit
 ```
 
 手动检查流程：`/login` -> `/dashboard` -> `/alerts` -> `/settings`。

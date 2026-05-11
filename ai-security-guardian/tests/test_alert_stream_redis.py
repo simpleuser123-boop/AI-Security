@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.auth_helpers import auth_headers, configure_test_admin
+
 
 def _redis_ping() -> bool:
     try:
@@ -41,8 +43,7 @@ def stream_env(monkeypatch, tmp_path: Path) -> dict:
     monkeypatch.setenv("FLASK_ENV", "testing")
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b-long")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
     monkeypatch.setenv("GUARDIAN_REDIS_DISABLE_CONNECT", "false")
     monkeypatch.setenv("ALERT_STREAM_CONSUMER_AUTOSTART", "false")
     monkeypatch.setenv("GUARDIAN_ALERT_STREAM", stream)
@@ -224,13 +225,7 @@ def test_api_survives_app_recreate_same_database(stream_env):
     # 新 Flask 应用实例，复用同一 DATABASE_URL
     app2, _ = _make_pair()
     client = app2.test_client()
-    login = client.post(
-        "/api/auth/login",
-        json={"username": "admin", "password": "changeme"},
-    )
-    assert login.status_code == 200
-    token = login.get_json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers, _ = auth_headers(client)
     resp = client.get("/api/alerts", headers=headers)
     assert resp.status_code == 200
     data = resp.get_json()

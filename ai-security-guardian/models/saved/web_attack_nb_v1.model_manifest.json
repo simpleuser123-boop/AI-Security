@@ -9,20 +9,24 @@
   "training_dataset": "builtin_web_attack_samples",
   "training_data_description": "Curated built-in web attack examples with encoded bypass variants. This is synthetic/curated coverage evidence, not production traffic performance.",
   "metrics": {
-    "accuracy": 0.9498204906204906,
-    "precision": 0.9498204906204906,
-    "recall": 0.9498204906204906,
-    "f1": 0.9498204906204906,
-    "fpr": 0.01254487734487735,
-    "fnr": 0.0501795093795094,
+    "accuracy": 0.96,
+    "precision": 0.9657142857142857,
+    "recall": 0.96,
+    "f1": 0.9586813186813187,
+    "fpr": 0.010526315789473684,
+    "fnr": 0.05,
     "cv_f1_weighted_mean": 0.9498204906204906,
-    "cv_f1_std": 0.04104570108415755
+    "cv_f1_std": 0.04104570108415755,
+    "adversarial_passed": 5,
+    "adversarial_total": 5
   },
-  "created_at": "2026-04-29T10:17:14Z",
-  "published_at": "2026-04-29T10:17:14Z",
+  "created_at": "2026-05-08T11:04:16Z",
+  "published_at": "2026-05-08T11:04:16Z",
   "artifact_files": {
     "model": "web_attack_nb_v1.pkl"
   },
+  "trust_tier": "production",
+  "model_input_mode": "text_sklearn_pipeline",
   "evaluation_report": {
     "model_name": "web_attack_nb_v1",
     "model_version": "1.0.0",
@@ -34,15 +38,13 @@
     "training_data_description": "Curated built-in web attack examples with encoded bypass variants. This is synthetic/curated coverage evidence, not production traffic performance.",
     "evaluation_data_description": "Stratified 80/20 split from the built-in sample set.",
     "metrics": {
-      "accuracy": 0.9498204906204906,
-      "precision": 0.9498204906204906,
-      "recall": 0.9498204906204906,
-      "f1": 0.9498204906204906,
-      "fpr": 0.01254487734487735,
-      "fnr": 0.0501795093795094
+      "accuracy": 0.96,
+      "precision": 0.9657142857142857,
+      "recall": 0.96,
+      "f1": 0.9586813186813187,
+      "fpr": 0.010526315789473684,
+      "fnr": 0.05
     },
-    "notes": "Backfilled governance fields for an existing local artifact; rerun training for split-specific metrics."
-  },
-  "trust_tier": "production",
-  "model_input_mode": "text_sklearn_pipeline"
+    "notes": "5-fold weighted F1 mean=0.9498, adversarial_passed=5/5."
+  }
 }

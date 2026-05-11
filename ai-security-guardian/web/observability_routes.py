@@ -17,6 +17,7 @@ from src.utils.redis_client import RedisClient
 from web.audit_integrity_patrol import get_last_audit_integrity_valid
 from web.database import db
 from web.models import ResponseAction
+from web.schema_readiness import check_schema_readiness
 
 _DEFAULT_READY_TIMEOUT_SEC = 0.3
 _DEFAULT_API_HEALTH_TIMEOUT_SEC = 0.2
@@ -180,12 +181,8 @@ def _default_secret_key() -> str:
 
 
 def _checks_database() -> Tuple[bool, str]:
-    try:
-        db.session.execute(text("SELECT 1"))
-        return True, "ok"
-    except Exception as exc:  # noqa: BLE001
-        db.session.rollback()
-        return False, f"db_error: {type(exc).__name__}"
+    result = check_schema_readiness(db.engine)
+    return result.ok, result.detail
 
 
 def _checks_redis(client: RedisClient) -> Tuple[bool, str]:

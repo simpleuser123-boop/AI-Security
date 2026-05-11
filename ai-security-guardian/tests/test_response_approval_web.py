@@ -3,17 +3,23 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from src.response.firewall import FirewallResult
+from tests.auth_helpers import auth_headers, configure_test_admin
 
 
 def _build_test_app(monkeypatch, tmp_path):
     db_file = tmp_path / "approval_web.db"
     monkeypatch.setenv("FLASK_ENV", "testing")
+    monkeypatch.setenv("REQUIRE_REDIS_AVAILABLE", "false")
+    monkeypatch.setenv("REQUIRE_MODELS_READY", "false")
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    configure_test_admin(monkeypatch)
 
     from web.app import create_app
+    from config.config import TestingConfig
+
+    monkeypatch.setattr(TestingConfig, "REQUIRE_REDIS_AVAILABLE", False)
+    monkeypatch.setattr(TestingConfig, "REQUIRE_MODELS_READY", False)
 
     app, _ = create_app()
     app.config["TESTING"] = True
@@ -91,12 +97,8 @@ def _seed_real_gate_db_evidence(app, *, provider_validated=True):
 
 
 def _auth_headers(client):
-    resp = client.post(
-        "/api/auth/login",
-        json={"username": "admin", "password": "changeme"},
-    )
-    token = resp.get_json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+    headers, _ = auth_headers(client)
+    return headers
 
 
 def test_banned_ips_post_creates_approval_not_ban(monkeypatch, tmp_path):

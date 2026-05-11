@@ -1,4 +1,108 @@
+name: "${PROD_DRILL_COMPOSE_PROJECT_NAME:?wrong env for Compose prod-drill: use .env.prod-drill.example, not the host non-degraded env}"
+
 services:
+  db-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        APT_MIRROR: ${APT_MIRROR:-}
+    image: ai-security-guardian:latest
+    container_name: ai-security-guardian-db-migrate
+    restart: "no"
+    env_file:
+      - .env.prod-drill.example
+    environment:
+      FLASK_ENV: production
+      DATABASE_URL: ${PROD_DRILL_DATABASE_URL:?Use .env.prod-drill.example; prod-drill DATABASE_URL must use the postgres service name}
+      AUTO_CREATE_DB_TABLES: "false"
+      GUARDIAN_DB_MANAGED_BY_MIGRATIONS: "true"
+    command:
+      - sh
+      - -lc
+      - |
+        python -m flask --app web.migration_app:create_migration_app db upgrade
+        python web/init_db.py --check
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    mem_limit: 512m
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+
   app:
+    env_file: !override
+      - .env.prod-drill.example
     ports: !override
       - "127.0.0.1:5000:5000"
+    environment:
+      DATABASE_URL: ${PROD_DRILL_DATABASE_URL:?Use .env.prod-drill.example; prod-drill DATABASE_URL must use the postgres service name}
+      REDIS_HOST: ${PROD_DRILL_REDIS_HOST:?Use .env.prod-drill.example; prod-drill REDIS_HOST must be redis}
+      REDIS_PORT: ${PROD_DRILL_REDIS_PORT:?Use .env.prod-drill.example; prod-drill REDIS_PORT must be 6379}
+      REDIS_DB: ${PROD_DRILL_REDIS_DB:-0}
+      REDIS_PASSWORD: ${PROD_DRILL_REDIS_PASSWORD:?Use .env.prod-drill.example; prod-drill Redis password is required}
+      AUTO_CREATE_DB_TABLES: "false"
+      GUARDIAN_DB_MANAGED_BY_MIGRATIONS: "true"
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          python web/init_db.py --check >/tmp/db-schema-check.log 2>&1
+          && python -c "import urllib.request;
+          assert urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=5).status == 200"
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  guardian:
+    env_file: !override
+      - .env.prod-drill.example
+    environment:
+      REDIS_HOST: ${PROD_DRILL_REDIS_HOST:?Use .env.prod-drill.example; prod-drill REDIS_HOST must be redis}
+      REDIS_PORT: ${PROD_DRILL_REDIS_PORT:?Use .env.prod-drill.example; prod-drill REDIS_PORT must be 6379}
+      REDIS_DB: ${PROD_DRILL_REDIS_DB:-0}
+      REDIS_PASSWORD: ${PROD_DRILL_REDIS_PASSWORD:?Use .env.prod-drill.example; prod-drill Redis password is required}
+
+  redis:
+    ports: !override []
+    environment:
+      REDIS_PASSWORD: ${PROD_DRILL_REDIS_PASSWORD:?Use .env.prod-drill.example; prod-drill Redis password is required}
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-security-guardian-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PROD_DRILL_POSTGRES_DB:?Use .env.prod-drill.example; prod-drill Postgres DB is required}
+      POSTGRES_USER: ${PROD_DRILL_POSTGRES_USER:?Use .env.prod-drill.example; prod-drill Postgres user is required}
+      POSTGRES_PASSWORD: ${PROD_DRILL_POSTGRES_PASSWORD:?Use .env.prod-drill.example; prod-drill Postgres password is required}
+    volumes:
+      - postgres_prod_drill_data:/var/lib/postgresql/data
+    mem_limit: 512m
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  postgres_prod_drill_data:
+    driver: local

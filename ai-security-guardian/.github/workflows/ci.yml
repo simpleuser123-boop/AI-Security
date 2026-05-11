@@ -13,7 +13,8 @@ on:
         options:
           - none
           - slow
-          - e2e
+          - production-e2e
+          - degradation-e2e
 
 permissions:
   contents: read
@@ -64,7 +65,7 @@ jobs:
 
       - name: Unit and offline tests
         run: |
-          python -m pytest -q --tb=short --maxfail=1 -m "not integration and not e2e and not slow"
+          python -m pytest -q --tb=short --maxfail=1 -m "not integration and not e2e and not production_e2e and not degradation_e2e and not slow"
 
       - name: Critical security hardening tests
         run: |
@@ -74,8 +75,10 @@ jobs:
         run: |
           python -m pytest tests/test_schema_manifest.py tests/test_model_registry.py -q --tb=short --maxfail=1
 
-      - name: v1 acceptance scenarios
-        run: python scripts/verify_v1.py
+      - name: production-e2e acceptance scenarios
+        env:
+          GUARDIAN_REDIS_DISABLE_CONNECT: "false"
+        run: python -m pytest -m production_e2e -q
 
   optional-tests:
     name: Optional ${{ github.event.inputs.optional_group }} Tests
@@ -108,8 +111,11 @@ jobs:
         run: |
           if [ "$OPTIONAL_GROUP" = "slow" ]; then
             python -m pytest -q --tb=short --maxfail=1 -m slow
-          elif [ "$OPTIONAL_GROUP" = "e2e" ]; then
-            python -m pytest -q --tb=short --maxfail=1 -m e2e
+          elif [ "$OPTIONAL_GROUP" = "production-e2e" ]; then
+            export GUARDIAN_REDIS_DISABLE_CONNECT=false
+            python -m pytest -q --tb=short --maxfail=1 -m production_e2e
+          elif [ "$OPTIONAL_GROUP" = "degradation-e2e" ]; then
+            python -m pytest -q --tb=short --maxfail=1 -m degradation_e2e
           else
             echo "Unknown optional_group: $OPTIONAL_GROUP" >&2
             exit 2

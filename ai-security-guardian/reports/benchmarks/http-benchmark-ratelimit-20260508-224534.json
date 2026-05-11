@@ -1,0 +1,83 @@
+{
+  "tool": "scripts/benchmark_http.py",
+  "started_at": "2026-05-08T14:45:34+00:00",
+  "base_url": "http://127.0.0.1:5001",
+  "scenario": "rate-limit",
+  "mode": "requests:6",
+  "workers": 3,
+  "target_rps": 0.0,
+  "warmup": {
+    "requests": 0,
+    "seconds": 0.0
+  },
+  "elapsed_sec": 0.04295419994741678,
+  "throughput_rps": 139.68366323537666,
+  "ok_statuses": [
+    200
+  ],
+  "auth": {
+    "login_attempted": false,
+    "authorization_header_used": true
+  },
+  "targets": {
+    "core_api_p95_ms": 300.0,
+    "detection_p95_ms": 100.0
+  },
+  "summary": {
+    "overall": {
+      "requests": 6,
+      "successful_requests": 2,
+      "failed_requests": 4,
+      "error_rate": 0.6666666666666666,
+      "avg_ms": 17.85758329788223,
+      "p50_ms": 5.674499901942909,
+      "p95_ms": 40.37069994956255,
+      "p99_ms": 40.37069994956255,
+      "min_ms": 4.216699977405369,
+      "max_ms": 40.37069994956255,
+      "status_codes": {
+        "200": 2,
+        "429": 4
+      },
+      "errors_by_type": {
+        "http_429": 4
+      }
+    },
+    "endpoints": {
+      "/api/stats": {
+        "requests": 6,
+        "successful_requests": 2,
+        "failed_requests": 4,
+        "error_rate": 0.6666666666666666,
+        "avg_ms": 17.85758329788223,
+        "p50_ms": 5.674499901942909,
+        "p95_ms": 40.37069994956255,
+        "p99_ms": 40.37069994956255,
+        "min_ms": 4.216699977405369,
+        "max_ms": 40.37069994956255,
+        "status_codes": {
+          "200": 2,
+          "429": 4
+        },
+        "errors_by_type": {
+          "http_429": 4
+        }
+      }
+    }
+  },
+  "detection": {
+    "enabled": false
+  },
+  "judgement": {
+    "scenario": "rate-limit",
+    "rate_limit_target": "HTTP 429 appears under intentionally low limit",
+    "rate_limit_observed": true,
+    "server_errors": false,
+    "api_pass": true,
+    "api_p95_ms": 40.37069994956255,
+    "api_endpoint_failures": {},
+    "detection_target": "detection segment P95 < 100ms",
+    "detection_pass": null,
+    "detection_p95_ms": null
+  }
+}

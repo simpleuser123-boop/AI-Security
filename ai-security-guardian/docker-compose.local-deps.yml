@@ -1,0 +1,53 @@
+# Local dependency stack for non-degraded integration testing.
+# Starts real PostgreSQL and Redis services only; no app container and no customer data.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LOCAL_POSTGRES_PORT:-55432}:5432"
+    environment:
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-guardian_local_test}
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-guardian}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:?LOCAL_POSTGRES_PASSWORD is required}
+    volumes:
+      - local_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LOCAL_REDIS_PORT:-56379}:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        test -n "$${REDIS_PASSWORD}"
+        exec redis-server --requirepass "$${REDIS_PASSWORD}" --save "" --appendonly no
+    volumes:
+      - local_redis_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a "$${REDIS_PASSWORD}" ping | grep -q PONG
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  local_postgres_data:
+    driver: local
+  local_redis_data:
+    driver: local

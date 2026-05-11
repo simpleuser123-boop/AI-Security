@@ -3,23 +3,80 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import uuid
 
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import make_url
 
 
-def _migration_env(db_file, repo_root):
+def _redis_env() -> dict[str, str]:
+    required = ("REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD")
+    missing = [name for name in required if not os.environ.get(name)]
+    assert not missing, f"real Redis env is required: missing {missing}"
+    assert os.environ.get("GUARDIAN_REDIS_DISABLE_CONNECT", "").lower() != "true"
+    assert os.environ.get("REQUIRE_REDIS_AVAILABLE", "").lower() == "true"
+    return {
+        "REDIS_HOST": os.environ["REDIS_HOST"],
+        "REDIS_PORT": os.environ["REDIS_PORT"],
+        "REDIS_DB": os.environ.get("REDIS_DB", "0"),
+        "REDIS_PASSWORD": os.environ["REDIS_PASSWORD"],
+        "GUARDIAN_REDIS_DISABLE_CONNECT": "false",
+        "REQUIRE_REDIS_AVAILABLE": "true",
+    }
+
+
+def _postgres_database_url():
+    raw = os.environ.get("DATABASE_URL")
+    assert raw, "DATABASE_URL must point to the local PostgreSQL test database"
+    url = make_url(raw)
+    assert url.get_backend_name() == "postgresql"
+    assert url.host in {"127.0.0.1", "localhost"}
+    return url
+
+
+def _quote_ident(name: str) -> str:
+    assert name.replace("_", "").isalnum()
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _admin_engine(base_url):
+    admin_url = base_url.set(database="postgres")
+    return create_engine(admin_url, isolation_level="AUTOCOMMIT")
+
+
+def _create_database(base_url, database_name: str):
+    engine = _admin_engine(base_url)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {_quote_ident(database_name)} WITH (FORCE)"))
+            conn.execute(text(f"CREATE DATABASE {_quote_ident(database_name)}"))
+    finally:
+        engine.dispose()
+
+
+def _drop_database(base_url, database_name: str):
+    engine = _admin_engine(base_url)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {_quote_ident(database_name)} WITH (FORCE)"))
+    finally:
+        engine.dispose()
+
+
+def _migration_env(database_url, repo_root):
     env = os.environ.copy()
     env.update(
         {
             "FLASK_ENV": "testing",
-            "DATABASE_URL": f"sqlite:///{db_file.as_posix()}",
+            "DATABASE_URL": database_url,
             "SECRET_KEY": "test-secret-key-which-is-at-least-32b",
             "ALERT_STREAM_CONSUMER_AUTOSTART": "false",
             "AUDIT_INTEGRITY_PATROL": "false",
-            "GUARDIAN_REDIS_DISABLE_CONNECT": "true",
+            "GUARDIAN_DB_MANAGED_BY_MIGRATIONS": "true",
             "PYTHONPATH": str(repo_root),
         }
     )
+    env.update(_redis_env())
     return env
 
 
@@ -42,48 +99,58 @@ def _run_flask_db(args, *, env, repo_root):
     )
 
 
-def test_flask_migrate_upgrade_creates_schema_and_is_repeatable(tmp_path):
+def test_flask_migrate_upgrade_creates_schema_and_is_repeatable():
     repo_root = os.path.dirname(os.path.dirname(__file__))
-    db_file = tmp_path / "migrated.db"
-    env = _migration_env(db_file, repo_root)
+    base_url = _postgres_database_url()
+    database_name = f"guardian_migration_{uuid.uuid4().hex}"
+    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
+    _create_database(base_url, database_name)
 
-    first = _run_flask_db(["upgrade"], env=env, repo_root=repo_root)
-    second = _run_flask_db(["upgrade"], env=env, repo_root=repo_root)
+    try:
+        env = _migration_env(database_url, repo_root)
 
-    assert "Running upgrade" in (first.stderr + first.stdout)
-    assert second.returncode == 0
+        first = _run_flask_db(["upgrade"], env=env, repo_root=repo_root)
+        second = _run_flask_db(["upgrade"], env=env, repo_root=repo_root)
 
-    from web.database import db
-    import web.models  # noqa: F401
+        assert "Running upgrade" in (first.stderr + first.stdout)
+        assert second.returncode == 0
 
-    engine = create_engine(f"sqlite:///{db_file.as_posix()}")
-    inspector = inspect(engine)
-    existing = set(inspector.get_table_names())
-    expected = set(db.metadata.tables.keys())
+        from web.database import db
+        import web.models  # noqa: F401
 
-    assert expected.issubset(existing)
-    assert "alembic_version" in existing
+        engine = create_engine(database_url)
+        try:
+            inspector = inspect(engine)
+            existing = set(inspector.get_table_names())
+            expected = set(db.metadata.tables.keys())
 
-    with engine.begin() as conn:
-        version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        conn.execute(
-            text(
-                "INSERT INTO settings (key, value, updated_at) "
-                "VALUES ('migration_repeatability_probe', '{}', CURRENT_TIMESTAMP)"
-            )
-        )
+            assert expected.issubset(existing)
+            assert "alembic_version" in existing
 
-    third = _run_flask_db(["upgrade"], env=env, repo_root=repo_root)
-    assert third.returncode == 0
+            with engine.begin() as conn:
+                version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value, updated_at) "
+                        "VALUES ('migration_repeatability_probe', '{}', CURRENT_TIMESTAMP)"
+                    )
+                )
 
-    with engine.begin() as conn:
-        assert (
-            conn.execute(
-                text("SELECT COUNT(*) FROM settings WHERE key='migration_repeatability_probe'")
-            ).scalar_one()
-            == 1
-        )
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == version
+            third = _run_flask_db(["upgrade"], env=env, repo_root=repo_root)
+            assert third.returncode == 0
+
+            with engine.begin() as conn:
+                assert (
+                    conn.execute(
+                        text("SELECT COUNT(*) FROM settings WHERE key='migration_repeatability_probe'")
+                    ).scalar_one()
+                    == 1
+                )
+                assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == version
+        finally:
+            engine.dispose()
+    finally:
+        _drop_database(base_url, database_name)
 
 
 def test_phase_b1_migration_backfills_legacy_rows_to_default_tenant(tmp_path):

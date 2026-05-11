@@ -1,6 +1,6 @@
 # CI/CD 与测试分组
 
-本项目使用 GitHub Actions 作为基础 CI。默认质量门禁在每次 `push` / `pull_request` 上运行，目标是快速发现单元、核心安全、schema/manifest 和 v1 验收问题；慢测与完整 E2E 不放进默认必跑链路，避免 CI 被外部等待或端到端流程拖慢。
+本项目使用 GitHub Actions 作为基础 CI。默认质量门禁在每次 `push` / `pull_request` 上运行，目标是快速发现单元、核心安全、schema/manifest 和 production-e2e 验收问题；慢测与降级 E2E 不放进默认必跑链路，避免 CI 被外部等待或容灾流程拖慢。
 
 ## 默认质量门禁
 
@@ -16,7 +16,7 @@ CI 使用 Python 3.10，和 `Dockerfile` 中的 `python:3.10-slim` 运行基线�
    - `python -m pip check`
 
 2. **单元与离线快测**
-   - `python -m pytest -q --tb=short --maxfail=1 -m "not integration and not e2e and not slow"`
+   - `python -m pytest -q --tb=short --maxfail=1 -m "not integration and not e2e and not production_e2e and not degradation_e2e and not slow"`
    - 对齐 `pytest.ini` 的默认策略，排除需要外部服务或明显耗时的测试。
 
 3. **关键安全硬化测试**
@@ -35,19 +35,25 @@ CI 使用 Python 3.10，和 `Dockerfile` 中的 `python:3.10-slim` 运行基线�
    - `python scripts/verify_v1.py`
    - 覆盖 v1 场景 1 到 9。场景 10 由 E2E 分组覆盖。
 
+7. **production-e2e 非降级生产验收**
+   - `python -m pytest -m production_e2e -q`
+   - 覆盖场景 1～6、9、10：正常 Web、SQLi、双层 XSS、命令注入、IOC、SYN/异常、审计篡改、Web 重启后历史告警可查。
+   - 该分组要求模型制品完整，且不得设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`；模型缺失和 Redis memory fallback 不计入生产通过标准。
+
 ## 可选分组
 
 可在 GitHub Actions 页面手动触发 `workflow_dispatch`，通过 `optional_group` 选择：
 
 - `slow`：运行 `python -m pytest -q --tb=short --maxfail=1 -m slow`
-- `e2e`：运行 `python -m pytest -q --tb=short --maxfail=1 -m e2e`
+- `production-e2e`：运行 `python -m pytest -m production_e2e -q`
+- `degradation-e2e`：运行 `python -m pytest -m degradation_e2e -q`
 - `none`：只运行默认质量门禁
 
 ## 环境与密钥策略
 
-CI 只使用 dummy 环境变量，例如 `SECRET_KEY` 与 `ADMIN_PASSWORD` 均为 CI 专用占位值。不要在 workflow 中写入真实生产密钥；如后续需要访问制品仓库、私有镜像或部署环境，应使用 GitHub Environments / Actions Secrets 注入，并限制到部署 job。
+CI 只使用 dummy 环境变量，例如 `SECRET_KEY` 与 `ADMIN_PASSWORD_HASH` 均为 CI 专用占位值。非降级验收测试通过测试认证夹具生成哈希并清除明文 `ADMIN_PASSWORD`，登录成功/失败仍走 `/api/auth/login`。不要在 workflow 中写入真实生产密钥；如后续需要访问制品仓库、私有镜像或部署环境，应使用 GitHub Environments / Actions Secrets 注入，并限制到部署 job。
 
-默认 CI 设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`，避免依赖外部 Redis；集成测试如需真实 Redis，应新增独立 job 或服务容器，并保持它不阻塞默认质量门禁。
+默认 CI 设置 `GUARDIAN_REDIS_DISABLE_CONNECT=true`，避免普通单元测试依赖外部 Redis；production-e2e step 会显式覆盖为 `false`。集成测试如需真实 Redis，应新增独立 job 或服务容器，并保持它不阻塞默认质量门禁。
 
 ## 失败定位
 
@@ -58,4 +64,5 @@ CI 将不同风险面拆成独立 step：
 - 安全配置回归：看 `Critical security hardening tests`。
 - SaaS 租户隔离回归：看 `SaaS tenant isolation static scan` 输出的 `ERROR ... suggestion=...` 行。
 - schema 或模型治理回归：看 `Schema and manifest tests`。
-- v1 场景回归：看 `v1 acceptance scenarios` 输出的具体 `[PASS]` / 失败场景。
+- production-e2e 回归：看 `production-e2e 非降级生产验收` 输出的失败测试名。
+- degradation-e2e 回归：只看手动触发的 `degradation-e2e` 分组；该分组不作为生产放行标准。

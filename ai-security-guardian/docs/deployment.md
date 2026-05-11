@@ -431,6 +431,17 @@ docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml run --rm a
 docker compose -f docker-compose.yml -f docker-compose.prod-drill.yml up -d app
 ```
 
+本地 Docker/Compose 生产演练使用 `docker-compose.prod-drill.yml`。该 override 内置一次性 `db-migrate` 服务：PostgreSQL healthy 后先执行 `python -m flask --app web.migration_app:create_migration_app db upgrade`，随后执行 `python web/init_db.py --check`；只有该服务成功退出后，`app` 才会启动。prod-drill 的 `app` healthcheck 还会重复执行 `python web/init_db.py --check` 并访问 `/readyz`，避免 `up --wait` 在业务表缺失时返回成功。
+
+从空 PostgreSQL volume 验证：
+
+```bash
+docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml down -v
+docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml up -d --wait
+docker compose --env-file .env.prod-drill.example -f docker-compose.yml -f docker-compose.prod-drill.yml exec -T app python web/init_db.py --check
+curl -fsS http://127.0.0.1:5000/readyz
+```
+
 ### 6.3 Web/API 生产启动方式
 
 `python -m web.app` 只作为本地开发入口保留。它通过 `socketio.run()` 启动，便于调试、热重载和 Windows 本机联调；生产容器不再依赖 Werkzeug development server。

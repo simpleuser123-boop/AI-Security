@@ -32,6 +32,7 @@ from src.detectors.web_detector import WebAttackDetector  # noqa: E402
 from src.collectors.threat_intel import ThreatIntelCollector  # noqa: E402
 from src.features.web_features import WebFeatureExtractor  # noqa: E402
 from src.registry.model_registry import ModelRegistry  # noqa: E402
+from tests.auth_helpers import configure_test_admin, auth_headers, login_json  # noqa: E402
 
 
 def _release_security_logger_handlers(sl: SecurityLogger) -> None:
@@ -241,8 +242,7 @@ def check_10_web_restart_alerts_queryable(
         monkeypatch.setenv("FLASK_ENV", "testing")
         monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
         monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-        monkeypatch.setenv("ADMIN_USERNAME", "admin")
-        monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+        configure_test_admin(monkeypatch)
         monkeypatch.setenv("ALERT_STREAM_CONSUMER_AUTOSTART", "false")
 
     from web.app import create_app, push_alert  # noqa: E402
@@ -250,10 +250,7 @@ def check_10_web_restart_alerts_queryable(
     app1, _ = create_app()
     app1.config["TESTING"] = True
     c1 = app1.test_client()
-    t1 = c1.post(
-        "/api/auth/login", json={"username": "admin", "password": "changeme"}
-    ).get_json()["access_token"]
-    h1 = {"Authorization": f"Bearer {t1}"}
+    h1, _ = auth_headers(c1)
 
     aid = uuid.uuid4().hex
     with app1.app_context():
@@ -273,16 +270,53 @@ def check_10_web_restart_alerts_queryable(
     app2, _ = create_app()
     app2.config["TESTING"] = True
     c2 = app2.test_client()
-    t2 = c2.post(
-        "/api/auth/login", json={"username": "admin", "password": "changeme"}
-    ).get_json()["access_token"]
-    h2 = {"Authorization": f"Bearer {t2}"}
+    h2, _ = auth_headers(c2)
     r = c2.get("/api/alerts", headers=h2)
     if r.status_code != 200:
         raise AssertionError(r.get_data(as_text=True))
     data = r.get_json()
     if not any(x.get("id") == aid for x in data):
         raise AssertionError("重启后应仍能查到历史告警")
+
+
+def check_11_auth_rejects_bad_password(monkeypatch, tmp_path: Path) -> None:
+    """哈希认证下，错误密码仍返回 401 并记录登录失败。"""
+
+    if monkeypatch:
+        db_file = tmp_path / "e2e_auth_failure.db"
+        monkeypatch.setenv("FLASK_ENV", "testing")
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+        monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
+        configure_test_admin(monkeypatch)
+        monkeypatch.setenv("ALERT_STREAM_CONSUMER_AUTOSTART", "false")
+
+    from web.app import create_app  # noqa: E402
+    from web.database import db  # noqa: E402
+    from web.models import AuditEvent  # noqa: E402
+
+    app, _ = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    payload = login_json()
+    payload["password"] = "wrong-password"
+
+    resp = client.post("/api/auth/login", json=payload)
+    if resp.status_code != 401:
+        raise AssertionError(resp.get_data(as_text=True))
+
+    body = resp.get_json()
+    if body.get("code") != "auth_failed":
+        raise AssertionError(f"期望 auth_failed，得到 {body}")
+
+    with app.app_context():
+        row = (
+            db.session.query(AuditEvent)
+            .filter(AuditEvent.event_type == "auth.login_failed")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+        if row is None:
+            raise AssertionError("登录失败应写入审计事件")
 
 
 def all_checks_plain() -> List[Tuple[str, Callable[[], None]]]:
@@ -332,7 +366,7 @@ def main() -> int:
 
     print()
     print(
-        "说明: 场景 10（Web 重启查历史告警）请运行: python -m pytest tests/e2e/test_v1_acceptance.py -q"
+        "说明: 场景 10（Web 重启查历史告警）请运行: python -m pytest -m e2e tests/e2e/test_v1_acceptance.py -q"
     )
     return 1 if failed else 0
 

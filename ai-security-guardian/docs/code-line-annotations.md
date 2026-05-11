@@ -2731,7 +2731,7 @@
 | 8 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
 | 9 | 代码语句：参与当前文件的业务流程或数据处理。 | `场景 10 请运行::` |
 | 10 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
-| 11 | 代码语句：参与当前文件的业务流程或数据处理。 | `    python -m pytest tests/e2e/test_v1_acceptance.py::test_10_web_restart_alerts -q` |
+| 11 | 代码语句：参与当前文件的业务流程或数据处理。 | `    python -m pytest -m e2e tests/e2e/test_v1_acceptance.py::test_10_web_restart_alerts -q` |
 | 12 | 文档字符串边界：开始或结束模块/类/函数说明。 | `"""` |
 | 13 | 兼容性导入：启用较新的 Python 语义。 | `from __future__ import annotations` |
 | 14 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
@@ -12046,7 +12046,7 @@
 | 332 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |
 | 333 | 函数调用：执行已有函数/方法完成当前步骤。 | `    print()` |
 | 334 | 函数调用：执行已有函数/方法完成当前步骤。 | `    print(` |
-| 335 | 赋值/配置：保存变量、字段或配置项供后续逻辑使用。 | `        "说明: 场景 10（Web 重启查历史告警）请运行: python -m pytest tests/e2e/test_v1_acceptance.py -q"` |
+| 335 | 赋值/配置：保存变量、字段或配置项供后续逻辑使用。 | `        "说明: 场景 10（Web 重启查历史告警）请运行: python -m pytest -m e2e tests/e2e/test_v1_acceptance.py -q"` |
 | 336 | 函数调用：执行已有函数/方法完成当前步骤。 | `    )` |
 | 337 | 返回结果：把处理后的值交回调用方。 | `    return 1 if failed else 0` |
 | 338 | 空行：分隔代码块，让相邻逻辑更容易阅读。 | `&nbsp;` |

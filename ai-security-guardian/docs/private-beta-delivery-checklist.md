@@ -338,7 +338,8 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml logs --tail=100 
 ```bash
 python -m pytest -q
 python scripts/check_production_readiness.py
-python scripts/verify_v1.py
+python -m pytest -m production_e2e -q
+python -m pytest -m degradation_e2e -q  # 容灾验证，不计入生产通过标准
 python scripts/staging_drill.py --cleanup
 python scripts/benchmark_p95.py
 BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' python scripts/benchmark_http.py --base-url http://127.0.0.1:5000 --requests 1000 --workers 32 --warmup-requests 100
@@ -349,7 +350,7 @@ BENCHMARK_USERNAME=admin BENCHMARK_PASSWORD='REPLACE_ME' python scripts/benchmar
 - 私有化 Beta 配置校验无 `[FAIL]`，且允许 `DRY_RUN=true`。
 - `/api/health`、`/healthz`、`/readyz` 成功。
 - `scripts/staging_drill.py --cleanup` 通过，证明 Redis -> Web consumer -> DB -> Socket.IO -> 历史查询链路闭环。
-- `scripts/verify_v1.py` 通过；若客户环境不允许真实抓包，相关项以合成流量或离线脚本证据替代。
+- `python -m pytest -m production_e2e -q` 通过；模型缺失和 Redis memory fallback 仅由 `python -m pytest -m degradation_e2e -q` 验证，不计入生产通过标准。
 - HTTP 核心 API P95 目标参考 `< 300ms`，检测段 P95 目标参考 `< 100ms`。
 
 ### 6.2 手工验收
@@ -559,7 +560,8 @@ docker compose up -d redis app
 curl -fsS http://127.0.0.1:5000/api/health
 curl -fsS http://127.0.0.1:5000/healthz
 curl -fsS http://127.0.0.1:5000/readyz
-python scripts/verify_v1.py
+python -m pytest -m production_e2e -q
+python -m pytest -m degradation_e2e -q
 ```
 
 恢复演练结论必须记录 RTO、RPO、问题项和整改人。
@@ -667,7 +669,8 @@ curl -fsS http://127.0.0.1:5000/readyz
 - 登录、Dashboard、Alerts、Settings 截图。
 - Socket.IO / WSS 连接成功截图。
 - `python scripts/staging_drill.py --cleanup` 输出。
-- `python scripts/verify_v1.py` 输出。
+- `python -m pytest -m production_e2e -q` 输出。
+- `python -m pytest -m degradation_e2e -q` 输出，作为容灾验证证据，不作为生产通过标准。
 - `python -m pytest -q` 输出。
 - HTTP benchmark 报告，若执行 `scripts/benchmark_http.py`，保留 `reports/benchmarks/` 产物。
 - 告警状态流转和审计记录截图或导出。

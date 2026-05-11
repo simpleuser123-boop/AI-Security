@@ -1,34 +1,141 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import make_url
+
+from tests.auth_helpers import auth_headers, configure_test_admin, test_admin_env
+
+
+_MIGRATED = False
+
+
+def _redis_env() -> dict[str, str]:
+    required = ("REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD")
+    missing = [name for name in required if not os.environ.get(name)]
+    assert not missing, f"real Redis env is required: missing {missing}"
+    assert os.environ.get("GUARDIAN_REDIS_DISABLE_CONNECT", "").lower() != "true"
+    assert os.environ.get("REQUIRE_REDIS_AVAILABLE", "").lower() == "true"
+    return {
+        "REDIS_HOST": os.environ["REDIS_HOST"],
+        "REDIS_PORT": os.environ["REDIS_PORT"],
+        "REDIS_DB": os.environ.get("REDIS_DB", "0"),
+        "REDIS_PASSWORD": os.environ["REDIS_PASSWORD"],
+        "GUARDIAN_REDIS_DISABLE_CONNECT": "false",
+        "REQUIRE_REDIS_AVAILABLE": "true",
+    }
+
+
+def _postgres_database_url() -> str:
+    raw = os.environ.get("DATABASE_URL")
+    assert raw, "DATABASE_URL must point to the local PostgreSQL test database"
+    url = make_url(raw)
+    assert url.get_backend_name() == "postgresql"
+    assert url.host in {"127.0.0.1", "localhost"}
+    return raw
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _truncate_application_tables(database_url: str) -> None:
+    engine = create_engine(database_url)
+    try:
+        with engine.begin() as conn:
+            tables = [
+                name
+                for name in inspect(conn).get_table_names()
+                if name != "alembic_version"
+            ]
+            if tables:
+                conn.execute(
+                    text(
+                        "TRUNCATE TABLE "
+                        + ", ".join(_quote_ident(name) for name in tables)
+                        + " RESTART IDENTITY CASCADE"
+                    )
+                )
+    finally:
+        engine.dispose()
+
+
+def _prepare_postgres_schema(monkeypatch, tmp_path) -> None:
+    global _MIGRATED
+
+    database_url = _postgres_database_url()
+    monkeypatch.setenv("FLASK_ENV", "testing")
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
+    configure_test_admin(monkeypatch, role="admin")
+    monkeypatch.setenv("ALERT_STREAM_CONSUMER_AUTOSTART", "false")
+    monkeypatch.setenv("AUDIT_INTEGRITY_PATROL", "false")
+    for key, value in _redis_env().items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GUARDIAN_DB_MANAGED_BY_MIGRATIONS", "true")
+    monkeypatch.setenv("AUDIT_LOG_DIR", str(tmp_path / f"audit_{uuid.uuid4().hex}"))
+
+    if not _MIGRATED:
+        env = os.environ.copy()
+        env.update(
+            {
+                "FLASK_ENV": "testing",
+                "DATABASE_URL": database_url,
+                "SECRET_KEY": "test-secret-key-which-is-at-least-32b",
+                "ALERT_STREAM_CONSUMER_AUTOSTART": "false",
+                "AUDIT_INTEGRITY_PATROL": "false",
+                "GUARDIAN_DB_MANAGED_BY_MIGRATIONS": "true",
+                "PYTHONPATH": os.path.dirname(os.path.dirname(__file__)),
+            }
+        )
+        env.pop("ADMIN_PASSWORD", None)
+        env.update(test_admin_env(role="admin"))
+        env.update(_redis_env())
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "flask",
+                "--app",
+                "web.migration_app:create_migration_app",
+                "db",
+                "upgrade",
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        _MIGRATED = True
+
+    _truncate_application_tables(database_url)
+
 
 def _build_test_app(monkeypatch, tmp_path):
-    db_file = tmp_path / "guardian_test.db"
-    monkeypatch.setenv("FLASK_ENV", "testing")
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
-    monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    _prepare_postgres_schema(monkeypatch, tmp_path)
 
     from web.app import create_app
 
     app, _ = create_app()
     app.config["TESTING"] = True
+    redis_check = app.extensions["guardian_startup_dependency_checks"]["redis"]
+    assert redis_check["ok"] is True
+    assert redis_check["mode"] == "redis"
     return app
 
 
 def _auth_headers(client):
-    resp = client.post(
-        "/api/auth/login",
-        json={"username": "admin", "password": "changeme"},
-    )
-    token = resp.get_json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+    headers, _ = auth_headers(client)
+    return headers
 
 
-def test_all_r2_tables_can_be_created(monkeypatch, tmp_path):
+def test_all_r2_tables_exist_after_migration(monkeypatch, tmp_path):
     app = _build_test_app(monkeypatch, tmp_path)
 
     from sqlalchemy import inspect
@@ -58,18 +165,13 @@ def test_all_r2_tables_can_be_created(monkeypatch, tmp_path):
     assert expected_tables.issubset(existing)
 
 
-def test_init_db_lightweight_app_creates_tables(monkeypatch, tmp_path):
-    db_file = tmp_path / "init_entrypoint.db"
-    monkeypatch.setenv("FLASK_ENV", "testing")
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
-    monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
+def test_init_db_lightweight_app_checks_migrated_tables(monkeypatch, tmp_path):
+    _prepare_postgres_schema(monkeypatch, tmp_path)
 
-    from sqlalchemy import inspect
-    from web.database import db, init_db_command
+    from web.database import db
     from web.init_db import create_init_app
 
     app = create_init_app()
-    init_db_command(app)
 
     with app.app_context():
         existing = set(inspect(db.engine).get_table_names())
@@ -220,12 +322,7 @@ def test_alert_api_reads_and_updates_db(monkeypatch, tmp_path):
 
 
 def test_settings_persist_and_reload(monkeypatch, tmp_path):
-    db_file = tmp_path / "settings_roundtrip.db"
-    monkeypatch.setenv("FLASK_ENV", "testing")
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
-    monkeypatch.setenv("SECRET_KEY", "test-secret-key-which-is-at-least-32b")
-    monkeypatch.setenv("ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("ADMIN_PASSWORD", "changeme")
+    _prepare_postgres_schema(monkeypatch, tmp_path)
 
     from web.app import create_app
 
@@ -253,6 +350,30 @@ def test_settings_persist_and_reload(monkeypatch, tmp_path):
     assert r2.status_code == 200
     assert r2.get_json()["editable"]["model_version"] == "v2.1"
     assert abs(r2.get_json()["editable"]["detection_sensitivity"] - 0.55) < 1e-6
+
+
+def test_audit_event_persist_and_query(monkeypatch, tmp_path):
+    app = _build_test_app(monkeypatch, tmp_path)
+    client = app.test_client()
+    headers = _auth_headers(client)
+
+    from web.database import db
+    from web.models import AuditEvent
+
+    with app.app_context():
+        row = (
+            db.session.query(AuditEvent)
+            .filter(AuditEvent.event_type == "auth.login_success")
+            .one()
+        )
+        assert row.actor == "admin"
+        assert row.resource_type == "auth"
+
+    resp = client.get("/api/audit/events?event_type=auth.login_success", headers=headers)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["total"] >= 1
+    assert any(item["actor"] == "admin" for item in body["items"])
 
 
 def test_rules_crud_db(monkeypatch, tmp_path):
